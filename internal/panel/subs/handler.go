@@ -31,6 +31,9 @@ import (
 type Config struct {
 	Brand      string
 	SupportURL string
+	PageTheme  string
+	PageLogo   string
+	PageModules []PageModule
 	// Title is the profile's name in the apps (Profile-Title); "" names it Brand. Title and
 	// Announce may hold TitleVars, filled for each user.
 	Title string
@@ -57,6 +60,12 @@ type Config struct {
 	// Lang is the panel's default language, "" when unset: default group names and the
 	// notices in place of servers are in it.
 	Lang string
+}
+
+// PageModule is a section's saved order and visibility on the subscription page.
+type PageModule struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
 }
 
 // Binder hands devices their keys (domain.Devices).
@@ -769,6 +778,9 @@ func (h *Handler) operatorHeaders(w http.ResponseWriter, r *http.Request, u db.U
 type Info struct {
 	Name       string     `json:"name"`
 	Brand      string     `json:"brand"`
+	Theme      string     `json:"theme"`
+	Logo       string     `json:"logo,omitempty"`
+	Modules    []PageModule `json:"modules,omitempty"`
 	SupportURL string     `json:"support_url,omitempty"`
 	State      string     `json:"state"`
 	UsedUp     int64      `json:"used_up"`
@@ -809,7 +821,7 @@ func (h *Handler) info(ctx context.Context, w http.ResponseWriter, u db.User, pr
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	out := Info{Name: u.Name, Brand: cfg.Brand, SupportURL: cfg.SupportURL, State: domain.State(u, grants.Main(u.ID), now), UsedUp: u.UsedUp, UsedDown: u.UsedDown,
+	out := Info{Name: u.Name, Brand: cfg.Brand, Theme: cfg.PageTheme, Logo: cfg.PageLogo, Modules: cfg.PageModules, SupportURL: cfg.SupportURL, State: domain.State(u, grants.Main(u.ID), now), UsedUp: u.UsedUp, UsedDown: u.UsedDown,
 		Binding: cfg.Binding, Bound: []DeviceItem{}}
 	if u.TrafficLimit.Valid {
 		out.Extra = grants.Main(u.ID)

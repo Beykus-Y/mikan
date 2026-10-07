@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -117,5 +118,49 @@ func TestOperatorHeadersOverHTTP(t *testing.T) {
 	resp, _ = h.do(http.MethodGet, "/"+subPath+"/"+u.SubToken, nil, map[string]string{"User-Agent": "v2RayTun/1.0"})
 	if resp.Header.Get("X-Hwid-Limit") != "" || resp.Header.Get("X-Hwid-Max-Devices-Reached") != "" {
 		t.Errorf("a stub without servers speaks of devices: %v", resp.Header)
+	}
+}
+
+func TestSubscriptionPageCustomizationOverHTTP(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	clock := func() time.Time { return h.now }
+	if err := domain.Seed(ctx, h.st, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := h.login(password, ""); resp.StatusCode != http.StatusOK {
+		t.Fatal("login")
+	}
+	tariffs, err := h.st.Q.ListTariffs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := domain.NewUsers(h.st, domain.NewPool(h.st, clock), noChanges{}, clock).Create(ctx, domain.CreateInput{Name: "brand user", TariffID: tariffs[1].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modules := append([]settings.SubscriptionModule(nil), settings.DefaultSubscriptionModules...)
+	modules[0], modules[1] = modules[1], modules[0]
+	modules[0].Enabled = false
+	resp, body := h.do(http.MethodPatch, "/"+adminPath+"/api/v1/settings", map[string]any{
+		"subscription_theme": "ocean", "subscription_logo": "🌿", "subscription_modules": modules,
+	}, map[string]string{"X-CSRF-Token": h.csrf})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("save subscription-page settings: %d %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(http.MethodGet, "/"+subPath+"/"+u.SubToken+"/info", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("subscription info: %d %s", resp.StatusCode, body)
+	}
+	var info struct {
+		Theme   string                      `json:"theme"`
+		Logo    string                      `json:"logo"`
+		Modules []settings.SubscriptionModule `json:"modules"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Theme != "ocean" || info.Logo != "🌿" || len(info.Modules) != len(modules) || info.Modules[0].ID != "usage" || info.Modules[0].Enabled {
+		t.Fatalf("subscription customization did not reach the page: %+v", info)
 	}
 }

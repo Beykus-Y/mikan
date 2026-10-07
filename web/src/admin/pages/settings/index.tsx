@@ -13,7 +13,7 @@ import { ImportCard, LegacyLinksCard } from "./import";
 import { ClashRulesCard } from "./rules";
 import { TorrentCard, TorrentHitsCard } from "./torrent";
 import { AccessCard, ApiCard, CertificateCard, PasswordCard, SessionsCard, TwoFactorCard } from "./security";
-import { AppsCard, DevicesCard, SubPortCard, SubscriptionCard } from "./subscription";
+import { AppsCard, DevicesCard, SubPageCard, SubPortCard, SubscriptionCard } from "./subscription";
 
 const ICONS = { general: Globe, subscription: Link2, rules: ListFilter, security: ShieldCheck, import: ArrowDownToLine } as const;
 
@@ -62,6 +62,7 @@ export function SettingsPage() {
                 right={
                   <>
                     <SubPortCard s={s} />
+                    <SubPageCard s={s} />
                     <AppsCard s={s} />
                   </>
                 }

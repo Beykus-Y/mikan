@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from "react";
+import { ArrowDown, ArrowUp } from "lucide-react";
 import type { Schemas } from "../../../api/client";
 import { useInbounds, useNodes } from "../../../api/hooks";
 import { Button, Field, Pill } from "../../../components/ui";
 import { Switch } from "../../../components/switch";
-import { t } from "../../../i18n";
+import { t, tMaybe } from "../../../i18n";
 import { useDraft } from "../../../lib/draft";
 import { fieldErrors } from "../../../lib/fields";
 import { FingerprintSelect } from "../../../components/fingerprint-select";
@@ -280,6 +281,72 @@ export function AppsCard({ s }: { s: Schemas["SettingsView"] }) {
             </Field>
           </div>
         ) : null}
+        <Button type="submit" variant="primary" loading={save.isPending}>
+          {t("common.save")}
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+const PAGE_THEMES = ["mikan", "midnight", "ocean", "sakura", "forest"] as const;
+const PAGE_THEME_LABELS = { mikan: "settings.themeMikan", midnight: "settings.themeMidnight", ocean: "settings.themeOcean", sakura: "settings.themeSakura", forest: "settings.themeForest" } as const;
+const MODULE_LABELS: Record<string, string> = {
+  status: "settings.pageModuleStatus", usage: "settings.pageModuleUsage", pools: "settings.pageModulePools",
+  devices: "settings.pageModuleDevices", apps: "settings.pageModuleApps", instructions: "settings.pageModuleInstructions",
+  link: "settings.pageModuleLink", promo: "settings.pageModulePromo", shop: "settings.pageModuleShop",
+  packages: "settings.pageModulePackages", telegram: "settings.pageModuleTelegram", support: "settings.pageModuleSupport",
+};
+
+/** Theme, logo and the order/visibility of sections on the public subscription page. */
+export function SubPageCard({ s }: { s: Schemas["SettingsView"] }) {
+  const save = useSaveSettings();
+  const [theme, setTheme] = useState(s.subscription_theme);
+  const [logo, setLogo] = useState(s.subscription_logo);
+  const [modules, setModules] = useState(s.subscription_modules);
+  const errors = fieldErrors(save.error);
+  const move = (index: number, delta: number) => {
+    const next = [...modules];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    setModules(next);
+  };
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    save.mutate({ subscription_theme: theme, subscription_logo: logo.trim(), subscription_modules: modules });
+  };
+  return (
+    <section className="card glass reveal" style={{ "--i": 2 } as React.CSSProperties}>
+      <form onSubmit={submit} noValidate>
+        <div className="card-head"><div><h2 className="card-title">{t("settings.subscriptionPage")}</h2><div className="card-sub">{t("settings.subscriptionPageSub")}</div></div></div>
+        <Field label={t("settings.subscriptionTheme")} htmlFor="sub-page-theme" error={errors.subscription_theme}>
+          <select id="sub-page-theme" className="input" value={theme} onChange={(e) => setTheme(e.target.value as typeof theme)}>
+            {PAGE_THEMES.map((value) => <option key={value} value={value}>{t(PAGE_THEME_LABELS[value])}</option>)}
+          </select>
+        </Field>
+        <Field label={t("settings.subscriptionLogo")} htmlFor="sub-page-logo" hint={t("settings.subscriptionLogoHint")} error={errors.subscription_logo}>
+          <div className="flex items-center gap-3">
+            <span className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-xl border border-[var(--hairline)] bg-[var(--surface-soft)] text-xl">
+              {logo.startsWith("https://") ? <img src={logo} alt="" className="h-full w-full object-cover" /> : logo || (s.brand || "V")[0]}
+            </span>
+            <input id="sub-page-logo" className="input" value={logo} onChange={(e) => setLogo(e.target.value)} maxLength={500} placeholder="✨ или https://example.com/logo.png" aria-invalid={!!errors.subscription_logo} />
+          </div>
+        </Field>
+        <div className="mt-4 mb-2 text-[13px] font-medium">{t("settings.subscriptionModules")}</div>
+        <div className="row-list">
+          {modules.map((module, index) => (
+            <div key={module.id} className="flex items-center gap-2 py-2">
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <Switch checked={module.enabled} label={tMaybe(MODULE_LABELS[module.id] ?? module.id) ?? module.id} disabled={save.isPending} onChange={(enabled) => setModules((cur) => cur.map((m) => m.id === module.id ? { ...m, enabled } : m))} />
+                <span className="truncate text-[13px]">{tMaybe(MODULE_LABELS[module.id] ?? module.id) ?? module.id}</span>
+              </div>
+              <button type="button" className="icon-btn" aria-label={t("settings.moduleMoveUp")} disabled={index === 0 || save.isPending} onClick={() => move(index, -1)}><ArrowUp size={16} /></button>
+              <button type="button" className="icon-btn" aria-label={t("settings.moduleMoveDown")} disabled={index === modules.length - 1 || save.isPending} onClick={() => move(index, 1)}><ArrowDown size={16} /></button>
+            </div>
+          ))}
+        </div>
+        {errors.subscription_modules ? <div className="mt-2 text-xs text-[var(--berry-600)]">{errors.subscription_modules}</div> : null}
         <Button type="submit" variant="primary" loading={save.isPending}>
           {t("common.save")}
         </Button>

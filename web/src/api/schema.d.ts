@@ -2563,6 +2563,11 @@ export interface components {
             sub_title?: string;
             /** @description https://… или tg://… */
             support_url?: string;
+            /** @enum {string} */
+            subscription_theme?: "mikan" | "midnight" | "ocean" | "sakura" | "forest";
+            /** @description HTTPS URL изображения, эмодзи или пусто */
+            subscription_logo?: string;
+            subscription_modules?: components["schemas"]["SubscriptionModule"][];
         };
         PatchTelegramInputBody: {
             config?: components["schemas"]["Config"];
@@ -3039,6 +3044,11 @@ export interface components {
             /** @description Название подписки в приложениях (заголовок profile-title); пусто — бренд. Переменные: {brand} — бренд, {name} — имя пользователя, {date} — дата окончания (ДД.ММ.ГГГГ, МСК), {days} — дней осталось, {used} — израсходовано, {left} — осталось трафика, {total} — всего; без срока или лимита — ∞ */
             sub_title: string;
             support_url: string;
+            /** @enum {string} */
+            subscription_theme: "mikan" | "midnight" | "ocean" | "sakura" | "forest";
+            /** @description HTTPS URL изображения или эмодзи для страницы подписки */
+            subscription_logo: string;
+            subscription_modules: components["schemas"]["SubscriptionModule"][];
         };
         SpeedTestView: {
             /** Format: date-time */
@@ -3612,6 +3622,10 @@ export interface components {
             source?: "register" | "import" | "";
             /** @description Последняя проверка выхода через WARP с ноды; нет — у ноды ещё нет настроенного WARP */
             status?: components["schemas"]["WarpCheck"];
+        };
+        SubscriptionModule: {
+            enabled: boolean;
+            id: string;
         };
     };
     responses: never;

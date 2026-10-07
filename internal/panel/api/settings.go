@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/danielgtaylor/huma/v2"
 
@@ -30,6 +32,9 @@ type SettingsView struct {
 	AppBranding  bool     `json:"app_branding" doc:"Брендинг в приложениях, читающих операторские заголовки (ClashFest, SlothClash): название, логотип, цвет, ссылки"`
 	BrandAccent  string   `json:"brand_accent" doc:"Цвет бренда #RRGGBB; пусто — цвет приложения"`
 	BrandLogoURL string   `json:"brand_logo_url" doc:"Логотип: https, PNG, WebP или JPEG до 512 КБ; пусто — значок приложения"`
+	PageTheme   string      `json:"subscription_theme" enum:"mikan,midnight,ocean,sakura,forest"`
+	PageLogo    string      `json:"subscription_logo" doc:"HTTPS URL изображения или эмодзи для страницы подписки"`
+	PageModules PageModules `json:"subscription_modules"`
 	PublicHost   string   `json:"public_host"`
 	Domain       string   `json:"domain"`
 	PanelPort    int      `json:"panel_port"`
@@ -53,6 +58,8 @@ type SettingsView struct {
 	Certificate   acme.Status `json:"certificate"`
 }
 
+type PageModules = []settings.SubscriptionModule
+
 type settingsOutput struct{ Body SettingsView }
 
 type patchSettingsInput struct {
@@ -65,6 +72,9 @@ type patchSettingsInput struct {
 		AppBranding   *bool   `json:"app_branding,omitempty"`
 		BrandAccent   *string `json:"brand_accent,omitempty" maxLength:"7" doc:"#RRGGBB или пусто"`
 		BrandLogoURL  *string `json:"brand_logo_url,omitempty" maxLength:"500" doc:"https://… или пусто"`
+		PageTheme   *string      `json:"subscription_theme,omitempty" enum:"mikan,midnight,ocean,sakura,forest"`
+		PageLogo    *string      `json:"subscription_logo,omitempty" maxLength:"500" doc:"HTTPS URL изображения, эмодзи или пусто"`
+		PageModules *PageModules `json:"subscription_modules,omitempty"`
 		PublicHost    *string `json:"public_host,omitempty" maxLength:"253"`
 		Domain        *string `json:"domain,omitempty" maxLength:"253"`
 		QuietHourUTC  *int    `json:"quiet_hour_utc,omitempty" minimum:"0" maximum:"23"`
@@ -119,6 +129,14 @@ func (h *handlers) readSettings(ctx context.Context) (SettingsView, error) {
 	get(settings.KeyAnnounceURL, &v.AnnounceURL)
 	get(settings.KeyBrandAccent, &v.BrandAccent)
 	get(settings.KeyBrandLogo, &v.BrandLogoURL)
+	get(settings.KeySubPageTheme, &v.PageTheme)
+	get(settings.KeySubPageLogo, &v.PageLogo)
+	if v.PageTheme == "" {
+		v.PageTheme = "mikan"
+	}
+	if v.PageModules, _, err = settings.GetOver(ctx, h.d.Settings, settings.KeySubPageModules, settings.DefaultSubscriptionModules); err != nil {
+		return v, err
+	}
 	get(settings.KeyPublicHost, &v.PublicHost)
 	get(settings.KeyDomain, &v.Domain)
 	get(settings.KeyGroupMain, &v.SubGroupMain)
@@ -212,7 +230,8 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 		"sub_rules": b.SubRules != nil, "support_url": b.SupportURL != nil,
 		// What every subscriber's app shows: text, links and the logo it downloads.
 		"sub_title": b.SubTitle != nil, "sub_announce": b.Announce != nil, "sub_announce_url": b.AnnounceURL != nil, "app_branding": b.AppBranding != nil,
-		"brand_accent": b.BrandAccent != nil, "brand_logo_url": b.BrandLogoURL != nil} {
+		"brand_accent": b.BrandAccent != nil, "brand_logo_url": b.BrandLogoURL != nil,
+		"subscription_theme": b.PageTheme != nil, "subscription_logo": b.PageLogo != nil, "subscription_modules": b.PageModules != nil} {
 		if touched {
 			if err := requireSession(ctx, field); err != nil {
 				return nil, err
@@ -246,6 +265,15 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 	}
 	if b.BrandLogoURL != nil && *b.BrandLogoURL != "" && !subs.ValidLink(strings.TrimSpace(*b.BrandLogoURL), false) {
 		details = append(details, &huma.ErrorDetail{Location: "body.brand_logo_url", Message: "url_invalid"})
+	}
+	if b.PageTheme != nil && !validSubscriptionTheme(strings.TrimSpace(*b.PageTheme)) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_theme", Message: "theme_invalid"})
+	}
+	if b.PageLogo != nil && *b.PageLogo != "" && !validSubscriptionLogo(strings.TrimSpace(*b.PageLogo)) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_logo", Message: "logo_invalid"})
+	}
+	if b.PageModules != nil && !validSubscriptionModules(*b.PageModules) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_modules", Message: "modules_invalid"})
 	}
 	if b.SubGroupMain != nil || b.SubGroupAuto != nil || b.SubRules != nil {
 		cur, err := h.groups(ctx)
@@ -352,11 +380,17 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 		}
 		for key, v := range map[string]*string{settings.KeyBrand: b.Brand, settings.KeySupportURL: b.SupportURL, settings.KeyPublicHost: b.PublicHost, settings.KeyDomain: b.Domain,
 			settings.KeySubTitle: b.SubTitle, settings.KeyAnnounce: b.Announce, settings.KeyAnnounceURL: b.AnnounceURL, settings.KeyBrandAccent: b.BrandAccent, settings.KeyBrandLogo: b.BrandLogoURL,
+			settings.KeySubPageTheme: b.PageTheme, settings.KeySubPageLogo: b.PageLogo,
 			settings.KeyGroupMain: b.SubGroupMain, settings.KeyGroupAuto: b.SubGroupAuto, settings.KeyRouting: b.SubRouting, settings.KeyFingerprint: b.Fingerprint, settings.KeyDefaultLang: b.DefaultLang} {
 			if v == nil {
 				continue
 			}
 			if err := settings.Set(ctx, set, key, strings.TrimSpace(*v)); err != nil {
+				return err
+			}
+		}
+		if b.PageModules != nil {
+			if err := settings.Set(ctx, set, settings.KeySubPageModules, *b.PageModules); err != nil {
 				return err
 			}
 		}
@@ -397,6 +431,55 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 		return nil, err
 	}
 	return &settingsOutput{Body: v}, nil
+}
+
+func validSubscriptionTheme(v string) bool {
+	switch v {
+	case "mikan", "midnight", "ocean", "sakura", "forest":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSubscriptionLogo(v string) bool {
+	if subs.ValidLink(v, false) {
+		return true
+	}
+	// Permit one emoji grapheme (including a skin tone, variation selector or ZWJ
+	// sequence), but no arbitrary text or markup.
+	if utf8.RuneCountInString(v) == 0 || utf8.RuneCountInString(v) > 8 {
+		return false
+	}
+	base := false
+	for _, r := range v {
+		if unicode.Is(unicode.S, r) {
+			base = true
+			continue
+		}
+		if unicode.Is(unicode.M, r) || r == '\u200d' || r == '\ufe0f' || (r >= '\U0001f3fb' && r <= '\U0001f3ff') {
+			continue
+		}
+		return false
+	}
+	return base
+}
+
+func validSubscriptionModules(v []settings.SubscriptionModule) bool {
+	if len(v) != len(settings.DefaultSubscriptionModules) {
+		return false
+	}
+	want := make(map[string]bool, len(settings.DefaultSubscriptionModules))
+	for _, m := range settings.DefaultSubscriptionModules {
+		want[m.ID] = true
+	}
+	for _, m := range v {
+		if !want[m.ID] {
+			return false
+		}
+		delete(want, m.ID)
+	}
+	return len(want) == 0
 }
 
 // subPortReserved can never serve subscriptions: SSH, and 80 that Let's Encrypt needs.

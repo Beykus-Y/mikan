@@ -284,6 +284,22 @@ func NewPanel(st *store.Store, o Options) (*Panel, error) {
 		}
 		cfg := subs.Config{Brand: brand, SupportURL: support, Groups: groups, Routing: subs.ParseRouting(routing), Fingerprint: fingerprint,
 			Direct: []string{publicHost, domainName}, Lang: lang, Rules: subs.ServedRules(rules, groups.WithDefaults(lang))}
+		if cfg.PageTheme, _, err = settings.Get[string](ctx, set, settings.KeySubPageTheme); err != nil {
+			return subs.Config{}, err
+		}
+		if cfg.PageTheme == "" {
+			cfg.PageTheme = "mikan"
+		}
+		if cfg.PageLogo, _, err = settings.Get[string](ctx, set, settings.KeySubPageLogo); err != nil {
+			return subs.Config{}, err
+		}
+		pageModules, _, err := settings.GetOver(ctx, set, settings.KeySubPageModules, settings.DefaultSubscriptionModules)
+		if err != nil {
+			return subs.Config{}, err
+		}
+		for _, m := range pageModules {
+			cfg.PageModules = append(cfg.PageModules, subs.PageModule{ID: m.ID, Enabled: m.Enabled})
+		}
 		if cfg.Binding, err = set.On(ctx, settings.DeviceBinding); err != nil {
 			return subs.Config{}, err
 		}

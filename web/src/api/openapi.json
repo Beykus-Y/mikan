@@ -2950,6 +2950,27 @@
             "description": "https://… или tg://…",
             "maxLength": 200,
             "type": "string"
+          },
+          "subscription_theme": {
+            "enum": [
+              "mikan",
+              "midnight",
+              "ocean",
+              "sakura",
+              "forest"
+            ],
+            "type": "string"
+          },
+          "subscription_logo": {
+            "description": "HTTPS URL изображения, эмодзи или пусто",
+            "maxLength": 500,
+            "type": "string"
+          },
+          "subscription_modules": {
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionModule"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -3251,7 +3272,7 @@
             "type": "string"
           },
           "provider": {
-            "description": "stars или addon:\u003cid\u003e — адаптер маркетплейса",
+            "description": "stars или addon:<id> — адаптер маркетплейса",
             "type": "string"
           },
           "refunded_at": {
@@ -4209,6 +4230,26 @@
           },
           "support_url": {
             "type": "string"
+          },
+          "subscription_theme": {
+            "enum": [
+              "mikan",
+              "midnight",
+              "ocean",
+              "sakura",
+              "forest"
+            ],
+            "type": "string"
+          },
+          "subscription_logo": {
+            "description": "HTTPS URL изображения или эмодзи для страницы подписки",
+            "type": "string"
+          },
+          "subscription_modules": {
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionModule"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -4238,7 +4279,10 @@
           "device_binding",
           "device_require_hwid",
           "default_lang",
-          "certificate"
+          "certificate",
+          "subscription_theme",
+          "subscription_logo",
+          "subscription_modules"
         ],
         "type": "object"
       },
@@ -5722,6 +5766,22 @@
           "inbounds"
         ],
         "type": "object"
+      },
+      "SubscriptionModule": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "enabled"
+        ],
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -5739,7 +5799,7 @@
     }
   },
   "info": {
-    "description": "REST API панели mikan. Все пути — под секретным адресом админки: https://\u003cпанель\u003e/\u003cсекретный путь\u003e/api/v1/…\n\nСкрипты и интеграции авторизуются ключом API (Настройки → API): заголовок `Authorization: Bearer mk_…`. Ключ «чтение» выполняет только GET и не получает ссылок подписок и секретных адресов; «полный» меняет данные, кроме входа, сессий, самих ключей и операций, где уходят деньги, ключи и адреса клиентов (они помечены «только сессия»).\n\nАдминка в браузере ходит с cookie сессии; изменяющие запросы тогда требуют заголовок `X-CSRF-Token` из `GET /auth/me`.\n\nОшибки — RFC 9457 (application/problem+json): `detail` — код ошибки, `errors[].message` — код по полю.\n\n## Подписка в приложениях\n\nСсылка подписки (`sub_url` пользователя) отдаёт конфиг и заголовки, которые читают приложения: `profile-title` — название профиля (настройка `sub_title`, пусто — бренд), `announce` — строка над профилем или под его названием (`sub_announce`), `subscription-userinfo` — трафик и срок, `support-url`, `profile-web-page-url`. Настраиваются в `PATCH /api/v1/settings`.\n\nВ `sub_title` и `sub_announce` подставляются переменные каждого пользователя: `{brand}` — бренд, `{name}` — имя, `{date}` — дата окончания (ДД.ММ.ГГГГ, МСК), `{days}` — дней осталось, `{used}` — израсходовано, `{left}` — осталось трафика, `{total}` — лимит с пакетами. Без срока или лимита — `∞`. Неизвестное слово в фигурных скобках остаётся текстом. Если название после подстановки пустое, берётся бренд. Пример: `{brand} · до {date}`.",
+    "description": "REST API панели mikan. Все пути — под секретным адресом админки: https://<панель>/<секретный путь>/api/v1/…\n\nСкрипты и интеграции авторизуются ключом API (Настройки → API): заголовок `Authorization: Bearer mk_…`. Ключ «чтение» выполняет только GET и не получает ссылок подписок и секретных адресов; «полный» меняет данные, кроме входа, сессий, самих ключей и операций, где уходят деньги, ключи и адреса клиентов (они помечены «только сессия»).\n\nАдминка в браузере ходит с cookie сессии; изменяющие запросы тогда требуют заголовок `X-CSRF-Token` из `GET /auth/me`.\n\nОшибки — RFC 9457 (application/problem+json): `detail` — код ошибки, `errors[].message` — код по полю.\n\n## Подписка в приложениях\n\nСсылка подписки (`sub_url` пользователя) отдаёт конфиг и заголовки, которые читают приложения: `profile-title` — название профиля (настройка `sub_title`, пусто — бренд), `announce` — строка над профилем или под его названием (`sub_announce`), `subscription-userinfo` — трафик и срок, `support-url`, `profile-web-page-url`. Настраиваются в `PATCH /api/v1/settings`.\n\nВ `sub_title` и `sub_announce` подставляются переменные каждого пользователя: `{brand}` — бренд, `{name}` — имя, `{date}` — дата окончания (ДД.ММ.ГГГГ, МСК), `{days}` — дней осталось, `{used}` — израсходовано, `{left}` — осталось трафика, `{total}` — лимит с пакетами. Без срока или лимита — `∞`. Неизвестное слово в фигурных скобках остаётся текстом. Если название после подстановки пустое, берётся бренд. Пример: `{brand} · до {date}`.",
     "title": "mikan",
     "version": "dev"
   },

@@ -63,6 +63,10 @@ const (
 	KeyAppBranding = "app_branding"
 	KeyBrandAccent = "brand_accent"   // #RRGGBB, empty: the app's own
 	KeyBrandLogo   = "brand_logo_url" // https, empty: the app's own
+	// Subscription-page branding is separate from operator branding sent to VPN apps.
+	KeySubPageTheme   = "subscription_theme"
+	KeySubPageLogo    = "subscription_logo" // https image URL or a single emoji
+	KeySubPageModules = "subscription_modules"
 	// KeyLegacySubPath is the path of the subscription links of the panel users were
 	// imported from: "sub" for Marzban and PasarGuard, "api/sub" for Remnawave. The old
 	// tokens lead to the users (legacy_sub_tokens); empty: off.
@@ -75,6 +79,19 @@ const (
 	// KeyQuietHour is the UTC hour the slot pool is refilled, which reconnects QUIC clients.
 	KeyQuietHour = "quiet_hour_utc"
 )
+
+// SubscriptionModule controls one content section on the public subscription page.
+type SubscriptionModule struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
+}
+
+var DefaultSubscriptionModules = []SubscriptionModule{
+	{ID: "status", Enabled: true}, {ID: "usage", Enabled: true}, {ID: "pools", Enabled: true},
+	{ID: "devices", Enabled: true}, {ID: "apps", Enabled: true}, {ID: "instructions", Enabled: true},
+	{ID: "link", Enabled: true}, {ID: "promo", Enabled: true}, {ID: "shop", Enabled: true},
+	{ID: "packages", Enabled: true}, {ID: "telegram", Enabled: true}, {ID: "support", Enabled: true},
+}
 
 // Switch is an on/off setting with its default: read it with On, so the default lives
 // here and nowhere else.
