@@ -29,10 +29,10 @@ import (
 
 // Config is resolved per request, so settings changes apply without a restart.
 type Config struct {
-	Brand      string
-	SupportURL string
-	PageTheme  string
-	PageLogo   string
+	Brand       string
+	SupportURL  string
+	PageTheme   string
+	PageLogo    string
 	PageModules []PageModule
 	// Title is the profile's name in the apps (Profile-Title); "" names it Brand. Title and
 	// Announce may hold TitleVars, filled for each user.
@@ -776,22 +776,22 @@ func (h *Handler) operatorHeaders(w http.ResponseWriter, r *http.Request, u db.U
 // Info is what the subscription page shows. Credentials are not included: the page
 // offers import buttons that point back at this subscription URL.
 type Info struct {
-	Name       string     `json:"name"`
-	Brand      string     `json:"brand"`
-	Theme      string     `json:"theme"`
-	Logo       string     `json:"logo,omitempty"`
+	Name       string       `json:"name"`
+	Brand      string       `json:"brand"`
+	Theme      string       `json:"theme"`
+	Logo       string       `json:"logo,omitempty"`
 	Modules    []PageModule `json:"modules,omitempty"`
-	SupportURL string     `json:"support_url,omitempty"`
-	State      string     `json:"state"`
-	UsedUp     int64      `json:"used_up"`
-	UsedDown   int64      `json:"used_down"`
-	Limit      *int64     `json:"limit,omitempty"`
-	Extra      int64      `json:"extra,omitempty"` // bytes left in traffic packages, spent after Limit
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	ResetsAt   *time.Time `json:"resets_at,omitempty"`
-	Devices    int        `json:"device_limit"`
-	Protocols  []string   `json:"protocols"`
-	Locations  []string   `json:"locations,omitempty"`
+	SupportURL string       `json:"support_url,omitempty"`
+	State      string       `json:"state"`
+	UsedUp     int64        `json:"used_up"`
+	UsedDown   int64        `json:"used_down"`
+	Limit      *int64       `json:"limit,omitempty"`
+	Extra      int64        `json:"extra,omitempty"` // bytes left in traffic packages, spent after Limit
+	ExpiresAt  *time.Time   `json:"expires_at,omitempty"`
+	ResetsAt   *time.Time   `json:"resets_at,omitempty"`
+	Devices    int          `json:"device_limit"`
+	Protocols  []string     `json:"protocols"`
+	Locations  []string     `json:"locations,omitempty"`
 	// Telegram opens the bot with this subscription tied to the account; empty without a bot.
 	Telegram string `json:"telegram,omitempty"`
 	// Bound devices, when binding is on. The device id itself stays in the admin panel.

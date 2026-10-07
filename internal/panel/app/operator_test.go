@@ -153,8 +153,8 @@ func TestSubscriptionPageCustomizationOverHTTP(t *testing.T) {
 		t.Fatalf("subscription info: %d %s", resp.StatusCode, body)
 	}
 	var info struct {
-		Theme   string                      `json:"theme"`
-		Logo    string                      `json:"logo"`
+		Theme   string                        `json:"theme"`
+		Logo    string                        `json:"logo"`
 		Modules []settings.SubscriptionModule `json:"modules"`
 	}
 	if err := json.Unmarshal(body, &info); err != nil {
