@@ -10,9 +10,32 @@ import (
 	"database/sql"
 )
 
+const addTariffTerm = `-- name: AddTariffTerm :exec
+INSERT INTO tariff_terms (tariff_id, days, price_stars, price_rub, sort) VALUES ($1, $2, $3, $4, $5)
+`
+
+type AddTariffTermParams struct {
+	TariffID   int64
+	Days       int64
+	PriceStars sql.NullInt64
+	PriceRub   sql.NullInt64
+	Sort       int64
+}
+
+func (q *Queries) AddTariffTerm(ctx context.Context, arg AddTariffTermParams) error {
+	_, err := q.db.ExecContext(ctx, addTariffTerm,
+		arg.TariffID,
+		arg.Days,
+		arg.PriceStars,
+		arg.PriceRub,
+		arg.Sort,
+	)
+	return err
+}
+
 const addTrafficDaily = `-- name: AddTrafficDaily :exec
-INSERT INTO traffic_daily (user_id, day, up, down) VALUES (?, ?, ?, ?)
-ON CONFLICT (user_id, day) DO UPDATE SET up = up + excluded.up, down = down + excluded.down
+INSERT INTO traffic_daily (user_id, day, up, down) VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, day) DO UPDATE SET up = traffic_daily.up + excluded.up, down = traffic_daily.down + excluded.down
 `
 
 type AddTrafficDailyParams struct {
@@ -33,8 +56,8 @@ func (q *Queries) AddTrafficDaily(ctx context.Context, arg AddTrafficDailyParams
 }
 
 const addTrafficHourly = `-- name: AddTrafficHourly :exec
-INSERT INTO traffic_hourly (user_id, hour, up, down) VALUES (?, ?, ?, ?)
-ON CONFLICT (user_id, hour) DO UPDATE SET up = up + excluded.up, down = down + excluded.down
+INSERT INTO traffic_hourly (user_id, hour, up, down) VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, hour) DO UPDATE SET up = traffic_hourly.up + excluded.up, down = traffic_hourly.down + excluded.down
 `
 
 type AddTrafficHourlyParams struct {
@@ -56,9 +79,9 @@ func (q *Queries) AddTrafficHourly(ctx context.Context, arg AddTrafficHourlyPara
 
 const addUserTraffic = `-- name: AddUserTraffic :exec
 UPDATE users
-SET used_up = used_up + ?1, used_down = used_down + ?2,
-    total_up = total_up + ?1, total_down = total_down + ?2
-WHERE id = ?3
+SET used_up = used_up + $1, used_down = used_down + $2,
+    total_up = total_up + $1, total_down = total_down + $2
+WHERE id = $3
 `
 
 type AddUserTrafficParams struct {
@@ -73,7 +96,7 @@ func (q *Queries) AddUserTraffic(ctx context.Context, arg AddUserTrafficParams) 
 }
 
 const archiveTariff = `-- name: ArchiveTariff :execrows
-UPDATE tariffs SET archived = 1 WHERE id = ?
+UPDATE tariffs SET archived = 1 WHERE id = $1
 `
 
 func (q *Queries) ArchiveTariff(ctx context.Context, id int64) (int64, error) {
@@ -85,7 +108,7 @@ func (q *Queries) ArchiveTariff(ctx context.Context, id int64) (int64, error) {
 }
 
 const burnSlot = `-- name: BurnSlot :exec
-UPDATE slots SET state = 'burned', burned_at = ? WHERE id = ?
+UPDATE slots SET state = 'burned', burned_at = $1 WHERE id = $2
 `
 
 type BurnSlotParams struct {
@@ -143,7 +166,7 @@ func (q *Queries) CountTariffs(ctx context.Context) (int64, error) {
 
 const createInbound = `-- name: CreateInbound :one
 INSERT INTO inbounds (node_id, name, preset, port, enabled, settings, config, created_at, updated_at)
-VALUES (?, ?, ?, ?, 1, '{}', ?, ?, ?)
+VALUES ($1, $2, $3, $4, 1, '{}', $5, $6, $7)
 RETURNING id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen
 `
 
@@ -192,7 +215,7 @@ func (q *Queries) CreateInbound(ctx context.Context, arg CreateInboundParams) (I
 
 const createTariff = `-- name: CreateTariff :one
 INSERT INTO tariffs (name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, created_at, billing_day, price_stars, price_rub, on_sale)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING id, name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, archived, created_at, billing_day, price_stars, price_rub, on_sale
 `
 
@@ -249,7 +272,7 @@ func (q *Queries) CreateTariff(ctx context.Context, arg CreateTariffParams) (Tar
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy,
                    period_days, period_start, expires_at, inbounds, sub_token, slot_id, created_at, updated_at, billing_day)
-VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $14, $15, $16)
 RETURNING id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at
 `
 
@@ -333,7 +356,7 @@ func (q *Queries) DeleteBurnedSlots(ctx context.Context) error {
 }
 
 const deleteInbound = `-- name: DeleteInbound :exec
-DELETE FROM inbounds WHERE id = ?
+DELETE FROM inbounds WHERE id = $1
 `
 
 func (q *Queries) DeleteInbound(ctx context.Context, id int64) error {
@@ -342,7 +365,7 @@ func (q *Queries) DeleteInbound(ctx context.Context, id int64) error {
 }
 
 const deleteNodeStateOf = `-- name: DeleteNodeStateOf :exec
-DELETE FROM node_state WHERE key LIKE '%/' || CAST(?1 AS TEXT)
+DELETE FROM node_state WHERE key LIKE '%/' || CAST($1 AS TEXT)
 `
 
 func (q *Queries) DeleteNodeStateOf(ctx context.Context, nodeID string) error {
@@ -350,17 +373,17 @@ func (q *Queries) DeleteNodeStateOf(ctx context.Context, nodeID string) error {
 	return err
 }
 
-const deleteUser = `-- name: DeleteUser :exec
-DELETE FROM users WHERE id = ?
+const deleteTariffTerms = `-- name: DeleteTariffTerms :exec
+DELETE FROM tariff_terms WHERE tariff_id = $1
 `
 
-func (q *Queries) DeleteUser(ctx context.Context, id int64) error {
-	_, err := q.db.ExecContext(ctx, deleteUser, id)
+func (q *Queries) DeleteTariffTerms(ctx context.Context, tariffID int64) error {
+	_, err := q.db.ExecContext(ctx, deleteTariffTerms, tariffID)
 	return err
 }
 
 const getInbound = `-- name: GetInbound :one
-SELECT id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen FROM inbounds WHERE id = ?
+SELECT id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen FROM inbounds WHERE id = $1
 `
 
 func (q *Queries) GetInbound(ctx context.Context, id int64) (Inbound, error) {
@@ -389,7 +412,7 @@ func (q *Queries) GetInbound(ctx context.Context, id int64) (Inbound, error) {
 }
 
 const getNodeState = `-- name: GetNodeState :one
-SELECT value FROM node_state WHERE key = ?
+SELECT value FROM node_state WHERE key = $1
 `
 
 func (q *Queries) GetNodeState(ctx context.Context, key string) (string, error) {
@@ -400,7 +423,7 @@ func (q *Queries) GetNodeState(ctx context.Context, key string) (string, error) 
 }
 
 const getSlot = `-- name: GetSlot :one
-SELECT id, name, uuid, secret, state, created_at, burned_at FROM slots WHERE id = ?
+SELECT id, name, uuid, secret, state, created_at, burned_at FROM slots WHERE id = $1
 `
 
 func (q *Queries) GetSlot(ctx context.Context, id int64) (Slot, error) {
@@ -419,7 +442,7 @@ func (q *Queries) GetSlot(ctx context.Context, id int64) (Slot, error) {
 }
 
 const getTariff = `-- name: GetTariff :one
-SELECT id, name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, archived, created_at, billing_day, price_stars, price_rub, on_sale FROM tariffs WHERE id = ?
+SELECT id, name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, archived, created_at, billing_day, price_stars, price_rub, on_sale FROM tariffs WHERE id = $1
 `
 
 func (q *Queries) GetTariff(ctx context.Context, id int64) (Tariff, error) {
@@ -445,7 +468,7 @@ func (q *Queries) GetTariff(ctx context.Context, id int64) (Tariff, error) {
 }
 
 const getUser = `-- name: GetUser :one
-SELECT id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at FROM users WHERE id = ?
+SELECT id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUser(ctx context.Context, id int64) (User, error) {
@@ -482,7 +505,7 @@ func (q *Queries) GetUser(ctx context.Context, id int64) (User, error) {
 }
 
 const getUserBySubToken = `-- name: GetUserBySubToken :one
-SELECT id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at FROM users WHERE sub_token = ?
+SELECT id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at FROM users WHERE sub_token = $1
 `
 
 func (q *Queries) GetUserBySubToken(ctx context.Context, subToken string) (User, error) {
@@ -519,7 +542,7 @@ func (q *Queries) GetUserBySubToken(ctx context.Context, subToken string) (User,
 }
 
 const insertSlot = `-- name: InsertSlot :exec
-INSERT INTO slots (name, uuid, secret, state, created_at) VALUES (?, ?, ?, 'free', ?)
+INSERT INTO slots (name, uuid, secret, state, created_at) VALUES ($1, $2, $3, 'free', $4)
 `
 
 type InsertSlotParams struct {
@@ -539,8 +562,42 @@ func (q *Queries) InsertSlot(ctx context.Context, arg InsertSlotParams) error {
 	return err
 }
 
+const listAllTariffTerms = `-- name: ListAllTariffTerms :many
+SELECT id, tariff_id, days, price_stars, price_rub, sort FROM tariff_terms ORDER BY tariff_id, sort, id
+`
+
+func (q *Queries) ListAllTariffTerms(ctx context.Context) ([]TariffTerm, error) {
+	rows, err := q.db.QueryContext(ctx, listAllTariffTerms)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TariffTerm{}
+	for rows.Next() {
+		var i TariffTerm
+		if err := rows.Scan(
+			&i.ID,
+			&i.TariffID,
+			&i.Days,
+			&i.PriceStars,
+			&i.PriceRub,
+			&i.Sort,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listBoundDeviceSlots = `-- name: ListBoundDeviceSlots :many
-SELECT d.id AS device_id, s.name AS slot_name FROM bound_devices d JOIN slots s ON s.id = d.slot_id WHERE d.user_id = ?
+SELECT d.id AS device_id, s.name AS slot_name FROM bound_devices d JOIN slots s ON s.id = d.slot_id WHERE d.user_id = $1
 `
 
 type ListBoundDeviceSlotsRow struct {
@@ -618,7 +675,7 @@ func (q *Queries) ListInbounds(ctx context.Context) ([]Inbound, error) {
 }
 
 const listNodeInbounds = `-- name: ListNodeInbounds :many
-SELECT id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen FROM inbounds WHERE node_id = ? ORDER BY id
+SELECT id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen FROM inbounds WHERE node_id = $1 ORDER BY id
 `
 
 func (q *Queries) ListNodeInbounds(ctx context.Context, nodeID int64) ([]Inbound, error) {
@@ -732,6 +789,40 @@ func (q *Queries) ListSlots(ctx context.Context) ([]Slot, error) {
 	return items, nil
 }
 
+const listTariffTerms = `-- name: ListTariffTerms :many
+SELECT id, tariff_id, days, price_stars, price_rub, sort FROM tariff_terms WHERE tariff_id = $1 ORDER BY sort, id
+`
+
+func (q *Queries) ListTariffTerms(ctx context.Context, tariffID int64) ([]TariffTerm, error) {
+	rows, err := q.db.QueryContext(ctx, listTariffTerms, tariffID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TariffTerm{}
+	for rows.Next() {
+		var i TariffTerm
+		if err := rows.Scan(
+			&i.ID,
+			&i.TariffID,
+			&i.Days,
+			&i.PriceStars,
+			&i.PriceRub,
+			&i.Sort,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTariffs = `-- name: ListTariffs :many
 SELECT id, name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, archived, created_at, billing_day, price_stars, price_rub, on_sale FROM tariffs WHERE archived = 0 ORDER BY sort, id
 `
@@ -775,7 +866,7 @@ func (q *Queries) ListTariffs(ctx context.Context) ([]Tariff, error) {
 }
 
 const listUserDevices = `-- name: ListUserDevices :many
-SELECT user_id, ip, first_seen, last_seen FROM devices WHERE user_id = ? ORDER BY last_seen DESC
+SELECT user_id, ip, first_seen, last_seen FROM devices WHERE user_id = $1 ORDER BY last_seen DESC
 `
 
 func (q *Queries) ListUserDevices(ctx context.Context, userID int64) ([]Device, error) {
@@ -807,9 +898,9 @@ func (q *Queries) ListUserDevices(ctx context.Context, userID int64) ([]Device, 
 }
 
 const listUserSlots = `-- name: ListUserSlots :many
-SELECT s.name FROM slots s JOIN users u ON u.slot_id = s.id WHERE u.id = ?1
+SELECT s.name FROM slots s JOIN users u ON u.slot_id = s.id WHERE u.id = $1
 UNION
-SELECT s.name FROM slots s JOIN bound_devices d ON d.slot_id = s.id WHERE d.user_id = ?1
+SELECT s.name FROM slots s JOIN bound_devices d ON d.slot_id = s.id WHERE d.user_id = $1
 `
 
 // The same for one user: what an answer about a single user needs, not the whole table.
@@ -889,19 +980,8 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
-const maxSlotID = `-- name: MaxSlotID :one
-SELECT CAST(coalesce(max(id), 0) AS INTEGER) FROM slots
-`
-
-func (q *Queries) MaxSlotID(ctx context.Context) (int64, error) {
-	row := q.db.QueryRowContext(ctx, maxSlotID)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
-}
-
 const pruneDevices = `-- name: PruneDevices :exec
-DELETE FROM devices WHERE last_seen < ?
+DELETE FROM devices WHERE last_seen < $1
 `
 
 func (q *Queries) PruneDevices(ctx context.Context, lastSeen int64) error {
@@ -910,7 +990,7 @@ func (q *Queries) PruneDevices(ctx context.Context, lastSeen int64) error {
 }
 
 const pruneTrafficDaily = `-- name: PruneTrafficDaily :exec
-DELETE FROM traffic_daily WHERE day < ?
+DELETE FROM traffic_daily WHERE day < $1
 `
 
 func (q *Queries) PruneTrafficDaily(ctx context.Context, day int64) error {
@@ -919,7 +999,7 @@ func (q *Queries) PruneTrafficDaily(ctx context.Context, day int64) error {
 }
 
 const pruneTrafficHourly = `-- name: PruneTrafficHourly :exec
-DELETE FROM traffic_hourly WHERE hour < ?
+DELETE FROM traffic_hourly WHERE hour < $1
 `
 
 func (q *Queries) PruneTrafficHourly(ctx context.Context, hour int64) error {
@@ -928,7 +1008,7 @@ func (q *Queries) PruneTrafficHourly(ctx context.Context, hour int64) error {
 }
 
 const resetUserTraffic = `-- name: ResetUserTraffic :exec
-UPDATE users SET used_up = 0, used_down = 0, period_start = ?, updated_at = ? WHERE id = ?
+UPDATE users SET used_up = 0, used_down = 0, period_start = $1, updated_at = $2 WHERE id = $3
 `
 
 type ResetUserTrafficParams struct {
@@ -943,7 +1023,7 @@ func (q *Queries) ResetUserTraffic(ctx context.Context, arg ResetUserTrafficPara
 }
 
 const setInboundConfig = `-- name: SetInboundConfig :exec
-UPDATE inbounds SET config = ? WHERE id = ?
+UPDATE inbounds SET config = $1 WHERE id = $2
 `
 
 type SetInboundConfigParams struct {
@@ -957,7 +1037,7 @@ func (q *Queries) SetInboundConfig(ctx context.Context, arg SetInboundConfigPara
 }
 
 const setNodeState = `-- name: SetNodeState :exec
-INSERT INTO node_state (key, value) VALUES (?, ?)
+INSERT INTO node_state (key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = excluded.value
 `
 
@@ -971,17 +1051,8 @@ func (q *Queries) SetNodeState(ctx context.Context, arg SetNodeStateParams) erro
 	return err
 }
 
-const setSlotCounter = `-- name: SetSlotCounter :exec
-INSERT INTO slot_counter (id, last) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET last = excluded.last
-`
-
-func (q *Queries) SetSlotCounter(ctx context.Context, last int64) error {
-	_, err := q.db.ExecContext(ctx, setSlotCounter, last)
-	return err
-}
-
 const setUserCredentials = `-- name: SetUserCredentials :exec
-UPDATE users SET slot_id = ?, sub_token = ?, updated_at = ? WHERE id = ?
+UPDATE users SET slot_id = $1, sub_token = $2, updated_at = $3 WHERE id = $4
 `
 
 type SetUserCredentialsParams struct {
@@ -1001,20 +1072,6 @@ func (q *Queries) SetUserCredentials(ctx context.Context, arg SetUserCredentials
 	return err
 }
 
-const setUserOnline = `-- name: SetUserOnline :exec
-UPDATE users SET online_at = ? WHERE id = ?
-`
-
-type SetUserOnlineParams struct {
-	OnlineAt sql.NullInt64
-	ID       int64
-}
-
-func (q *Queries) SetUserOnline(ctx context.Context, arg SetUserOnlineParams) error {
-	_, err := q.db.ExecContext(ctx, setUserOnline, arg.OnlineAt, arg.ID)
-	return err
-}
-
 const slotCounter = `-- name: SlotCounter :one
 SELECT last FROM slot_counter WHERE id = 1
 `
@@ -1029,7 +1086,7 @@ func (q *Queries) SlotCounter(ctx context.Context) (int64, error) {
 
 const takeFreeSlot = `-- name: TakeFreeSlot :one
 UPDATE slots SET state = 'assigned'
-WHERE id = (SELECT id FROM slots WHERE state = 'free' ORDER BY id LIMIT 1)
+WHERE id = (SELECT id FROM slots WHERE state = 'free' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) AND state = 'free'
 RETURNING id, name, uuid, secret, state, created_at, burned_at
 `
 
@@ -1049,15 +1106,15 @@ func (q *Queries) TakeFreeSlot(ctx context.Context) (Slot, error) {
 }
 
 const topUsersByTraffic = `-- name: TopUsersByTraffic :many
-SELECT u.id, u.name, CAST(sum(d.up + d.down) AS INTEGER) AS bytes
+SELECT u.id, u.name, CAST(sum(d.up + d.down) AS BIGINT) AS bytes
 FROM traffic_daily d JOIN users u ON u.id = d.user_id
-WHERE d.day >= ?
-GROUP BY u.id ORDER BY bytes DESC LIMIT ?
+WHERE d.day >= $1
+GROUP BY u.id, u.name ORDER BY bytes DESC LIMIT CAST($2 AS BIGINT)
 `
 
 type TopUsersByTrafficParams struct {
-	Day   int64
-	Limit int64
+	Day int64
+	Lim int64
 }
 
 type TopUsersByTrafficRow struct {
@@ -1067,7 +1124,7 @@ type TopUsersByTrafficRow struct {
 }
 
 func (q *Queries) TopUsersByTraffic(ctx context.Context, arg TopUsersByTrafficParams) ([]TopUsersByTrafficRow, error) {
-	rows, err := q.db.QueryContext(ctx, topUsersByTraffic, arg.Day, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, topUsersByTraffic, arg.Day, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -1090,8 +1147,8 @@ func (q *Queries) TopUsersByTraffic(ctx context.Context, arg TopUsersByTrafficPa
 }
 
 const totalTrafficDaily = `-- name: TotalTrafficDaily :many
-SELECT day, CAST(sum(up) AS INTEGER) AS up, CAST(sum(down) AS INTEGER) AS down
-FROM traffic_daily WHERE day >= ? GROUP BY day ORDER BY day
+SELECT day, CAST(sum(up) AS BIGINT) AS up, CAST(sum(down) AS BIGINT) AS down
+FROM traffic_daily WHERE day >= $1 GROUP BY day ORDER BY day
 `
 
 type TotalTrafficDailyRow struct {
@@ -1124,8 +1181,8 @@ func (q *Queries) TotalTrafficDaily(ctx context.Context, day int64) ([]TotalTraf
 }
 
 const totalTrafficHourly = `-- name: TotalTrafficHourly :many
-SELECT hour, CAST(sum(up) AS INTEGER) AS up, CAST(sum(down) AS INTEGER) AS down
-FROM traffic_hourly WHERE hour >= ? GROUP BY hour ORDER BY hour
+SELECT hour, CAST(sum(up) AS BIGINT) AS up, CAST(sum(down) AS BIGINT) AS down
+FROM traffic_hourly WHERE hour >= $1 GROUP BY hour ORDER BY hour
 `
 
 type TotalTrafficHourlyRow struct {
@@ -1158,7 +1215,7 @@ func (q *Queries) TotalTrafficHourly(ctx context.Context, hour int64) ([]TotalTr
 }
 
 const updateInbound = `-- name: UpdateInbound :one
-UPDATE inbounds SET port = ?, enabled = ?, config = ?, display_name = ?, updated_at = ? WHERE id = ? RETURNING id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen
+UPDATE inbounds SET port = $1, enabled = $2, config = $3, display_name = $4, updated_at = $5 WHERE id = $6 RETURNING id, node_id, name, preset, port, enabled, settings, created_at, updated_at, display_name, config, auto_port, auto_sni, outbound, exit_node_id, pool_id, listen
 `
 
 type UpdateInboundParams struct {
@@ -1204,9 +1261,9 @@ func (q *Queries) UpdateInbound(ctx context.Context, arg UpdateInboundParams) (I
 
 const updateTariff = `-- name: UpdateTariff :one
 UPDATE tariffs
-SET name = ?, traffic_limit = ?, duration_days = ?, device_limit = ?, reset_strategy = ?, price_label = ?, sort = ?, billing_day = ?,
-    price_stars = ?, price_rub = ?, on_sale = ?
-WHERE id = ?
+SET name = $1, traffic_limit = $2, duration_days = $3, device_limit = $4, reset_strategy = $5, price_label = $6, sort = $7, billing_day = $8,
+    price_stars = $9, price_rub = $10, on_sale = $11
+WHERE id = $12
 RETURNING id, name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, archived, created_at, billing_day, price_stars, price_rub, on_sale
 `
 
@@ -1262,9 +1319,9 @@ func (q *Queries) UpdateTariff(ctx context.Context, arg UpdateTariffParams) (Tar
 
 const updateUser = `-- name: UpdateUser :one
 UPDATE users
-SET name = ?, contact = ?, note = ?, tags = ?, status = ?, tariff_id = ?, traffic_limit = ?, device_limit = ?,
-    reset_strategy = ?, period_days = ?, period_start = ?, expires_at = ?, inbounds = ?, updated_at = ?, billing_day = ?
-WHERE id = ?
+SET name = $1, contact = $2, note = $3, tags = $4, status = $5, tariff_id = $6, traffic_limit = $7, device_limit = $8,
+    reset_strategy = $9, period_days = $10, period_start = $11, expires_at = $12, inbounds = $13, updated_at = $14, billing_day = $15
+WHERE id = $16
 RETURNING id, name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy, period_days, period_start, used_up, used_down, total_up, total_down, expires_at, inbounds, sub_token, slot_id, online_at, created_at, updated_at, billing_day, unbound_at
 `
 
@@ -1338,7 +1395,7 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 }
 
 const upsertDevice = `-- name: UpsertDevice :exec
-INSERT INTO devices (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?)
+INSERT INTO devices (user_id, ip, first_seen, last_seen) VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, ip) DO UPDATE SET last_seen = excluded.last_seen
 `
 
@@ -1360,7 +1417,7 @@ func (q *Queries) UpsertDevice(ctx context.Context, arg UpsertDeviceParams) erro
 }
 
 const userTrafficDaily = `-- name: UserTrafficDaily :many
-SELECT day, up, down FROM traffic_daily WHERE user_id = ? AND day >= ? ORDER BY day
+SELECT day, up, down FROM traffic_daily WHERE user_id = $1 AND day >= $2 ORDER BY day
 `
 
 type UserTrafficDailyParams struct {
@@ -1398,7 +1455,7 @@ func (q *Queries) UserTrafficDaily(ctx context.Context, arg UserTrafficDailyPara
 }
 
 const userTrafficHourly = `-- name: UserTrafficHourly :many
-SELECT hour, up, down FROM traffic_hourly WHERE user_id = ? AND hour >= ? ORDER BY hour
+SELECT hour, up, down FROM traffic_hourly WHERE user_id = $1 AND hour >= $2 ORDER BY hour
 `
 
 type UserTrafficHourlyParams struct {

@@ -3,7 +3,10 @@
 #
 #   curl -fsSL https://github.com/Miroshka000/mikan/releases/latest/download/install.sh | sudo bash
 #
-# Downloads the release manifest and its signature, checks the signature against the
+# Finds the newest stable release in the signed release index (an asset of the "updates"
+# pre-release, which does not depend on what GitHub calls the latest release), or takes
+# the latest release when the index cannot be had or believed. Downloads that release's
+# manifest and its signature, checks the signature against the
 # release key built into this script, then downloads the installer for this server's
 # architecture from the address the manifest names and checks its sha256 against the
 # manifest, and starts it with the arguments given after "-s --":
@@ -18,6 +21,7 @@ set -eu
 
 REPO="Miroshka000/mikan"
 BASE="https://github.com/$REPO/releases/latest/download"
+INDEX="https://github.com/$REPO/releases/download/updates/index.json"
 
 # The public half of the key that signs every release's manifest.json: the same key as
 # internal/release.PublicKey (installer/src/release.rs checks that this text matches it).
@@ -60,14 +64,81 @@ esac
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
+# A dead route must end in an error, not in silence: a connection that does not open in
+# 15 s or a transfer slower than 1 KB/s for 30 s is retried, then given up. curl before
+# 7.71 (Ubuntu 20.04) retries only some errors; newer ones retry every failure.
+retry="--retry 3"
+if { curl --help all || curl --help; } 2>/dev/null | grep -q -- '--retry-all-errors'; then
+  retry="$retry --retry-all-errors"
+fi
+# get URL FILE WHAT [bar]: says what it downloads; "bar" shows curl's progress bar on a
+# terminal (the installer is the only big file).
 get() {
-  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
+  echo "mikan: downloading $3: $1" >&2
+  shown=-s
+  if [ "${4:-}" = bar ] && [ -t 2 ]; then
+    shown=--progress-bar
+  fi
+  # shellcheck disable=SC2086 # $retry is a list of flags
+  curl -fSL $shown --proto '=https' --tlsv1.2 --connect-timeout 15 --speed-limit 1024 --speed-time 30 $retry "$1" -o "$2" || {
+    code=$?
+    case $code in
+      22) hint="the address answered with an HTTP error" ;;
+      *) hint="GitHub release downloads are unreachable from this server; check IPv6/proxy" ;;
+    esac
+    fail "cannot download $3 from $1 (curl exit code $code): $hint"
+  }
 }
-get "$BASE/manifest.json" "$tmp/manifest.json" || fail "cannot download the release manifest"
-get "$BASE/manifest.json.sig" "$tmp/manifest.json.sig" || fail "cannot download the manifest's signature"
+# try URL FILE: a download whose failure is an answer, not the end.
+try() {
+  # shellcheck disable=SC2086 # $retry is a list of flags
+  curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --speed-limit 1024 --speed-time 30 $retry "$1" -o "$2" 2>/dev/null
+}
+printf '%s\n' "$PUBKEY" >"$tmp/key.pem"
+# signed FILE SIG: whether SIG is the release key's signature over FILE's exact bytes.
+signed() {
+  tr -d ' \n\r' <"$2" | base64 -d >"$tmp/check.bin" 2>/dev/null || return 1
+  [ "$(wc -c <"$tmp/check.bin" | tr -d ' ')" = 64 ] || return 1
+  openssl pkeyutl -verify -pubin -inkey "$tmp/key.pem" -rawin -in "$1" -sigfile "$tmp/check.bin" >/dev/null 2>&1
+}
+# The newest stable release the index lists (internal/release/index.go): entries are flat
+# objects, so each is one line once split at "{"; one this script cannot read is skipped.
+# Only "stable" release versions count, and the manifest comes from that version's own
+# release in this project, whatever else the entry says.
+newest_stable() {
+  { tr -d ' \t\r\n' <"$1" | tr '{' '\n' && echo; } | while IFS= read -r e; do
+    v=$(printf '%s' "$e" | sed -n 's/.*"version":"\([0-9.]*\)".*/\1/p')
+    c=$(printf '%s' "$e" | sed -n 's/.*"channel":"\([a-z]*\)".*/\1/p')
+    if [ "$c" = stable ] && printf '%s\n' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?'; then
+      printf '%s\n' "$v"
+    fi
+  done | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n 1
+}
+
+# The index first; whatever goes wrong with it, the latest release.
+release=""
+echo "mikan: reading the release index: $INDEX" >&2
+if try "$INDEX" "$tmp/index.json" && try "$INDEX.sig" "$tmp/index.json.sig" && signed "$tmp/index.json" "$tmp/index.json.sig"; then
+  newest=$(newest_stable "$tmp/index.json")
+  at="https://github.com/$REPO/releases/download/v$newest/manifest.json"
+  if [ -z "$newest" ]; then
+    echo "mikan: the release index lists no stable release: using the latest release" >&2
+  elif try "$at" "$tmp/manifest.json" && try "$at.sig" "$tmp/manifest.json.sig" && signed "$tmp/manifest.json" "$tmp/manifest.json.sig" &&
+    tr -d '\n ' <"$tmp/manifest.json" | grep -qF "\"version\":\"$newest\""; then
+    release=$newest
+    echo "mikan: mikan $newest, the newest stable release" >&2
+  else
+    echo "mikan: the manifest of mikan $newest is unavailable: using the latest release" >&2
+  fi
+else
+  echo "mikan: the release index is unavailable: using the latest release" >&2
+fi
+if [ -z "$release" ]; then
+  get "$BASE/manifest.json" "$tmp/manifest.json" "the release manifest"
+  get "$BASE/manifest.json.sig" "$tmp/manifest.json.sig" "the manifest's signature"
+fi
 
 # The signature first: nothing in the manifest is read before it is known to be the release's.
-printf '%s\n' "$PUBKEY" >"$tmp/key.pem"
 tr -d ' \n\r' <"$tmp/manifest.json.sig" | base64 -d >"$tmp/sig.bin" 2>/dev/null || fail "the manifest's signature is not base64"
 [ "$(wc -c <"$tmp/sig.bin" | tr -d ' ')" = 64 ] || fail "the manifest's signature has the wrong length"
 openssl pkeyutl -verify -pubin -inkey "$tmp/key.pem" -rawin -in "$tmp/manifest.json" -sigfile "$tmp/sig.bin" >/dev/null 2>&1 ||
@@ -84,7 +155,7 @@ case "$url" in
   "https://github.com/$REPO/releases/download/v"*"/mikan-$arch") ;;
   *) fail "the manifest names an installer at an address outside this project's releases: $url" ;;
 esac
-get "$url" "$tmp/mikan" || fail "cannot download the installer"
+get "$url" "$tmp/mikan" "the installer for $arch" bar
 got=$(sha256sum "$tmp/mikan" | cut -d' ' -f1)
 [ "$want" = "$got" ] || fail "the installer does not match the signed release manifest"
 

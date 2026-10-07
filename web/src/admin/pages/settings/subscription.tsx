@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from "react";
+import { ArrowDown, ArrowUp } from "lucide-react";
 import type { Schemas } from "../../../api/client";
 import { useInbounds, useNodes } from "../../../api/hooks";
 import { Button, Field, Pill } from "../../../components/ui";
 import { Switch } from "../../../components/switch";
-import { t } from "../../../i18n";
+import { t, tMaybe } from "../../../i18n";
 import { useDraft } from "../../../lib/draft";
 import { fieldErrors } from "../../../lib/fields";
 import { FingerprintSelect } from "../../../components/fingerprint-select";
@@ -172,6 +173,181 @@ export function SubscriptionCard({ s }: { s: Schemas["SettingsView"] }) {
           <input id="s-support" className="input" value={form.support_url} onChange={set("support_url")} placeholder="https://t.me/your_support" aria-invalid={!!errors.support_url} />
         </Field>
         <Button type="submit" variant="primary" loading={save.isPending} disabled={!fpOk || !form.client_fingerprint}>
+          {t("common.save")}
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+// The variables the title and the announcement take (subs.TitleVars).
+const TITLE_VARS = ["brand", "name", "date", "days", "used", "left", "total"] as const;
+
+// The {words} of a text that are no variable: they stay as text in the apps, so this only
+// warns (same case-sensitive match as the panel's substitution).
+function unknownVars(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.matchAll(/\{([A-Za-z0-9_-]+)\}/g)) {
+    if (!(TITLE_VARS as readonly string[]).includes(m[1] ?? "")) found.add(m[0]);
+  }
+  return [...found];
+}
+
+// What the apps show besides the servers: an announcement for every app that reads one,
+// and the brand for the apps that read operator headers (ClashFest, SlothClash).
+export function AppsCard({ s }: { s: Schemas["SettingsView"] }) {
+  const save = useSaveSettings();
+  const { draft: form, setDraft: setForm } = useDraft({ sub_title: s.sub_title, sub_announce: s.sub_announce, sub_announce_url: s.sub_announce_url, brand_accent: s.brand_accent, brand_logo_url: s.brand_logo_url });
+  const errors = fieldErrors(save.error);
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    save.mutate({ sub_title: form.sub_title.trim(), sub_announce: form.sub_announce.trim(), sub_announce_url: form.sub_announce_url.trim(), brand_accent: form.brand_accent.trim(), brand_logo_url: form.brand_logo_url.trim() });
+  };
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  // A variable chip goes into the field last typed in: the title until the announcement is.
+  const [target, setTarget] = useState<"sub_title" | "sub_announce">("sub_title");
+  const insert = (v: string) => setForm((f) => ({ ...f, [target]: (f[target] ? f[target].replace(/\s*$/, " ") : "") + `{${v}}` }));
+  const unknownTitle = unknownVars(form.sub_title);
+  const unknownAnnounce = unknownVars(form.sub_announce);
+  const withUnknown = (hint: string, unknown: string[]) =>
+    unknown.length === 0 ? (
+      hint
+    ) : (
+      <>
+        {hint} <span className="font-medium">{t("settings.unknownVars", { vars: unknown.join(" ") })}</span>
+      </>
+    );
+  const accent = /^#[0-9A-Fa-f]{6}$/.test(form.brand_accent.trim()) ? form.brand_accent.trim() : "";
+  return (
+    <section className="card glass reveal" style={{ "--i": 2 } as React.CSSProperties}>
+      <form onSubmit={submit} noValidate>
+        <div className="card-head">
+          <div>
+            <h2 className="card-title">{t("settings.apps")}</h2>
+            <div className="card-sub">{t("settings.appsSub")}</div>
+          </div>
+        </div>
+        <Field label={t("settings.subTitle")} htmlFor="s-sub-title" hint={withUnknown(t("settings.subTitleHint"), unknownTitle)} error={errors.sub_title}>
+          <input
+            id="s-sub-title"
+            className="input"
+            value={form.sub_title}
+            onChange={set("sub_title")}
+            onFocus={() => setTarget("sub_title")}
+            maxLength={200}
+            placeholder={s.brand || "{brand}"}
+            aria-invalid={!!errors.sub_title}
+          />
+        </Field>
+        <Field label={t("settings.announce")} htmlFor="s-announce" hint={withUnknown(t("settings.announceHint"), unknownAnnounce)} error={errors.sub_announce}>
+          <input
+            id="s-announce"
+            className="input"
+            value={form.sub_announce}
+            onChange={set("sub_announce")}
+            onFocus={() => setTarget("sub_announce")}
+            maxLength={200}
+            aria-invalid={!!errors.sub_announce}
+          />
+        </Field>
+        <div className="-mt-1 mb-3 flex flex-wrap items-center gap-2" role="group" aria-label={t("settings.titleVars")}>
+          <span className="text-xs text-[var(--ink-500)]">{t("settings.titleVars")}</span>
+          {TITLE_VARS.map((v) => (
+            <button key={v} type="button" className="chip-btn" title={t(`settings.titleVar.${v}`)} onClick={() => insert(v)}>
+              <span className="mono">{`{${v}}`}</span>
+            </button>
+          ))}
+        </div>
+        <Field label={t("settings.announceUrl")} htmlFor="s-announce-url" hint={t("settings.announceUrlHint")} error={errors.sub_announce_url}>
+          <input id="s-announce-url" className="input" value={form.sub_announce_url} onChange={set("sub_announce_url")} placeholder="https://t.me/your_channel" aria-invalid={!!errors.sub_announce_url} />
+        </Field>
+        <div className="flex items-start justify-between gap-4 py-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium">{t("settings.appBranding")}</div>
+            <div className="mt-1 text-xs text-[var(--ink-500)]">{t("settings.appBrandingSub")}</div>
+          </div>
+          <Switch checked={s.app_branding} label={t("settings.appBranding")} disabled={save.isPending} onChange={(v) => save.mutate({ app_branding: v })} />
+        </div>
+        {s.app_branding ? (
+          <div className="grid gap-x-3 sm:grid-cols-[160px_1fr]">
+            <Field label={t("settings.brandAccent")} htmlFor="s-accent" hint={t("settings.brandAccentHint")} error={errors.brand_accent}>
+              <div className="flex items-center gap-2">
+                <span className="h-9 w-9 shrink-0 rounded-lg border border-[var(--hairline)]" style={{ background: accent || "transparent" }} aria-hidden />
+                <input id="s-accent" className="input mono" value={form.brand_accent} onChange={set("brand_accent")} maxLength={7} placeholder="#F07A2E" autoComplete="off" aria-invalid={!!errors.brand_accent} />
+              </div>
+            </Field>
+            <Field label={t("settings.brandLogo")} htmlFor="s-logo" hint={t("settings.brandLogoHint")} error={errors.brand_logo_url}>
+              <input id="s-logo" className="input" value={form.brand_logo_url} onChange={set("brand_logo_url")} placeholder="https://example.com/logo-256.png" aria-invalid={!!errors.brand_logo_url} />
+            </Field>
+          </div>
+        ) : null}
+        <Button type="submit" variant="primary" loading={save.isPending}>
+          {t("common.save")}
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+const PAGE_THEMES = ["mikan", "midnight", "ocean", "sakura", "forest"] as const;
+const PAGE_THEME_LABELS = { mikan: "settings.themeMikan", midnight: "settings.themeMidnight", ocean: "settings.themeOcean", sakura: "settings.themeSakura", forest: "settings.themeForest" } as const;
+const MODULE_LABELS: Record<string, string> = {
+  status: "settings.pageModuleStatus", usage: "settings.pageModuleUsage", pools: "settings.pageModulePools",
+  devices: "settings.pageModuleDevices", apps: "settings.pageModuleApps", instructions: "settings.pageModuleInstructions",
+  link: "settings.pageModuleLink", promo: "settings.pageModulePromo", shop: "settings.pageModuleShop",
+  packages: "settings.pageModulePackages", telegram: "settings.pageModuleTelegram", support: "settings.pageModuleSupport",
+};
+
+/** Theme, logo and the order/visibility of sections on the public subscription page. */
+export function SubPageCard({ s }: { s: Schemas["SettingsView"] }) {
+  const save = useSaveSettings();
+  const [theme, setTheme] = useState(s.subscription_theme);
+  const [logo, setLogo] = useState(s.subscription_logo);
+  const [modules, setModules] = useState(s.subscription_modules);
+  const errors = fieldErrors(save.error);
+  const move = (index: number, delta: number) => {
+    const next = [...modules];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    setModules(next);
+  };
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    save.mutate({ subscription_theme: theme, subscription_logo: logo.trim(), subscription_modules: modules });
+  };
+  return (
+    <section className="card glass reveal" style={{ "--i": 2 } as React.CSSProperties}>
+      <form onSubmit={submit} noValidate>
+        <div className="card-head"><div><h2 className="card-title">{t("settings.subscriptionPage")}</h2><div className="card-sub">{t("settings.subscriptionPageSub")}</div></div></div>
+        <Field label={t("settings.subscriptionTheme")} htmlFor="sub-page-theme" error={errors.subscription_theme}>
+          <select id="sub-page-theme" className="input" value={theme} onChange={(e) => setTheme(e.target.value as typeof theme)}>
+            {PAGE_THEMES.map((value) => <option key={value} value={value}>{t(PAGE_THEME_LABELS[value])}</option>)}
+          </select>
+        </Field>
+        <Field label={t("settings.subscriptionLogo")} htmlFor="sub-page-logo" hint={t("settings.subscriptionLogoHint")} error={errors.subscription_logo}>
+          <div className="flex items-center gap-3">
+            <span className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-xl border border-[var(--hairline)] bg-[var(--surface-soft)] text-xl">
+              {logo.startsWith("https://") ? <img src={logo} alt="" className="h-full w-full object-cover" /> : logo || (s.brand || "V")[0]}
+            </span>
+            <input id="sub-page-logo" className="input" value={logo} onChange={(e) => setLogo(e.target.value)} maxLength={500} placeholder="✨ или https://example.com/logo.png" aria-invalid={!!errors.subscription_logo} />
+          </div>
+        </Field>
+        <div className="mt-4 mb-2 text-[13px] font-medium">{t("settings.subscriptionModules")}</div>
+        <div className="row-list">
+          {modules.map((module, index) => (
+            <div key={module.id} className="flex items-center gap-2 py-2">
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <Switch checked={module.enabled} label={tMaybe(MODULE_LABELS[module.id] ?? module.id) ?? module.id} disabled={save.isPending} onChange={(enabled) => setModules((cur) => cur.map((m) => m.id === module.id ? { ...m, enabled } : m))} />
+                <span className="truncate text-[13px]">{tMaybe(MODULE_LABELS[module.id] ?? module.id) ?? module.id}</span>
+              </div>
+              <button type="button" className="icon-btn" aria-label={t("settings.moduleMoveUp")} disabled={index === 0 || save.isPending} onClick={() => move(index, -1)}><ArrowUp size={16} /></button>
+              <button type="button" className="icon-btn" aria-label={t("settings.moduleMoveDown")} disabled={index === modules.length - 1 || save.isPending} onClick={() => move(index, 1)}><ArrowDown size={16} /></button>
+            </div>
+          ))}
+        </div>
+        {errors.subscription_modules ? <div className="mt-2 text-xs text-[var(--berry-600)]">{errors.subscription_modules}</div> : null}
+        <Button type="submit" variant="primary" loading={save.isPending}>
           {t("common.save")}
         </Button>
       </form>

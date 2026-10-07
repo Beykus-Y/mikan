@@ -46,9 +46,35 @@ func (t *Tunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 		return
 	}
 	c := &countingConn{Conn: conn, slot: s, bucket: b, inName: m.InName, ip: ip, now: t.reg.now}
+	if t.reg.torrentWatch(s) {
+		bc := N.NewBufferedConn(conn)
+		c.Conn = bc
+		if kind := torrentTCP(peekFirst(bc)); kind != "" {
+			t.reg.caught(s, ip, m.InName, "tcp", kind, m.RemoteAddress())
+			_ = c.Close()
+			return
+		}
+	}
 	s.addConn(c)
 	defer c.Close()
 	t.inner.HandleTCPConn(c, m)
+}
+
+// peekFirst returns the bytes the client sent first, waiting torrentPeekWait at most;
+// nil when it sent nothing by then, or the connection cannot be given a deadline and
+// waiting could hang it.
+func peekFirst(bc *N.BufferedConn) []byte {
+	if bc.SetReadDeadline(time.Now().Add(torrentPeekWait)) != nil {
+		return nil
+	}
+	_, err := bc.Peek(1)
+	_ = bc.SetReadDeadline(time.Time{})
+	if err != nil {
+		return nil
+	}
+	// Peek(1) has buffered what arrived with the first byte; this one cannot block.
+	b, _ := bc.Peek(bc.Buffered())
+	return b
 }
 
 func (t *Tunnel) HandleUDPPacket(p C.UDPPacket, m *C.Metadata) {
@@ -56,10 +82,18 @@ func (t *Tunnel) HandleUDPPacket(p C.UDPPacket, m *C.Metadata) {
 		t.inner.HandleUDPPacket(p, m)
 		return
 	}
-	s, b := t.reg.admitIn(m.InUser, m.InName, m.SrcIP.Unmap().String(), false)
+	ip := m.SrcIP.Unmap().String()
+	s, b := t.reg.admitIn(m.InUser, m.InName, ip, false)
 	if s == nil {
 		p.Drop()
 		return
+	}
+	if t.reg.torrentWatch(s) {
+		if kind := torrentUDP(p.Data()); kind != "" {
+			t.reg.caught(s, ip, m.InName, "udp", kind, m.RemoteAddress())
+			p.Drop()
+			return
+		}
 	}
 	s.countIn(b, int64(len(p.Data())), 0)
 	t.inner.HandleUDPPacket(&countingPacket{UDPPacket: p, slot: s, bucket: b}, m)

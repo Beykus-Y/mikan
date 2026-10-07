@@ -3,6 +3,106 @@
 Each release has a section in English and in Russian; the release workflow puts them in
 the signed manifest, and the panel shows the one in its language.
 
+## 0.5.0.2
+### en
+- **Nodes update from the panel.** The Nodes page shows each node's version and marks the ones behind the panel, with **Update** and **Update all**. By default nodes follow the panel by themselves: after the panel updates, they are brought to its version one at a time, the next one starting when the previous one works. A node that fails goes back to its version, you get a notice, and the rollout stops. The switch is in Settings → General → Updates.
+- A node installs only signed releases and never goes back to an older one. Its nightly timer no longer moves it ahead of the panel.
+- Nodes on 0.5.0.1 and older need `mikan update` on their server once; the panel shows the command. After that they update from the panel.
+- With device binding, the places taken are the bound devices: a phone moving from Wi-Fi to mobile data no longer looks like two devices. Connection addresses are shown separately and take no places.
+- "What changed" in Settings → Updates shows bold text, code and links properly.
+- **Torrent blocker** (Settings → Clash rules): nodes recognise BitTorrent and drop it; a caught user can be banned on every node for a chosen time. The ban is per user, not per IP. A plain tracker request alone bans nobody: it takes three within ten minutes, since a web page can make a browser send one. Users can be exempted, and bans lifted in their card.
+- **Speed test of a node** (Nodes → a node): latency, loss, download and upload, with the history. One test uses up to 250 MB down and 100 MB up; a node can be tested once in 5 minutes.
+- **Subscription name in apps** (Settings → Subscription): the profile name Happ, v2RayTun and Hiddify show, with variables like `{name}`, `{days}` and `{left}`; the announcement takes them too.
+- **Close a traffic pool on a plan**: the plan's users lose that pool at once, and its packages are not sold to them. Opening it again puts the plan's limit back on them.
+- **Remove a subscription from the bot**: the subscription screen in the bot has "Remove from the bot". Only the Telegram link goes: the subscription keeps working in the apps and comes back when its link is sent to the bot.
+- **Server order** (Nodes, arrows up and down): the order of the nodes is the order of the servers in subscriptions, in every app.
+- Promo codes: the bot's **Promo codes** button opens the Mini App signed in, one **Apply** takes both bonus and discount codes (a discount applies at checkout), and discounts are shown in rubles. In the promo code form sums of a RUB code are entered in rubles; a minimum order or a maximum discount needs the code's currency.
+- A Telegram Stars refund takes back what the payment gave: a new subscription is turned off, a renewal loses its term (and gets its previous plan back when nothing changed since), a traffic package is removed, and the promo code can be used again. Refunds Telegram makes itself do the same. The buyer gets a message in the bot.
+- The bot takes the old subscription links of users imported from Marzban, PasarGuard or Remnawave, and the user's card shows the old link (Remnawave) or that it still works.
+- Cascade: the relay on the exit node no longer takes a port another program holds, and a relay whose port is taken moves to a free one by itself. The cascade window shows the relay's state, and an alert comes when it is down. Works with nodes on 0.5.0.2.
+- WARP: the WARP window shows why the check fails (no UDP answer from the endpoint, DNS, TLS and so on), the node writes it to its log, and **Check** really checks again. The WARP alert in Telegram gives the reason too.
+- Behind a proxy (a protocol with its own listen address) the masking site no longer changes by itself, like the port: a proxy that routes by the site's name would lose the clients. The update turns it off where it was on.
+- Clash apps (Koala Clash, Clash Verge, FlClash) name the profile with the subscription name from Settings → Subscription instead of the brand.
+
+### ru
+- **Ноды обновляются из панели.** На странице «Ноды» видна версия каждой ноды и отмечены отстающие от панели, есть кнопки **Обновить** и **Обновить все**. По умолчанию ноды сами следуют за панелью: после её обновления они подтягиваются до её версии по одной, следующая начинает, когда предыдущая заработала. Нода, которая не обновилась, возвращается на свою версию, приходит уведомление, и обновление останавливается. Переключатель в «Настройки → Основное → Обновления».
+- Нода ставит только подписанные релизы и никогда не откатывается на старую версию. Её ночной таймер больше не обгоняет панель.
+- Нодам на 0.5.0.1 и раньше один раз нужен `mikan update` на их сервере, панель показывает команду. Дальше они обновляются из панели.
+- С привязкой устройств места считаются по привязанным устройствам: телефон, перешедший с Wi-Fi на мобильную сеть, больше не выглядит как два устройства. Адреса подключений показаны отдельно и мест не занимают.
+- «Что изменилось» в «Настройки → Обновления» показывает жирный текст, код и ссылки как надо.
+- **Блокировка торрентов** («Настройки → Правила Clash»): ноды узнают BitTorrent и не пропускают его, пойманного пользователя можно забанить на всех нодах на выбранное время. Бан вешается на пользователя, а не на IP. Один простой запрос к трекеру никого не банит: нужно три за десять минут, ведь такой запрос может отправить и обычная веб-страница. Пользователей можно исключить, а бан снять в их карточке.
+- **Проверка скорости ноды** («Ноды → нода»): задержка, потери, загрузка и отдача, с историей. Один тест расходует до 250 МБ на загрузку и 100 МБ на отдачу, ноду можно проверять раз в 5 минут.
+- **Название подписки в приложениях** («Настройки → Подписка»): имя профиля, которое показывают Happ, v2RayTun и Hiddify, с переменными вроде `{name}`, `{days}` и `{left}`, объявление тоже их понимает.
+- **Закрыть пул трафика на тарифе**: пользователи тарифа сразу теряют этот пул, пакеты для него им не продаются. При открытии им снова ставится лимит тарифа.
+- **Убрать подписку из бота**: на экране подписки в боте есть кнопка «Убрать из бота». Снимается только привязка к Telegram: подписка продолжает работать в приложениях и возвращается в бот, если прислать ему её ссылку.
+- **Порядок серверов** («Ноды», стрелки вверх и вниз): в каком порядке стоят ноды, в таком порядке серверы идут в подписке, во всех приложениях.
+- Промокоды: кнопка **Промокоды** в боте открывает Mini App со входом, одна кнопка **Применить** принимает и бонусные, и скидочные коды (скидка применяется при оплате), скидки показываются в рублях. В форме промокода суммы для кода в RUB вводятся в рублях, а минимальная сумма или максимальная скидка требуют выбрать валюту кода.
+- Возврат Telegram Stars забирает то, что дал платёж: новая подписка выключается, продление теряет свой срок (и получает прежний тариф, если с тех пор ничего не менялось), пакет трафика снимается, промокод снова можно использовать. Возвраты, которые Telegram делает сам, работают так же. Покупатель получает сообщение в боте.
+- Бот принимает старые ссылки подписок пользователей, перенесённых из Marzban, PasarGuard или Remnawave, а в карточке пользователя видна старая ссылка (Remnawave) или отметка, что она работает.
+- Каскад: служебный вход на ноде выхода больше не занимает порт, который держит другая программа, а если порт заняли, сам переезжает на свободный. В окне каскада видно его состояние, при сбое приходит уведомление. Работает с нодами на 0.5.0.2.
+- WARP: окно WARP показывает, почему проверка не проходит (нет ответа от endpoint по UDP, DNS, TLS и так далее), нода пишет причину в свой лог, а кнопка **Проверить** действительно проверяет заново. Уведомление о WARP в Telegram тоже называет причину.
+- За прокси (у протокола свой адрес для прослушивания) сайт маскировки больше не меняется сам, как и порт: прокси, который выбирает подключение по имени сайта, потерял бы клиентов. Обновление выключает это там, где было включено.
+- Clash-приложения (Koala Clash, Clash Verge, FlClash) называют профиль названием подписки из «Настройки → Подписка», а не брендом.
+
+## 0.5.0.1
+### en
+- The installer no longer stops when nginx or Caddy holds ports 80 or 443. The protocols whose port is taken get other free ports. With a domain, it offers to add the Let's Encrypt rule to nginx or Caddy: it backs up the config, checks it and rolls back on an error. Without your consent it only shows the lines to add.
+- A protocol whose port is held by another program moves to a free port by itself, on the panel's server and on nodes. You get a notice in Telegram, and subscriptions get the new port.
+- Installer screen: long links wrap instead of being cut, and output from other programs no longer stays on the screen. After you finish, the full link and login are printed to copy. The password is shown on the last screen only; get a new one with `mikan reset-password`.
+- Updates no longer depend on GitHub's "latest" release: servers read a signed list of releases. When a version cannot be reached directly, they go through the one in between by themselves. Settings → General has a switch for beta versions.
+- **Several terms in one plan**: a plan can be sold for 7, 30 or 90 days, each with its own price in Stars and rubles (Plans → a plan → More terms). The buyer picks the term in the bot and the Mini App; limits are not multiplied, traffic resets by the plan's strategy. An invoice keeps the term and price it was made for.
+- **Free trial in the bot**: pick a plan in Payments → settings, and the bot's welcome offers it once per Telegram account to people without a subscription or payments. It needs a plan with a term.
+- Confirmation dialogs are no longer cut off on phones.
+
+### ru
+- Установщик больше не останавливается, если порты 80 или 443 заняты nginx или Caddy. Протоколы с занятым портом получают другие свободные порты. С доменом он предлагает сам добавить правило для Let's Encrypt в nginx или Caddy: делает копию конфига, проверяет его и откатывает при ошибке. Без вашего согласия только показывает, какие строки добавить.
+- Протокол, чей порт заняла другая программа, сам переезжает на свободный порт, и на сервере панели, и на нодах. Приходит уведомление в Telegram, подписки получают новый порт.
+- Экран установщика: длинные ссылки переносятся, а не обрезаются, вывод других программ больше не остаётся на экране. После завершения полная ссылка и логин печатаются для копирования. Пароль показывается только на последнем экране, новый можно получить командой `mikan reset-password`.
+- Обновления больше не зависят от релиза «latest» на GitHub: серверы читают подписанный список релизов. Если до версии нельзя дойти напрямую, они сами проходят через промежуточную. В «Настройки → Основное» появился переключатель бета-версий.
+- **Несколько сроков в одном тарифе**: тариф можно продавать на 7, 30 или 90 дней, у каждого срока своя цена в Stars и рублях («Тарифы → тариф → Другие сроки»). Покупатель выбирает срок в боте и Mini App, лимиты не умножаются, трафик сбрасывается по стратегии тарифа. Счёт сохраняет срок и цену, с которыми выставлен.
+- **Пробный период в боте**: выберите тариф в «Платежи → настройки», и приветствие бота предложит его один раз на Telegram-аккаунт тем, у кого нет подписки и оплат. Нужен тариф со сроком.
+- Диалоги подтверждения больше не обрезаются на телефонах.
+
+## 0.5.0.0
+### en
+- The panel now uses PostgreSQL. The update moves all data over: subscription links, VPN keys, user IDs, counters, payments and settings stay the same. A backup is made first, and the old SQLite database stays on disk. New backups are PostgreSQL archives; old SQLite backups can still be restored.
+- How to get it: on 0.4.4 or older, update to 0.4.5 first with the **Update** button (or `mikan update`). After that 0.5.0.0 arrives the usual way, by the **Update** button or the nightly auto-update.
+- If the move to PostgreSQL fails, the panel stays stopped and keeps both databases; run the update again.
+- Versions now have four numbers: major.minor.patch.revision.
+- From 0.5 on, an update that does not come up goes back to the previous version by itself when it did not change the database schema; otherwise the panel stays stopped with its data for another try. Restoring a backup replaces the whole database.
+- **Promo codes**, a new page: bonus days, extra traffic into the main limit or a traffic pool, and percent or fixed discounts on plans and traffic packages. Limits by dates, total uses, uses per person, new users or first purchase only, and chosen plans. Buyers enter a code in the Mini App; every activation is kept in the history.
+- **Import from another panel**: Settings → Import moves users from Marzban, PasarGuard or Remnawave onto a chosen plan, with their traffic used, term, device limit and note. A check shows what will happen first; the import runs in the background. The old subscription links keep working once the old domain points to this panel.
+- **Server alerts in Telegram** (Telegram → Infrastructure): private notices to the admin about nodes, WARP, cascade exits, protocols, autotune, the TLS certificate and updates, and a public server status in a channel. A node's public name is set in its settings; without one the node is not shown.
+- **Daily database backups to the admin's Telegram chat**, encrypted with your password, at the hour you choose (Telegram → Infrastructure).
+- **Five themes**: Mikan, Midnight, Ocean, Sakura and Forest, in Settings → General. The choice is kept in the browser.
+- **Subscription page and apps**: a Linux tab (SlothClash, Clash Verge Rev, Hiddify), ClashFest and SlothClash among the apps, an announcement shown inside Happ, v2RayTun and ClashFest, and your brand in ClashFest and SlothClash (Settings → Subscription).
+- **Prometheus metrics** at `/api/v1/metrics` with a read key; the API page (Settings → Security) shows a ready scrape job.
+- A new logo: the painted mandarin in the panel, the browser tab and on the subscription page.
+
+### ru
+- Панель переходит на PostgreSQL. Обновление переносит все данные: ссылки подписок, VPN-ключи, ID пользователей, счётчики, платежи и настройки не меняются. Перед переносом делается бэкап, старая база SQLite остаётся на диске. Новые бэкапы — архивы PostgreSQL, старые SQLite-бэкапы по-прежнему можно восстановить.
+- Как обновиться: на 0.4.4 и более ранних версиях сначала обновитесь до 0.4.5 кнопкой **Обновить** (или `mikan update`). После этого 0.5.0.0 придёт как обычно — кнопкой **Обновить** или ночным автообновлением.
+- Если перенос на PostgreSQL не удался, панель остаётся остановленной и сохраняет обе базы; запустите обновление ещё раз.
+- Версии теперь из четырёх чисел: major.minor.patch.revision.
+- Начиная с 0.5 обновление, которое не поднялось, само откатывается на прежнюю версию, если не меняло схему базы; иначе панель остаётся остановленной с данными для повторной попытки. Восстановление бэкапа заменяет базу целиком.
+- **Промокоды**, новая страница: бонусные дни, дополнительный трафик в основной лимит или в пул трафика, скидки в процентах или фиксированной суммой на тарифы и пакеты трафика. Ограничения по датам, общему числу активаций, активациям на человека, только для новых или для первой покупки и по тарифам. Покупатель вводит код в Mini App, все активации видны в истории.
+- **Импорт из другой панели**: «Настройки → Импорт» переносит пользователей из Marzban, PasarGuard или Remnawave на выбранный тариф вместе с израсходованным трафиком, сроком, лимитом устройств и заметкой. Сначала проверка показывает, что будет, импорт идёт в фоне. Старые ссылки подписок продолжают работать, когда старый домен направлен на эту панель.
+- **Уведомления о серверах в Telegram** («Telegram → Инфраструктура»): личные сообщения админу о нодах, WARP, выходах каскадов, протоколах, autotune, TLS-сертификате и обновлениях, и публичный статус серверов в канале. Публичное имя ноды задаётся в её настройках, без него нода в статусе не показывается.
+- **Ежедневные бэкапы базы в Telegram-чат админа**, зашифрованные вашим паролем, в выбранный час («Telegram → Инфраструктура»).
+- **Пять тем оформления**: Mikan, Midnight, Ocean, Sakura и Forest, в «Настройки → Основное». Выбор сохраняется в браузере.
+- **Страница подписки и приложения**: вкладка Linux (SlothClash, Clash Verge Rev, Hiddify), ClashFest и SlothClash в списке приложений, объявление внутри Happ, v2RayTun и ClashFest и ваш бренд в ClashFest и SlothClash («Настройки → Подписка»).
+- **Метрики Prometheus** на `/api/v1/metrics` по ключу на чтение; на странице API («Настройки → Безопасность») есть готовый job для сбора.
+- Новый логотип: нарисованный мандарин в панели, на вкладке браузера и на странице подписки.
+
+## 0.4.5
+### en
+- Prepares the move to 0.5: the panel and the mikan command understand versions with four numbers (0.5.0.0), and the command updates itself before the panel when a release needs a newer one. Nothing else changes; the database stays as it is.
+- After this update, 0.5.0.0 arrives the usual way: the Update button in Settings → Updates, or the nightly automatic update. It moves the panel to PostgreSQL with a backup first.
+
+### ru
+- Подготовка к переходу на 0.5: панель и команда mikan понимают версии из четырёх чисел (0.5.0.0), а команда сама обновляется раньше панели, если релизу нужна новая. Больше ничего не меняется, база остаётся прежней.
+- После этого обновления 0.5.0.0 придёт обычным путём: кнопкой «Обновить» в «Настройки → Обновления» или ночным автообновлением. Оно переведёт панель на PostgreSQL, сначала сделав бэкап.
+
 ## 0.4.4
 ### en
 - YooKassa and CryptoBot now come from the marketplace like every other payment method. On the update the panel moves their keys into the adapters, asks the server to install the adapter that took payments (Payments shows a notice until it runs), and keeps everything working: invoices opened before the update are paid through the adapter, the notification URLs set in the YooKassa and CryptoBot dashboards stay valid, and pay buttons in old bot messages still work. Payments → Accepting payments keeps Telegram Stars and the selling switches.

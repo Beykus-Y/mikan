@@ -2,49 +2,55 @@
 SELECT * FROM tariffs WHERE archived = 0 ORDER BY sort, id;
 
 -- name: GetTariff :one
-SELECT * FROM tariffs WHERE id = ?;
+SELECT * FROM tariffs WHERE id = $1;
 
 -- name: CountTariffs :one
 SELECT count(*) FROM tariffs;
 
 -- name: CreateTariff :one
 INSERT INTO tariffs (name, traffic_limit, duration_days, device_limit, reset_strategy, price_label, sort, created_at, billing_day, price_stars, price_rub, on_sale)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING *;
 
 -- name: UpdateTariff :one
 UPDATE tariffs
-SET name = ?, traffic_limit = ?, duration_days = ?, device_limit = ?, reset_strategy = ?, price_label = ?, sort = ?, billing_day = ?,
-    price_stars = ?, price_rub = ?, on_sale = ?
-WHERE id = ?
+SET name = $1, traffic_limit = $2, duration_days = $3, device_limit = $4, reset_strategy = $5, price_label = $6, sort = $7, billing_day = $8,
+    price_stars = $9, price_rub = $10, on_sale = $11
+WHERE id = $12
 RETURNING *;
 
+-- name: ListTariffTerms :many
+SELECT * FROM tariff_terms WHERE tariff_id = $1 ORDER BY sort, id;
+
+-- name: ListAllTariffTerms :many
+SELECT * FROM tariff_terms ORDER BY tariff_id, sort, id;
+
+-- name: DeleteTariffTerms :exec
+DELETE FROM tariff_terms WHERE tariff_id = $1;
+
+-- name: AddTariffTerm :exec
+INSERT INTO tariff_terms (tariff_id, days, price_stars, price_rub, sort) VALUES ($1, $2, $3, $4, $5);
+
 -- name: ArchiveTariff :execrows
-UPDATE tariffs SET archived = 1 WHERE id = ?;
+UPDATE tariffs SET archived = 1 WHERE id = $1;
 
 -- name: CountSlotsByState :many
 SELECT state, count(*) AS n FROM slots GROUP BY state;
 
 -- name: InsertSlot :exec
-INSERT INTO slots (name, uuid, secret, state, created_at) VALUES (?, ?, ?, 'free', ?);
-
--- name: MaxSlotID :one
-SELECT CAST(coalesce(max(id), 0) AS INTEGER) FROM slots;
+INSERT INTO slots (name, uuid, secret, state, created_at) VALUES ($1, $2, $3, 'free', $4);
 
 -- name: SlotCounter :one
 -- The last slot number handed out: slots purged from the top do not give theirs back.
 SELECT last FROM slot_counter WHERE id = 1;
 
--- name: SetSlotCounter :exec
-INSERT INTO slot_counter (id, last) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET last = excluded.last;
-
 -- name: TakeFreeSlot :one
 UPDATE slots SET state = 'assigned'
-WHERE id = (SELECT id FROM slots WHERE state = 'free' ORDER BY id LIMIT 1)
+WHERE id = (SELECT id FROM slots WHERE state = 'free' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) AND state = 'free'
 RETURNING *;
 
 -- name: BurnSlot :exec
-UPDATE slots SET state = 'burned', burned_at = ? WHERE id = ?;
+UPDATE slots SET state = 'burned', burned_at = $1 WHERE id = $2;
 
 -- name: DeleteBurnedSlots :exec
 DELETE FROM slots WHERE state = 'burned' AND id NOT IN (SELECT slot_id FROM users WHERE slot_id IS NOT NULL)
@@ -54,7 +60,7 @@ DELETE FROM slots WHERE state = 'burned' AND id NOT IN (SELECT slot_id FROM user
 SELECT * FROM slots ORDER BY id;
 
 -- name: GetSlot :one
-SELECT * FROM slots WHERE id = ?;
+SELECT * FROM slots WHERE id = $1;
 
 -- name: ListSlotUsers :many
 -- Every slot that works for a user: the own one and those of bound devices.
@@ -70,38 +76,35 @@ SELECT s.name FROM slots s JOIN bound_devices d ON d.slot_id = s.id WHERE d.user
 
 -- name: ListBoundDeviceSlots :many
 -- The names of the slots of a user's bound devices, by device id.
-SELECT d.id AS device_id, s.name AS slot_name FROM bound_devices d JOIN slots s ON s.id = d.slot_id WHERE d.user_id = ?;
+SELECT d.id AS device_id, s.name AS slot_name FROM bound_devices d JOIN slots s ON s.id = d.slot_id WHERE d.user_id = $1;
 
 -- name: CreateUser :one
 INSERT INTO users (name, contact, note, tags, status, tariff_id, traffic_limit, device_limit, reset_strategy,
                    period_days, period_start, expires_at, inbounds, sub_token, slot_id, created_at, updated_at, billing_day)
-VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $14, $15, $16)
 RETURNING *;
 
 -- name: GetUser :one
-SELECT * FROM users WHERE id = ?;
+SELECT * FROM users WHERE id = $1;
 
 -- name: GetUserBySubToken :one
-SELECT * FROM users WHERE sub_token = ?;
+SELECT * FROM users WHERE sub_token = $1;
 
 -- name: ListUsers :many
 SELECT * FROM users ORDER BY id DESC;
 
 -- name: UpdateUser :one
 UPDATE users
-SET name = ?, contact = ?, note = ?, tags = ?, status = ?, tariff_id = ?, traffic_limit = ?, device_limit = ?,
-    reset_strategy = ?, period_days = ?, period_start = ?, expires_at = ?, inbounds = ?, updated_at = ?, billing_day = ?
-WHERE id = ?
+SET name = $1, contact = $2, note = $3, tags = $4, status = $5, tariff_id = $6, traffic_limit = $7, device_limit = $8,
+    reset_strategy = $9, period_days = $10, period_start = $11, expires_at = $12, inbounds = $13, updated_at = $14, billing_day = $15
+WHERE id = $16
 RETURNING *;
 
 -- name: SetUserCredentials :exec
-UPDATE users SET slot_id = ?, sub_token = ?, updated_at = ? WHERE id = ?;
+UPDATE users SET slot_id = $1, sub_token = $2, updated_at = $3 WHERE id = $4;
 
 -- name: ResetUserTraffic :exec
-UPDATE users SET used_up = 0, used_down = 0, period_start = ?, updated_at = ? WHERE id = ?;
-
--- name: DeleteUser :exec
-DELETE FROM users WHERE id = ?;
+UPDATE users SET used_up = 0, used_down = 0, period_start = $1, updated_at = $2 WHERE id = $3;
 
 -- name: AddUserTraffic :exec
 UPDATE users
@@ -109,81 +112,78 @@ SET used_up = used_up + sqlc.arg(up), used_down = used_down + sqlc.arg(down),
     total_up = total_up + sqlc.arg(up), total_down = total_down + sqlc.arg(down)
 WHERE id = sqlc.arg(id);
 
--- name: SetUserOnline :exec
-UPDATE users SET online_at = ? WHERE id = ?;
-
 -- name: AddTrafficHourly :exec
-INSERT INTO traffic_hourly (user_id, hour, up, down) VALUES (?, ?, ?, ?)
-ON CONFLICT (user_id, hour) DO UPDATE SET up = up + excluded.up, down = down + excluded.down;
+INSERT INTO traffic_hourly (user_id, hour, up, down) VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, hour) DO UPDATE SET up = traffic_hourly.up + excluded.up, down = traffic_hourly.down + excluded.down;
 
 -- name: AddTrafficDaily :exec
-INSERT INTO traffic_daily (user_id, day, up, down) VALUES (?, ?, ?, ?)
-ON CONFLICT (user_id, day) DO UPDATE SET up = up + excluded.up, down = down + excluded.down;
+INSERT INTO traffic_daily (user_id, day, up, down) VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, day) DO UPDATE SET up = traffic_daily.up + excluded.up, down = traffic_daily.down + excluded.down;
 
 -- name: UserTrafficHourly :many
-SELECT hour, up, down FROM traffic_hourly WHERE user_id = ? AND hour >= ? ORDER BY hour;
+SELECT hour, up, down FROM traffic_hourly WHERE user_id = $1 AND hour >= $2 ORDER BY hour;
 
 -- name: UserTrafficDaily :many
-SELECT day, up, down FROM traffic_daily WHERE user_id = ? AND day >= ? ORDER BY day;
+SELECT day, up, down FROM traffic_daily WHERE user_id = $1 AND day >= $2 ORDER BY day;
 
 -- name: TotalTrafficHourly :many
-SELECT hour, CAST(sum(up) AS INTEGER) AS up, CAST(sum(down) AS INTEGER) AS down
-FROM traffic_hourly WHERE hour >= ? GROUP BY hour ORDER BY hour;
+SELECT hour, CAST(sum(up) AS BIGINT) AS up, CAST(sum(down) AS BIGINT) AS down
+FROM traffic_hourly WHERE hour >= $1 GROUP BY hour ORDER BY hour;
 
 -- name: TotalTrafficDaily :many
-SELECT day, CAST(sum(up) AS INTEGER) AS up, CAST(sum(down) AS INTEGER) AS down
-FROM traffic_daily WHERE day >= ? GROUP BY day ORDER BY day;
+SELECT day, CAST(sum(up) AS BIGINT) AS up, CAST(sum(down) AS BIGINT) AS down
+FROM traffic_daily WHERE day >= $1 GROUP BY day ORDER BY day;
 
 -- name: TopUsersByTraffic :many
-SELECT u.id, u.name, CAST(sum(d.up + d.down) AS INTEGER) AS bytes
+SELECT u.id, u.name, CAST(sum(d.up + d.down) AS BIGINT) AS bytes
 FROM traffic_daily d JOIN users u ON u.id = d.user_id
-WHERE d.day >= ?
-GROUP BY u.id ORDER BY bytes DESC LIMIT ?;
+WHERE d.day >= $1
+GROUP BY u.id, u.name ORDER BY bytes DESC LIMIT CAST(sqlc.arg(lim) AS BIGINT);
 
 -- name: PruneTrafficHourly :exec
-DELETE FROM traffic_hourly WHERE hour < ?;
+DELETE FROM traffic_hourly WHERE hour < $1;
 
 -- name: PruneTrafficDaily :exec
-DELETE FROM traffic_daily WHERE day < ?;
+DELETE FROM traffic_daily WHERE day < $1;
 
 -- name: UpsertDevice :exec
-INSERT INTO devices (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?)
+INSERT INTO devices (user_id, ip, first_seen, last_seen) VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, ip) DO UPDATE SET last_seen = excluded.last_seen;
 
 -- name: ListUserDevices :many
-SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC;
+SELECT * FROM devices WHERE user_id = $1 ORDER BY last_seen DESC;
 
 -- name: PruneDevices :exec
-DELETE FROM devices WHERE last_seen < ?;
+DELETE FROM devices WHERE last_seen < $1;
 
 -- name: ListInbounds :many
 SELECT * FROM inbounds ORDER BY id;
 
 -- name: ListNodeInbounds :many
-SELECT * FROM inbounds WHERE node_id = ? ORDER BY id;
+SELECT * FROM inbounds WHERE node_id = $1 ORDER BY id;
 
 -- name: GetInbound :one
-SELECT * FROM inbounds WHERE id = ?;
+SELECT * FROM inbounds WHERE id = $1;
 
 -- name: CreateInbound :one
 INSERT INTO inbounds (node_id, name, preset, port, enabled, settings, config, created_at, updated_at)
-VALUES (?, ?, ?, ?, 1, '{}', ?, ?, ?)
+VALUES ($1, $2, $3, $4, 1, '{}', $5, $6, $7)
 RETURNING *;
 
 -- name: UpdateInbound :one
-UPDATE inbounds SET port = ?, enabled = ?, config = ?, display_name = ?, updated_at = ? WHERE id = ? RETURNING *;
+UPDATE inbounds SET port = $1, enabled = $2, config = $3, display_name = $4, updated_at = $5 WHERE id = $6 RETURNING *;
 
 -- name: SetInboundConfig :exec
-UPDATE inbounds SET config = ? WHERE id = ?;
+UPDATE inbounds SET config = $1 WHERE id = $2;
 
 -- name: DeleteInbound :exec
-DELETE FROM inbounds WHERE id = ?;
+DELETE FROM inbounds WHERE id = $1;
 
 -- name: GetNodeState :one
-SELECT value FROM node_state WHERE key = ?;
+SELECT value FROM node_state WHERE key = $1;
 
 -- name: SetNodeState :exec
-INSERT INTO node_state (key, value) VALUES (?, ?)
+INSERT INTO node_state (key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = excluded.value;
 
 -- name: DeleteNodeStateOf :exec

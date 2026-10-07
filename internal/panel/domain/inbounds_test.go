@@ -84,6 +84,23 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+// An automatic move names the port it moves from: a row moved meanwhile keeps its port.
+func TestUpdateFromPort(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	_, s := inbounds(t, &now, nil)
+	ctx := context.Background()
+	x := find(t, s, 1, "vless-xhttp")
+	if _, _, err := s.Update(ctx, x.ID, InboundPatch{Port: ptr("2053"), FromPort: ptr("8443")}); !errors.Is(err, ErrInboundChanged) {
+		t.Fatalf("moved from a port it is not on: %v", err)
+	}
+	if got := find(t, s, 1, "vless-xhttp").Port; got != "443" {
+		t.Fatalf("port %s", got)
+	}
+	if _, next, err := s.Update(ctx, x.ID, InboundPatch{Port: ptr("2053"), FromPort: ptr("443")}); err != nil || next.Port != "2053" {
+		t.Fatalf("move: %+v %v", next, err)
+	}
+}
+
 func TestUpdatePort(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	st, s := inbounds(t, &now, nil)

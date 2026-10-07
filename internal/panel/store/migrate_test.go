@@ -60,11 +60,11 @@ func TestMigration0017KeepsWhatIsThere(t *testing.T) {
 	if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN ('traffic_hourly_hour', 'traffic_daily_day', 'devices_last_seen', 'audit_log_ts')").Scan(&n); err != nil || n != 4 {
 		t.Fatalf("time indexes: %d %v", n, err)
 	}
-	// And back: the rollback leaves the data.
-	if _, err := p.Down(ctx); err != nil {
-		t.Fatal(err)
+	// Migration 0018 adds publication metadata and durable alert state.
+	var publicName string
+	if err := conn.QueryRowContext(ctx, "SELECT public_name FROM nodes WHERE id = 1").Scan(&publicName); err != nil || publicName != "" {
+		t.Fatalf("existing node's public name: %q %v", publicName, err)
 	}
-	if err := conn.QueryRowContext(ctx, "SELECT client FROM devices WHERE user_id = 1").Scan(new(string)); err != nil {
-		t.Fatalf("the column after a rollback: %v", err)
-	}
+	exec("INSERT INTO infrastructure_alert_state (key, value, updated_at) VALUES ('monitor', '{}', 1)")
+	// Legacy migrations only ever run up, to normalize a snapshot for the import.
 }

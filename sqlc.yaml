@@ -1,10 +1,11 @@
 version: "2"
 sql:
-  - engine: sqlite
-    schema: internal/panel/store/migrations
+  - engine: postgresql
+    schema: internal/panel/store/postgres
     queries: internal/panel/store/queries
     gen:
       go:
         package: db
         out: internal/panel/store/db
+        sql_package: database/sql
         emit_empty_slices: true

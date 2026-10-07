@@ -13,14 +13,14 @@ import (
 
 	"mikan/internal/panel/domain"
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 // The host script opens the new inbound's port in ufw from stdout, so it must be bare.
 func TestInboundAddPrintsPortForHostScript(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestInboundAddPrintsPortForHostScript(t *testing.T) {
 // is opened on that node's server, so the panel's host script must not open it here.
 func TestInboundSetPrintsPortOnlyForOwnNode(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestURLStdoutParsesInHostScript(t *testing.T) {
 // in it and names its defaults in it.
 func TestBootstrapStoresDefaultLang(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestBootstrapStoresDefaultLang(t *testing.T) {
 // add and node set alike.
 func TestHostsAreChecked(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestHostsAreChecked(t *testing.T) {
 // The backup holds secrets: it is never readable by others, not even for a moment.
 func TestBackupIsPrivateAndConsistent(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,8 @@ func TestBackupIsPrivateAndConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "backup.db")
-	if err := backup(ctx, st, path); err != nil {
+	dsn := schemaDSN(t, st)
+	if err := databaseBackup(ctx, dsn, path); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(path)
@@ -219,14 +220,14 @@ func TestBackupIsPrivateAndConsistent(t *testing.T) {
 	}
 	// An existing backup is not overwritten, and is left as it was.
 	before, _ := os.ReadFile(path)
-	if err := backup(ctx, st, path); err == nil {
+	if err := databaseBackup(ctx, dsn, path); err == nil {
 		t.Fatal("a second backup over the first")
 	}
 	if after, _ := os.ReadFile(path); !bytes.Equal(before, after) {
 		t.Fatal("the existing backup was changed")
 	}
 	// A bad path leaves nothing behind.
-	if err := backup(ctx, st, filepath.Join(t.TempDir(), "no", "dir", "x.db")); err == nil {
+	if err := databaseBackup(ctx, dsn, filepath.Join(t.TempDir(), "no", "dir", "x.db")); err == nil {
 		t.Fatal("a path that cannot be written")
 	}
 }

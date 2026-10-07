@@ -104,7 +104,7 @@ func TestTrafficPackagesOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.st.DB.ExecContext(ctx, "UPDATE users SET used_down = traffic_limit + 1 WHERE id = ?", u.ID); err != nil {
+	if _, err := h.st.DB.ExecContext(ctx, "UPDATE users SET used_down = traffic_limit + 1 WHERE id = $1", u.ID); err != nil {
 		t.Fatal(err)
 	}
 	state := func() (string, int64) {

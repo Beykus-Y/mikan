@@ -169,6 +169,8 @@ func (c *Client) Webhook(ctx context.Context, s Settings, remoteIP string, heade
 	return out.ExternalID, err
 }
 
-func (c *Client) Refund(ctx context.Context, s Settings, externalID string, amount int64) error {
-	return c.call(ctx, http.MethodPost, "/v1/refund", map[string]any{"settings": s, "external_id": externalID, "amount": amount}, nil)
+// Refund sends a stable idempotency key so adapters can safely handle concurrent
+// notifications and retries for the same late promo payment.
+func (c *Client) Refund(ctx context.Context, s Settings, externalID string, amount int64, idempotencyKey string) error {
+	return c.call(ctx, http.MethodPost, "/v1/refund", map[string]any{"settings": s, "external_id": externalID, "amount": amount, "idempotency_key": idempotencyKey}, nil)
 }

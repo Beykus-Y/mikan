@@ -50,7 +50,7 @@ func TestBillingDates(t *testing.T) {
 		}
 	}
 	for days, months := range map[int64]int{30: 1, 31: 1, 90: 3, 180: 6, 365: 12, 7: 1} {
-		if got := termMonths(days); got != months {
+		if got := TermMonths(days); got != months {
 			t.Errorf("%d days: %d months, want %d", days, got, months)
 		}
 	}

@@ -4,6 +4,7 @@
 set -eu
 cd "$(dirname "$0")"
 export MSYS_NO_PATHCONV=1
+export MIKAN_TEST_POSTGRES_PASSWORD=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
 docker volume create mikan-gomod >/dev/null
 docker volume create mikan-gocache >/dev/null

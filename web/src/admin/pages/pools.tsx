@@ -10,6 +10,7 @@ import { qk, usePools, useTariffs } from "../../api/hooks";
 import { Confirm, Drawer } from "../../components/overlay";
 import { QueryBoundary } from "../../components/query";
 import { useToast } from "../../components/toast";
+import { Switch } from "../../components/switch";
 import { Button, EmptyState, Field, Skeleton } from "../../components/ui";
 import { t } from "../../i18n";
 import { bytes } from "../../lib/format";
@@ -184,38 +185,52 @@ function PoolDrawer({ pool, onClose }: { pool: Pool | "new" | null; onClose: () 
   );
 }
 
-/** Pool limits of a tariff or a user: GB per pool, empty = unlimited. */
+/** Pool limits of a tariff or a user: GB per pool, empty = unlimited. With closed/onClosed
+ * each pool has an access switch: a closed pool is left out of the subscription and the
+ * nodes turn the user away from it, so it has no limit. */
 export function PoolLimitsField({
   pools,
   value,
   onChange,
+  closed,
+  onClosed,
 }: {
   pools: Pool[];
   value: Record<number, string>;
   onChange: (v: Record<number, string>) => void;
+  closed?: Record<number, boolean>;
+  onClosed?: (v: Record<number, boolean>) => void;
 }) {
   if (pools.length === 0) return null;
   return (
     <ul className="row-list rounded-2xl border border-[var(--hairline)] px-3">
-      {pools.map((p) => (
-        <li key={p.id} className="grid grid-cols-[minmax(0,1fr)_132px] items-center gap-3 py-2">
-          <div className="min-w-0">
-            <div className="truncate text-[13px] font-medium">{p.name}</div>
-            {p.inbounds.length ? <div className="truncate text-xs text-[var(--ink-500)]">{p.inbounds.join(", ")}</div> : null}
-          </div>
-          <label className="input-unit">
-            <input
-              className="input num"
-              inputMode="decimal"
-              value={value[p.id] ?? ""}
-              onChange={(e) => onChange({ ...value, [p.id]: e.target.value })}
-              placeholder="∞"
-              aria-label={t("pools.limitOf", { name: p.name })}
-            />
-            <span aria-hidden>{t("units.gb")}</span>
-          </label>
-        </li>
-      ))}
+      {pools.map((p) => {
+        const shut = !!closed?.[p.id];
+        return (
+          <li key={p.id} className={`grid items-center gap-3 py-2 ${onClosed ? "grid-cols-[minmax(0,1fr)_auto_132px]" : "grid-cols-[minmax(0,1fr)_132px]"}`}>
+            <div className="min-w-0">
+              <div className="truncate text-[13px] font-medium">{p.name}</div>
+              {p.inbounds.length ? <div className="truncate text-xs text-[var(--ink-500)]">{p.inbounds.join(", ")}</div> : null}
+            </div>
+            {onClosed ? <Switch checked={!shut} label={t("pools.accessOf", { name: p.name })} onChange={(on) => onClosed({ ...closed, [p.id]: !on })} /> : null}
+            {shut ? (
+              <span className="text-xs text-[var(--ink-500)]">{t("pools.closed")}</span>
+            ) : (
+              <label className="input-unit">
+                <input
+                  className="input num"
+                  inputMode="decimal"
+                  value={value[p.id] ?? ""}
+                  onChange={(e) => onChange({ ...value, [p.id]: e.target.value })}
+                  placeholder="∞"
+                  aria-label={t("pools.limitOf", { name: p.name })}
+                />
+                <span aria-hidden>{t("units.gb")}</span>
+              </label>
+            )}
+          </li>
+        );
+      })}
     </ul>
   );
 }

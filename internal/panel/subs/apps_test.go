@@ -11,16 +11,20 @@ import (
 
 func TestDetectApp(t *testing.T) {
 	for ua, want := range map[string]App{
-		"koala-clash/1.4.1":                {Family: FamilyMihomo, Core: Version{1, 19, 30}},
-		"koala-clash/1.3.1":                {Family: FamilyMihomo, Core: Version{1, 19, 23}},
-		"mihomo/1.19.31":                   {Family: FamilyMihomo, Core: Version{1, 19, 31}},
-		"clash.meta/v1.19.12":              {Family: FamilyMihomo, Core: Version{1, 19, 12}},
-		"clash-verge/v2.2.3":               {Family: FamilyMihomo},
-		"FlClashX/v0.9.1 Platform/android": {Family: FamilyMihomo},
-		"ClashMetaForAndroid/2.11.19.Meta": {Family: FamilyMihomo},
-		"Happ/3.4.1":                       {Family: FamilyXray},
-		"v2rayNG/1.10.20":                  {Family: FamilyXray},
-		"INCY/2.1.0":                       {Family: FamilyXray},
+		"koala-clash/1.4.1":                    {Family: FamilyMihomo, Core: Version{1, 19, 30}},
+		"koala-clash/1.3.1":                    {Family: FamilyMihomo, Core: Version{1, 19, 23}},
+		"mihomo/1.19.31":                       {Family: FamilyMihomo, Core: Version{1, 19, 31}},
+		"clash.meta/v1.19.12":                  {Family: FamilyMihomo, Core: Version{1, 19, 12}},
+		"clash-verge/v2.2.3":                   {Family: FamilyMihomo},
+		"FlClashX/v0.9.1 Platform/android":     {Family: FamilyMihomo},
+		"ClashMetaForAndroid/2.11.19.Meta":     {Family: FamilyMihomo},
+		"mihomo/1.19.32 ClashFest/1.2.0":       {Family: FamilyMihomo, Core: Version{1, 19, 32}},
+		"mihomo ClashFest/1.2.0":               {Family: FamilyMihomo}, // a build off a release tag names no core
+		"clash.meta/v1.19.32 SlothClash/0.9.4": {Family: FamilyMihomo, Core: Version{1, 19, 32}},
+		"clash.meta/mihomo SlothClash/0.9.4":   {Family: FamilyMihomo},
+		"Happ/3.4.1":                           {Family: FamilyXray},
+		"v2rayNG/1.10.20":                      {Family: FamilyXray},
+		"INCY/2.1.0":                           {Family: FamilyXray},
 		"HiddifyNext/2.5.7 (android) like ClashMeta v2ray sing-box": {Family: FamilySingBox, Legacy: true},
 		"karing/1.1.4.920":                       {Family: FamilySingBox},
 		"SFA/1.12.4":                             {Family: FamilySingBox},
@@ -114,17 +118,19 @@ func TestForApp(t *testing.T) {
 func TestGeckoOnlyForNewMihomo(t *testing.T) {
 	g := proto.Needs{Type: "hysteria2", Gecko: true}
 	for ua, want := range map[string]bool{
-		"mihomo/1.19.26":          true,
-		"clash.meta/v1.19.31":     true,
-		"koala-clash/1.4.2":       true,
-		"mihomo/1.19.25":          false,
-		"koala-clash/1.2.0":       false,
-		"clash-verge/v2.4.0":      false, // the core is not named
-		"Happ/3.4.1":              false,
-		"Hiddify/2.5.7":           false,
-		"Karing/1.1":              false,
-		"Stash/3.0":               false,
-		"Shadowrocket/2070 CFNet": false,
+		"mihomo/1.19.26":                       true,
+		"clash.meta/v1.19.31":                  true,
+		"koala-clash/1.4.2":                    true,
+		"mihomo/1.19.32 ClashFest/1.2.0":       true,
+		"clash.meta/v1.19.32 SlothClash/0.9.4": true,
+		"mihomo/1.19.25":                       false,
+		"koala-clash/1.2.0":                    false,
+		"clash-verge/v2.4.0":                   false, // the core is not named
+		"Happ/3.4.1":                           false,
+		"Hiddify/2.5.7":                        false,
+		"Karing/1.1":                           false,
+		"Stash/3.0":                            false,
+		"Shadowrocket/2070 CFNet":              false,
 	} {
 		if got := DetectApp(ua).Supports(g); got != want {
 			t.Errorf("%s: %v, want %v", ua, got, want)

@@ -15,6 +15,7 @@ import (
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 type fakeNode struct {
@@ -22,6 +23,7 @@ type fakeNode struct {
 	acked    []int64
 	applied  []nodeapi.DesiredState
 	policies [][]nodeapi.Policy
+	health   nodeapi.Health
 }
 
 func (f *fakeNode) Apply(_ context.Context, s nodeapi.DesiredState) (nodeapi.ApplyResult, error) {
@@ -37,7 +39,7 @@ func (f *fakeNode) Ack(_ context.Context, _ string, seq int64) error {
 	f.acked = append(f.acked, seq)
 	return nil
 }
-func (f *fakeNode) Health(context.Context) (nodeapi.Health, error) { return nodeapi.Health{}, nil }
+func (f *fakeNode) Health(context.Context) (nodeapi.Health, error) { return f.health, nil }
 
 func fakeTLS() (*nodeapi.TLSFiles, error) { return &nodeapi.TLSFiles{CertPEM: "c", KeyPEM: "k"}, nil }
 
@@ -45,7 +47,7 @@ func setup(t *testing.T) (*Syncer, *fakeNode, *store.Store, *domain.Users, *time
 	t.Helper()
 	ctx := context.Background()
 	now := time.Unix(1_800_000_000, 0)
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +233,7 @@ func TestEachNodeGetsItsOwnInbounds(t *testing.T) {
 
 	// A disabled node keeps its syncer but serves nothing.
 	n, _ := st.Q.GetNode(ctx, remote.id)
-	if _, err := st.Q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain, Enabled: 0, ID: n.ID}); err != nil {
+	if _, err := st.Q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain, PublicName: n.PublicName, Enabled: 0, ID: n.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ = remote.desired(ctx); len(b.Inbounds) != 0 {
@@ -369,3 +371,39 @@ type noopChanges struct{}
 
 func (noopChanges) PoliciesChanged() {}
 func (noopChanges) SlotsChanged()    {}
+
+// The health view names the ports of the state the node runs, so a listener's failure is
+// read against the port it failed on, not against a row moved since; a node that runs any
+// other state gets none.
+func TestHealthCarriesAppliedPorts(t *testing.T) {
+	s, node, st, _, _ := setup(t)
+	ctx := context.Background()
+	s.refreshHealth(ctx)
+	if p := s.Health().Ports; p != nil {
+		t.Fatalf("nothing applied yet, ports %v", p)
+	}
+	s.applyState(ctx)
+	rev := node.applied[len(node.applied)-1].Revision
+	node.health = nodeapi.Health{Revision: rev}
+	s.refreshHealth(ctx)
+	if p := s.Health().Ports; p["vless-xhttp"] != "443" || p["tuic"] != "8443" {
+		t.Fatalf("ports of the applied state: %v", p)
+	}
+	in, err := st.Q.ListNodeInbounds(ctx, LocalNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := "2053"
+	if _, _, err := domain.NewInbounds(st, nil, time.Now).Update(ctx, in[0].ID, domain.InboundPatch{Port: &port}); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshHealth(ctx)
+	if p := s.Health().Ports; p[in[0].Name] != in[0].Port {
+		t.Fatalf("the node still runs the old port until the next apply: %v", p)
+	}
+	node.health = nodeapi.Health{Revision: rev + 1}
+	s.refreshHealth(ctx)
+	if p := s.Health().Ports; p != nil {
+		t.Fatalf("a state this panel did not apply: ports %v", p)
+	}
+}

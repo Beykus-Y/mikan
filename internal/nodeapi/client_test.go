@@ -52,3 +52,26 @@ func TestAnswerWithinTheCapIsRead(t *testing.T) {
 		t.Fatalf("%+v %v", got, err)
 	}
 }
+
+// A failure without an Error body is a typed *StatusError, so that callers tell a node
+// that predates an endpoint (404) without matching text; a coded failure stays an *Error.
+func TestFailureIsTyped(t *testing.T) {
+	old := httptest.NewServer(http.NotFoundHandler()) // a mux without the route: plain text
+	defer old.Close()
+	var se *StatusError
+	_, err := (&Client{hc: old.Client(), base: old.URL}).SpeedTest(context.Background())
+	if !errors.As(err, &se) || se.Status != http.StatusNotFound || se.Path != "/v1/speedtest" || !strings.Contains(err.Error(), "status 404") {
+		t.Fatalf("an old node: %v", err)
+	}
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"code":"speed_test_busy","message":"a speed test is running"}`)
+	}))
+	defer busy.Close()
+	var ne *Error
+	var typed *StatusError
+	_, err = (&Client{hc: busy.Client(), base: busy.URL}).SpeedTest(context.Background())
+	if !errors.As(err, &ne) || ne.Code != "speed_test_busy" || errors.As(err, &typed) {
+		t.Fatalf("a busy node: %v", err)
+	}
+}

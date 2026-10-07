@@ -13,6 +13,7 @@ import { Switch } from "../../../components/switch";
 import { getLocale, LOCALES, t } from "../../../i18n";
 import { useDraft } from "../../../lib/draft";
 import { fieldErrors } from "../../../lib/fields";
+import { inlineMarkdown } from "../../../lib/inline-md";
 import { ago } from "../../../lib/format";
 import { useSaveSettings } from "./shared";
 
@@ -176,6 +177,22 @@ export function UpdatesCard() {
     },
     onError: fail,
   });
+  const channel = useMutation({
+    mutationFn: (beta: boolean) => unwrap(api.PATCH("/api/v1/updates", { body: { channel: beta ? "beta" : "stable" } })),
+    onSuccess: (d) => {
+      put(d);
+      toast.ok(t("settings.saved"));
+    },
+    onError: fail,
+  });
+  const follow = useMutation({
+    mutationFn: (v: boolean) => unwrap(api.PATCH("/api/v1/updates", { body: { nodes_follow: v } })),
+    onSuccess: (d) => {
+      put(d);
+      toast.ok(t("settings.saved"));
+    },
+    onError: fail,
+  });
   const request = useMutation({
     mutationFn: () => unwrap(api.POST("/api/v1/updates/request")),
     onSuccess: (d) => {
@@ -214,6 +231,8 @@ export function UpdatesCard() {
         <span className="font-semibold">mikan {v.current}</span>
         {v.available ? (
           <Pill tone="warn">{t("settings.updatesOut", { v: v.latest })}</Pill>
+        ) : v.unreachable && v.newest ? (
+          <Pill tone="warn">{t("settings.updatesOut", { v: v.newest })}</Pill>
         ) : v.latest ? (
           <Pill tone="ok">{t("settings.updatesLatest")}</Pill>
         ) : (
@@ -222,6 +241,10 @@ export function UpdatesCard() {
         {v.checked_at > 0 ? <span className="text-xs text-[var(--ink-500)]">{t("settings.updatesChecked", { ago: ago(new Date(v.checked_at * 1000).toISOString()) })}</span> : null}
       </div>
       {v.error && v.error !== "no_release" ? <p className="mt-2 text-xs text-[var(--berry-600)]">{t("settings.updatesError", { e: v.error })}</p> : null}
+      {v.unreachable && v.newest ? <p className="mt-2 text-xs text-[var(--honey-600)]">{t("settings.updatesUnreachable", { v: v.newest })}</p> : null}
+      {v.available && v.newest && !v.unreachable ? (
+        <p className="mt-2 text-xs text-[var(--ink-500)]">{t("settings.updatesHop", { v: v.latest, newest: v.newest })}</p>
+      ) : null}
       {v.available && notes ? (
         <div className="panel-soft mt-4 p-3">
           <div className="mb-2 text-xs font-semibold text-[var(--ink-500)]">{t("settings.updatesChanges", { v: v.latest })}</div>
@@ -230,7 +253,7 @@ export function UpdatesCard() {
               .split("\n")
               .filter((l) => l.trim())
               .map((l, i) => (
-                <li key={i}>{l.replace(/^[-*]\s*/, "")}</li>
+                <li key={i}>{inlineMarkdown(l.replace(/^[-*]\s*/, ""))}</li>
               ))}
           </ul>
         </div>
@@ -258,6 +281,25 @@ export function UpdatesCard() {
             <div className="mt-1 text-xs text-[var(--ink-500)]">{t("settings.updatesAutoSub")}</div>
           </div>
           <Switch checked={v.auto} label={t("settings.updatesAuto")} disabled={auto.isPending} onChange={(on) => auto.mutate(on)} />
+        </li>
+        <li className="flex items-start justify-between gap-4 py-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium">{t("settings.updatesNodes")}</div>
+            <div className="mt-1 text-xs text-[var(--ink-500)]">{t("settings.updatesNodesSub")}</div>
+          </div>
+          <Switch checked={v.nodes_follow} label={t("settings.updatesNodes")} disabled={follow.isPending} onChange={(on) => follow.mutate(on)} />
+        </li>
+        <li className="flex items-start justify-between gap-4 py-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium">{t("settings.updatesBeta")}</div>
+            <div className="mt-1 text-xs text-[var(--ink-500)]">{t("settings.updatesBetaSub")}</div>
+          </div>
+          <Switch
+            checked={v.channel === "beta"}
+            label={t("settings.updatesBeta")}
+            disabled={channel.isPending}
+            onChange={(on) => channel.mutate(on)}
+          />
         </li>
       </ul>
       <Confirm

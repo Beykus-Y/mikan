@@ -19,7 +19,7 @@ import (
 	"mikan/internal/panel/acme"
 	"mikan/internal/panel/domain"
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 	"mikan/internal/panel/tlscert"
 )
 
@@ -41,7 +41,7 @@ func testCert(t *testing.T, name string, until time.Time) (string, string) {
 func TestCertificatesOverHTTP(t *testing.T) {
 	ctx := t.Context()
 	// The certificate manager on a store of its own: no address, so any name fits.
-	certStore, err := store.Open(ctx, t.TempDir())
+	certStore, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

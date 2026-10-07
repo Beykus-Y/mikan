@@ -453,6 +453,14 @@ pub fn down() {
     }
 }
 
+/// Rebuild compose from validated state after restore; never run a compose file supplied
+/// by a backup archive. Synchronize the panel's adapter tokens with root's state.
+pub fn resume() -> Result<()> {
+    let state = load_state()?;
+    save_state(&state)?;
+    up(&state.adapters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

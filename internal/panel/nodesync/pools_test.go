@@ -81,10 +81,12 @@ func TestTrafficPoolsOnThePanel(t *testing.T) {
 		t.Fatalf("after the pool ran out: %+v", p)
 	}
 	// The main quota running out keeps the user in for the pool.
-	_, err = st.DB.ExecContext(ctx, "UPDATE users SET traffic_limit = 50 WHERE id = ?", u.ID)
+	_, err = st.DB.ExecContext(ctx, "UPDATE users SET traffic_limit = 50 WHERE id = $1", u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.m.PoliciesChanged() // a change outside the API is picked up by the next upkeep
+
 	if p := policy(); !p.Allowed || p.QuotaRemaining != 0 {
 		t.Fatalf("main quota out: %+v", p)
 	}

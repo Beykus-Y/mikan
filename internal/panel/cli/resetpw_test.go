@@ -8,15 +8,15 @@ import (
 	"time"
 
 	"mikan/internal/panel/auth"
-	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 // A reset ends every session and every API key of the admin: it is what the owner runs on
 // the server after a hijacked session, and a key made from that session would outlive it.
 func TestResetPasswordRevokesSessionsAndKeys(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

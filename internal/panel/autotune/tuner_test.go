@@ -9,10 +9,12 @@ import (
 
 	"mikan/internal/nodeapi"
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/nodesync"
 	"mikan/internal/panel/presets"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 	"mikan/internal/proto"
 )
 
@@ -22,6 +24,12 @@ type fakeNodes struct {
 	found    []nodeapi.TargetResult
 	checks   int
 	onScan   func() // runs while a scan is under way: the admin edits meanwhile
+	health   map[int64]nodesync.HealthView
+}
+
+func (f *fakeNodes) Health(id int64) (nodesync.HealthView, bool) {
+	h, ok := f.health[id]
+	return h, ok
 }
 
 func (f *fakeNodes) Activity(_ context.Context, id int64) (nodeapi.Activity, error) {
@@ -77,7 +85,7 @@ func setup(t *testing.T) *env {
 	e := &env{ctx: context.Background(), now: time.Unix(1_800_000_000, 0), ch: &changes{}}
 	clock := func() time.Time { return e.now }
 	var err error
-	if e.st, err = store.Open(e.ctx, t.TempDir()); err != nil {
+	if e.st, err = storetest.Open(e.ctx, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.st.Close() })
@@ -304,6 +312,31 @@ func TestReplacesADeadTargetOnly(t *testing.T) {
 	}
 }
 
+// A dead target behind a proxy is shown, never replaced: the proxy may route by the site.
+func TestDeadTargetBehindAProxyStays(t *testing.T) {
+	e := setup(t)
+	every := DefaultOptions().CheckEvery
+	vision := e.inbound(t, "vless-vision")
+	dead := presets.DefaultDest
+	e.nodes.targets[dead] = nodeapi.TargetResult{Dest: dead, Error: "timeout"}
+	e.nodes.found = []nodeapi.TargetResult{good("203.0.113.44:443", "shop.example.org")}
+	if err := e.st.Q.SetInboundListen(e.ctx, db.SetInboundListenParams{Listen: "127.0.0.1", ID: vision.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.Q.SetInboundAuto(e.ctx, db.SetInboundAutoParams{AutoPort: 0, AutoSni: 1, ID: vision.ID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []time.Duration{0, every, every, every} {
+		e.step(t, d)
+	}
+	if got := sniOf(t, e.inbound(t, "vless-vision")); got != "www.microsoft.com" {
+		t.Fatalf("replaced behind a proxy: %s", got)
+	}
+	if s, _ := e.tn.Status(vision.ID); s.TargetOK || s.TargetError != "timeout" {
+		t.Fatalf("its target is still checked and shown: %+v", s)
+	}
+}
+
 // A cut-off inbound whose target is down but has no other site nearby still gets a new
 // port: the target was not the only thing to try.
 func TestNoOtherTargetStillMovesThePort(t *testing.T) {
@@ -406,8 +439,9 @@ func TestBoundDevices(t *testing.T) {
 	}
 }
 
-// Behind a TCP proxy the port is what the proxy forwards to: a blocked inbound there
-// never moves, even with its switch left on. Its REALITY target is the admin's call.
+// Behind a proxy the port is what the proxy forwards to, and the site may be what it
+// routes by: a blocked inbound there never moves nor changes its site, even with the
+// switches left on (a row from before they were locked).
 func TestNeverMovesAPortBehindAProxy(t *testing.T) {
 	e := setup(t)
 	x := e.inbound(t, "vless-xhttp")
@@ -430,11 +464,12 @@ func TestNeverMovesAPortBehindAProxy(t *testing.T) {
 	if err := e.st.Q.SetInboundAuto(e.ctx, db.SetInboundAutoParams{AutoPort: 1, AutoSni: 1, ID: x.ID}); err != nil {
 		t.Fatal(err)
 	}
+	sni := sniOf(t, e.inbound(t, "vless-xhttp"))
 	e.nodes.found = []nodeapi.TargetResult{good("203.0.113.44:443", "shop.example.org")}
 	e.reaches("hysteria2", "tuic", "vless-vision")
 	e.step(t, time.Minute)
-	if got := e.inbound(t, "vless-xhttp"); got.Port != "443" || sniOf(t, got) != "shop.example.org" {
-		t.Fatalf("port kept, target replaced: port %s sni %s", got.Port, sniOf(t, got))
+	if got := e.inbound(t, "vless-xhttp"); got.Port != "443" || sniOf(t, got) != sni || len(e.events(t)) != 0 {
+		t.Fatalf("changed behind a proxy: port %s sni %s (was %s)", got.Port, sniOf(t, got), sni)
 	}
 }
 

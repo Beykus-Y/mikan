@@ -16,8 +16,8 @@ import (
 	"mikan/internal/panel/tlscert"
 )
 
-// A deleted node takes its certificates and private keys with it. Node ids are reused (the
-// table has no AUTOINCREMENT): a node added later under the same id must not find them.
+// A deleted node takes its certificates and private keys with it. An old restored
+// sequence may reuse a node ID: a new node under that ID must not find the old keys.
 func TestNodeFilesGoWithTheNode(t *testing.T) {
 	ctx := t.Context()
 	dataDir := t.TempDir()
@@ -96,6 +96,11 @@ func TestNodeFilesGoWithTheNode(t *testing.T) {
 	// Files an older panel left under an id (a delete before this fix) go when the id is
 	// given to a new node.
 	selfDir, customDir = leave(id)
+	// PostgreSQL identities do not reuse deleted IDs. Simulate an old restored
+	// sequence so the protection against inheriting legacy credentials still runs.
+	if _, err := h.st.DB.ExecContext(ctx, "ALTER TABLE nodes ALTER COLUMN id RESTART WITH "+strconv.FormatInt(id, 10)); err != nil {
+		t.Fatal(err)
+	}
 	if again := add("C", "198.51.100.30"); again != id {
 		t.Fatalf("expected the freed id %d to be reused, got %d", id, again)
 	}

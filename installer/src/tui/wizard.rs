@@ -15,8 +15,9 @@ use ratatui::widgets::{LineGauge, Paragraph};
 
 use super::Screen;
 use super::widgets::{
-    ACCENT, Card, DIM, ERR, FAINT, Input, OK, Task, checkbox, dim, field, item, level_color, level_span, qr, spinner, wrap,
+    ACCENT, Card, DIM, ERR, FAINT, Input, OK, Task, checkbox, dim, field, field_styled, item, level_color, level_span, qr, spinner, wrap,
 };
+use crate::acme;
 use crate::net::{self, DomainCheck};
 use crate::setup::{self, Event, Options, Outcome, Plan, Step};
 use crate::sites::{self, Site};
@@ -30,6 +31,7 @@ enum Page {
     Address,
     Domain,
     Email,
+    Proxy,
     Options,
     Confirm,
     Install,
@@ -65,6 +67,8 @@ pub struct Wizard {
     dns_for: String,
     email: Input,
     email_err: String,
+    /// The nginx or Caddy on port 80 of a domain's server.
+    front: Option<acme::Front>,
     port: Input,
     port_err: String,
     ufw: bool,
@@ -107,6 +111,7 @@ impl Wizard {
             dns_for: String::new(),
             email: Input::new(&plan.email),
             email_err: String::new(),
+            front: None,
             port: Input::new(&plan.port.to_string()),
             port_err: String::new(),
             ufw: false,
@@ -143,7 +148,7 @@ impl Wizard {
     /// What stays in the terminal after the TUI closes: the admin's login is shown once.
     pub fn farewell(&self) -> Option<String> {
         let o = self.outcome.as_ref()?;
-        let mut text = setup::summary(o);
+        let mut text = setup::summary(o, false);
         if let Some(a) = &self.applied {
             text.push_str(&format!("\n\nREALITY camouflage:\n{a}"));
         }
@@ -173,7 +178,7 @@ impl Wizard {
         } else {
             &[Page::Lang, Page::Checks, Page::Address, Page::Domain, Page::Options, Page::Confirm]
         };
-        let page = if self.page == Page::Email { Page::Domain } else { self.page };
+        let page = if matches!(self.page, Page::Email | Page::Proxy) { Page::Domain } else { self.page };
         pages.iter().position(|p| *p == page).map(|i| (i + 1, pages.len()))
     }
 
@@ -188,9 +193,12 @@ impl Wizard {
             Page::Address => Page::Checks,
             Page::Domain => Page::Address,
             Page::Email => Page::Domain,
+            Page::Proxy => Page::Email,
             Page::Options => {
                 if self.plan.domain.is_empty() {
                     Page::Domain
+                } else if self.front.is_some() {
+                    Page::Proxy
                 } else {
                     Page::Email
                 }
@@ -234,8 +242,14 @@ impl Wizard {
                     if e.is_empty() || net::valid_email(&e) { String::new() } else { "an address like you@example.com".into() };
                 if self.email_err.is_empty() {
                     self.plan.email = e;
-                    self.page = Page::Options;
+                    // A web server on port 80 is asked about before Let's Encrypt goes through it.
+                    self.front = acme::front();
+                    self.page = if self.front.is_some() { Page::Proxy } else { Page::Options };
                 }
+            }
+            Page::Proxy => {
+                self.plan.proxy_rule = true;
+                self.page = Page::Options;
             }
             Page::Options => {
                 let p = self.port.text();
@@ -267,6 +281,7 @@ impl Wizard {
         if d.is_empty() {
             self.plan.domain.clear();
             self.plan.email.clear();
+            self.front = None;
             self.page = Page::Options;
             return;
         }
@@ -415,6 +430,20 @@ impl Wizard {
     }
 }
 
+/// A config snippet as it is: indents kept, tabs as four spaces, a line too long for the
+/// card cut into pieces rather than cut off.
+fn snippet_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    text.lines()
+        .flat_map(|l| {
+            let chars: Vec<char> = l.replace('\t', "    ").chars().collect();
+            if chars.is_empty() {
+                return vec![Line::from("")];
+            }
+            chars.chunks(width.max(8)).map(|c| Line::from(c.iter().collect::<String>())).collect()
+        })
+        .collect()
+}
+
 /// A port the panel can take: not the protocols' ports, free on the server.
 fn check_port(p: &str) -> String {
     let Ok(n) = p.parse::<u16>() else { return "a number from 1024 to 65535".into() };
@@ -521,7 +550,11 @@ impl Screen for Wizard {
         match (self.page, k.code) {
             (Page::Lang, KeyCode::Up | KeyCode::Char('k')) => self.lang = self.lang.saturating_sub(1),
             (Page::Lang, KeyCode::Down | KeyCode::Char('j')) => self.lang = (self.lang + 1).min(LANGS.len() - 1),
-            (Page::Lang | Page::Checks | Page::Docker | Page::Confirm, KeyCode::Char('q')) => return true,
+            (Page::Lang | Page::Checks | Page::Docker | Page::Proxy | Page::Confirm, KeyCode::Char('q')) => return true,
+            (Page::Proxy, KeyCode::Char('n')) => {
+                self.plan.proxy_rule = false;
+                self.page = Page::Options;
+            }
             (Page::Checks, KeyCode::Char('r')) if !self.checks.running() => self.start_checks(),
             (Page::Options, KeyCode::Up | KeyCode::BackTab) => self.focus = self.focus.saturating_sub(1),
             (Page::Options, KeyCode::Down | KeyCode::Tab) => self.focus = (self.focus + 1).min(2),
@@ -554,6 +587,7 @@ impl Screen for Wizard {
             Page::Address => self.draw_address(f),
             Page::Domain => self.draw_domain(f),
             Page::Email => self.draw_email(f),
+            Page::Proxy => self.draw_proxy(f),
             Page::Options => self.draw_options(f),
             Page::Confirm => self.draw_confirm(f),
             Page::Install => self.draw_install(f),
@@ -629,7 +663,8 @@ impl Wizard {
         let w = Card::body_width(f.area());
         let found =
             self.checks.done().and_then(|c| system::docker_to_replace(c)).map(|c| c.detail.split(' ').next().unwrap_or("").to_owned());
-        let mut lines = vec![field("Found", format!("Docker {}", found.unwrap_or_default())), Line::from("")];
+        let mut lines = field("Found", format!("Docker {}", found.unwrap_or_default()), w);
+        lines.push(Line::from(""));
         for text in [
             "The installer removes it (docker.io, containerd, runc and the old compose) and installs the current Docker from get.docker.com.",
             "Images, volumes and containers stay in /var/lib/docker and run again on the new Docker; running containers restart once.",
@@ -706,6 +741,36 @@ impl Wizard {
         }
     }
 
+    /// A web server's config is changed only with the admin's yes.
+    fn draw_proxy(&self, f: &mut Frame) {
+        let Some(front) = self.front else { return };
+        let keys = [("enter", "add the rule"), ("n", "no, I add it myself"), ("esc", "back"), ("q", "quit")];
+        let w = Card::body_width(f.area());
+        let (name, domain) = (front.name(), &self.plan.domain);
+        let title = format!("Let's Encrypt through {name}");
+        let lead = format!(
+            "Let's Encrypt checks {domain} on port 80, and {name} holds that port. mikan can add a rule to {name} that passes only those checks to the panel."
+        );
+        let texts: &[&str] = match front {
+            acme::Front::Nginx => &[
+                "It is a new file in nginx's config: a server for this domain on port 80. nginx -t tests it before a reload; if the test fails, the file is taken out again.",
+                "If nginx has a server for this domain already, mikan leaves it as it is and shows the one line to add to it.",
+            ],
+            acme::Front::Caddy => &[
+                "It is an http:// site for this domain at the end of the Caddyfile, which is backed up first. caddy validate checks it before a reload; if the check fails, the old Caddyfile goes back.",
+            ],
+        };
+        let mut lines = Vec::new();
+        for text in texts.iter().copied().chain([
+            "Say no to add it yourself: the last screen shows what to add. Until then the panel works with a self-signed certificate.",
+        ]) {
+            lines.extend(wrap(text, w).into_iter().map(|l| Line::from(dim(l))));
+            lines.push(Line::from(""));
+        }
+        lines.pop();
+        Self::page(f, self.card(&title, &lead, &keys), lines);
+    }
+
     fn draw_options(&self, f: &mut Frame) {
         let keys = [("↑↓", "move"), ("space", "switch"), ("enter", "next"), ("esc", "back")];
         let w = Card::body_width(f.area());
@@ -748,34 +813,43 @@ impl Wizard {
     fn draw_confirm(&self, f: &mut Frame) {
         let keys = [("enter", "install"), ("esc", "back"), ("q", "quit")];
         let p = &self.plan;
+        let w = Card::body_width(f.area());
         let mut lines = Vec::new();
         if let Some(key) = &p.join {
             let tail: String = key.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
-            lines.push(field("Mode", format!("a node of another panel (key …{tail})")));
+            lines.extend(field("Mode", format!("a node of another panel (key …{tail})"), w));
         } else {
-            lines.push(field("Language", LANGS[self.lang].1));
-            lines.push(field("Address", p.host.clone()));
-            lines.push(field("Domain", if p.domain.is_empty() { "none: self-signed certificate".into() } else { p.domain.clone() }));
+            lines.extend(field("Language", LANGS[self.lang].1, w));
+            lines.extend(field("Address", p.host.clone(), w));
+            lines.extend(field("Domain", if p.domain.is_empty() { "none: self-signed certificate".into() } else { p.domain.clone() }, w));
             if !p.domain.is_empty() {
-                lines.push(field("Email", if p.email.is_empty() { "none".into() } else { p.email.clone() }));
+                lines.extend(field("Email", if p.email.is_empty() { "none".into() } else { p.email.clone() }, w));
             }
-            lines.push(field("Panel port", p.port.to_string()));
+            if let Some(front) = self.front {
+                let rule = if p.proxy_rule {
+                    "mikan adds a rule for Let's Encrypt, tested before a reload"
+                } else {
+                    "you add the rule for Let's Encrypt (the last screen shows it)"
+                };
+                lines.extend(field("Port 80", format!("{}: {rule}", front.name()), w));
+            }
+            lines.extend(field("Panel port", p.port.to_string(), w));
         }
         let fw = match (self.ufw, p.firewall) {
             (false, _) => "ufw is off",
             (true, true) => "open the ports in ufw",
             (true, false) => "leave ufw alone",
         };
-        lines.push(field("Firewall", fw));
-        lines.push(field("Tuning", if p.tune { "BBR and bigger UDP buffers" } else { "leave the kernel alone" }));
+        lines.extend(field("Firewall", fw, w));
+        lines.extend(field("Tuning", if p.tune { "BBR and bigger UDP buffers" } else { "leave the kernel alone" }, w));
         let image = match (&p.image, &p.image_tar) {
             (Some(i), _) => i.clone(),
             (_, Some(t)) => format!("from {t}"),
             _ => "the latest signed release from GitHub".into(),
         };
-        lines.push(field("Image", image));
+        lines.extend(field("Image", image, w));
         if p.replace_docker {
-            lines.push(field("Docker", "replace the system's one from get.docker.com"));
+            lines.extend(field("Docker", "replace the system's one from get.docker.com", w));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(dim("Docker is installed if missing; mikan goes to /opt/mikan.")));
@@ -927,21 +1001,26 @@ impl Wizard {
 
     fn draw_done(&self, f: &mut Frame) {
         let Some(o) = &self.outcome else { return };
+        let w = Card::body_width(f.area());
         if o.node_port.is_some() {
             let keys = [("enter", "finish")];
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(vec![Span::styled("✓ ", Style::new().fg(OK)), Span::raw(format!("mikan {} node", o.version))]),
                 Line::from(""),
-                field("Waits on", format!("port {}", o.node_port.unwrap_or_default())),
-                Line::from(""),
-                Line::from(dim("Its panel connects within 30 seconds: see the panel's Nodes page.")),
-                Line::from(dim("On this server: mikan (menu), mikan status, mikan update.")),
             ];
+            lines.extend(field("Waits on", format!("port {}", o.node_port.unwrap_or_default()), w));
+            lines.push(Line::from(""));
+            for text in [
+                "Its panel connects within 30 seconds: see the panel's Nodes page.",
+                "On this server: mikan (menu), mikan status, mikan update.",
+            ] {
+                lines.extend(wrap(text, w).into_iter().map(|l| Line::from(dim(l))));
+            }
             Self::page(f, Card::new("The node is running", "", &keys), lines);
             return;
         }
         let keys = [("q", if self.show_qr { "hide QR" } else { "QR code" }), ("enter", "finish")];
-        let lead = "The password is shown once: keep it in a password manager. It stays in the terminal after you finish.";
+        let lead = "The password is shown here only, not after you finish: keep it in a password manager.";
         if self.show_qr {
             let code = qr(&o.url);
             let w = code.first().map_or(0, |l| l.spans.len()) as u16;
@@ -954,31 +1033,41 @@ impl Wizard {
             }
             return;
         }
-        let mut lines = vec![
-            field("Panel", o.url.clone()),
-            field("Login", o.login.clone()),
-            Line::from(vec![dim(format!("{:<14}", "Password")), Span::styled(o.password.clone(), Style::new().fg(ACCENT).bold())]),
-            Line::from(""),
-        ];
+        let mut lines = field("Panel", o.url.clone(), w);
+        lines.extend(field("Login", o.login.clone(), w));
+        lines.extend(field_styled("Password", o.password.clone(), Style::new().fg(ACCENT).bold(), w));
+        lines.push(Line::from(""));
         if let Some(a) = &self.applied {
             let first = a.lines().find(|l| l.starts_with("Inbound")).unwrap_or_else(|| a.lines().next().unwrap_or(""));
-            lines.push(field("REALITY", first.to_owned()));
+            lines.extend(field("REALITY", first.to_owned(), w));
         }
-        let cert = if self.plan.domain.is_empty() {
-            "self-signed: the browser warns once, then the panel works".to_string()
-        } else {
-            format!("Let's Encrypt for {} within a minute", self.plan.domain)
+        let domain = &self.plan.domain;
+        let cert = match &o.acme {
+            _ if domain.is_empty() => "self-signed: the browser warns once, then the panel works".to_string(),
+            None => format!("Let's Encrypt for {domain} within a minute"),
+            Some(r) if r.added.is_some() => format!("Let's Encrypt for {domain} within a minute, through {}", r.front),
+            Some(r) if r.manual.as_ref().is_some_and(|m| m.snippet.is_empty()) => {
+                format!("self-signed until port 80 is free ({}); the panel tries again by itself", r.front)
+            }
+            Some(r) => format!("self-signed until {} passes Let's Encrypt to the panel; it tries again by itself", r.front),
         };
-        lines.push(field("Certificate", cert));
+        lines.extend(field("Certificate", cert, w));
+        if let Some((r, m)) = o.acme.as_ref().and_then(|r| r.manual.as_ref().map(|m| (r, m))).filter(|(_, m)| !m.snippet.is_empty()) {
+            lines.push(Line::from(""));
+            let how = format!("Add this {}, then reload {} (it is printed again when you finish):", m.place, r.front);
+            lines.extend(wrap(&how, w).into_iter().map(|l| Line::from(dim(l))));
+            lines.extend(snippet_lines(&m.snippet, w));
+        }
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            dim("On this server: "),
-            "mikan".bold(),
-            dim(" for this menu, "),
-            "mikan update".bold(),
-            dim(", "),
-            "mikan status".bold(),
-        ]));
+        let head = vec![dim("On this server: "), "mikan".bold(), dim(" for this menu, ")];
+        let tail = vec!["mikan update".bold(), dim(", "), "mikan status".bold()];
+        let one: usize = head.iter().chain(&tail).map(|s| s.width()).sum();
+        if one <= w {
+            lines.push(Line::from([head, tail].concat()));
+        } else {
+            lines.push(Line::from(head));
+            lines.push(Line::from(tail));
+        }
         Self::page(f, Card::new("mikan is running", lead, &keys), lines);
     }
 }

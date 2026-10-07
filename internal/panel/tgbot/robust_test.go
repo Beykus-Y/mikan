@@ -25,7 +25,7 @@ func (e *env) link(tg int64) {
 func (e *env) expireIn(d time.Duration) {
 	e.t.Helper()
 	exp := e.clock().Add(d).Unix()
-	if _, err := e.st.DB.ExecContext(e.ctx, "UPDATE users SET expires_at = ? WHERE id = ?", exp, e.user.ID); err != nil {
+	if _, err := e.st.DB.ExecContext(e.ctx, "UPDATE users SET expires_at = $1 WHERE id = $2", exp, e.user.ID); err != nil {
 		e.t.Fatal(err)
 	}
 }

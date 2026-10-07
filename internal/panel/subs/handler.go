@@ -19,6 +19,8 @@ import (
 
 	"mikan/internal/panel/billing"
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/panelimport"
+	"mikan/internal/panel/promo"
 	"mikan/internal/panel/server"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
@@ -27,13 +29,28 @@ import (
 
 // Config is resolved per request, so settings changes apply without a restart.
 type Config struct {
-	Brand      string
-	SupportURL string
-	Nodes      []Node   // enabled nodes in display order
-	Direct     []string // the panel's and nodes' hosts: kept out of the tunnel
-	Groups     Groups
-	Routing    Routing
-	Rules      []string // the admin's own Clash rules, checked (ServedRules)
+	Brand       string
+	SupportURL  string
+	PageTheme   string
+	PageLogo    string
+	PageModules []PageModule
+	// Title is the profile's name in the apps (Profile-Title); "" names it Brand. Title and
+	// Announce may hold TitleVars, filled for each user.
+	Title string
+	// Announce is the text apps show over the profile, AnnounceURL where a tap on it leads.
+	Announce    string
+	AnnounceURL string
+	App         AppBrand // the brand in apps that read operator headers
+	// SubBase is https://host:port/<sub path> as the panel hands links out; "" without an
+	// address, and the request's own address is taken.
+	SubBase string
+	// Legacy checks the signed links of the panel users were imported from (Legacy).
+	Legacy  panelimport.Verifier
+	Nodes   []Node   // enabled nodes in display order
+	Direct  []string // the panel's and nodes' hosts: kept out of the tunnel
+	Groups  Groups
+	Routing Routing
+	Rules   []string // the admin's own Clash rules, checked (ServedRules)
 	// Fingerprint is the default uTLS profile for inbounds that set none.
 	Fingerprint string
 	// Binding gives every device that sends its id keys of its own (domain.Devices);
@@ -43,6 +60,12 @@ type Config struct {
 	// Lang is the panel's default language, "" when unset: default group names and the
 	// notices in place of servers are in it.
 	Lang string
+}
+
+// PageModule is a section's saved order and visibility on the subscription page.
+type PageModule struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
 }
 
 // Binder hands devices their keys (domain.Devices).
@@ -61,8 +84,10 @@ type Handler struct {
 	trustProxy bool
 	tg         Telegram         // nil: no bot
 	shop       *billing.Service // nil: nothing on sale
+	promos     *promo.Service
 	log        *slog.Logger
 	logged     sync.Map // what has been logged lately → when, so a standing fault is one line an hour
+	promoLimit promoLimiter
 }
 
 // Telegram is the bot's part in subscriptions: the page's "Open in Telegram" link and the
@@ -94,6 +119,7 @@ func (h *Handler) warn(key, msg string, args ...any) {
 
 // SetShop takes payments: the providers' webhooks under /pay/ and the Mini App's shop.
 func (h *Handler) SetShop(s *billing.Service) { h.shop = s }
+func (h *Handler) SetPromo(s *promo.Service)  { h.promos = s }
 
 func NewHandler(st *store.Store, cfg func(ctx context.Context) (Config, error), page http.Handler, now func() time.Time, devices Binder, trustProxy bool) *Handler {
 	return &Handler{st: st, cfg: cfg, page: page, now: now, devices: devices, trustProxy: trustProxy, log: slog.New(slog.DiscardHandler)}
@@ -128,7 +154,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method != http.MethodGet && r.Method != http.MethodHead:
 		server.NotFound(w)
 		return
-	case (strings.HasPrefix(p, "assets/") || p == "favicon.svg") && h.page != nil:
+	case (strings.HasPrefix(p, "assets/") || p == "favicon.png" || p == "apple-touch-icon.png") && h.page != nil:
 		h.page.ServeHTTP(w, r)
 		return
 	case rest != "" && rest != "info":
@@ -173,7 +199,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	h.userInfoHeaders(w, u, grants.Main(u.ID), cfg)
+	// The values are worked out only when a title or an announcement can use them.
+	var vars map[string]string
+	if cfg.Title != "" || cfg.Announce != "" {
+		vars = titleValues(u, grants.Main(u.ID), cfg, h.now())
+		if cfg.Announce != "" {
+			cfg.Announce = fillTitle(cfg.Announce, vars)
+		}
+	}
+	h.userInfoHeaders(w, u, grants.Main(u.ID), cfg, vars)
+	h.operatorHeaders(w, r, u, cfg)
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodHead {
 		return // apps peek at the traffic headers; the keys go only with a real fetch
@@ -213,7 +248,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(cfg.Brand)+".yaml")
+		// Clash apps name the profile after the file: the same name as Profile-Title.
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(fileName(profileTitle(cfg, vars)))+".yaml")
 		_, _ = w.Write(body)
 	default:
 		links, err := URIs(prof)
@@ -268,6 +304,12 @@ func (h *Handler) miniApp(w http.ResponseWriter, r *http.Request, rest string) {
 		_ = json.NewEncoder(w).Encode(out)
 	case r.Method == http.MethodPost && (rest == "shop" || rest == "pay") && sameOrigin(r) && h.shop != nil:
 		h.miniAppShop(w, r, rest)
+	case r.Method == http.MethodPost && (rest == "promo" || rest == "promo-history") && sameOrigin(r) && h.promos != nil:
+		if rest == "promo-history" {
+			h.miniAppPromoHistory(w, r)
+		} else {
+			h.miniAppPromo(w, r)
+		}
 	default:
 		server.NotFound(w)
 	}
@@ -280,9 +322,11 @@ func (h *Handler) miniAppShop(w http.ResponseWriter, r *http.Request, rest strin
 	var in struct {
 		InitData  string `json:"init_data"`
 		TariffID  int64  `json:"tariff_id"`
+		TermDays  *int64 `json:"term_days"` // the tariff's term; absent: its first
 		PackageID int64  `json:"package_id"`
 		Provider  string `json:"provider"`
 		Token     string `json:"token"`
+		PromoCode string `json:"promo_code"`
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
@@ -324,12 +368,21 @@ func (h *Handler) miniAppShop(w http.ResponseWriter, r *http.Request, rest strin
 			fail(http.StatusInternalServerError, "internal")
 			return
 		}
+		// A tariff's terms, the first one also in the offer itself (as before terms).
+		type term struct {
+			Days        int64  `json:"days"`
+			Label       string `json:"label"`
+			Description string `json:"description"`
+			Stars       int64  `json:"stars,omitempty"`
+			Rub         int64  `json:"rub,omitempty"`
+		}
 		type offer struct {
 			ID          int64  `json:"id"`
 			Name        string `json:"name"`
 			Description string `json:"description"`
 			Stars       int64  `json:"stars,omitempty"`
 			Rub         int64  `json:"rub,omitempty"`
+			Terms       []term `json:"terms"`
 		}
 		// Marketplace adapters take rubles; the buyer sees each by its own name.
 		type addon struct {
@@ -348,18 +401,31 @@ func (h *Handler) miniAppShop(w http.ResponseWriter, r *http.Request, rest strin
 			out.Addons = append(out.Addons, addon{Provider: billing.AddonPrefix + id, Name: h.shop.AddonName(ctx, id, cfg.Lang)})
 		}
 		for _, o := range offers {
-			out.Offers = append(out.Offers, offer{ID: o.Tariff.ID, Name: o.Tariff.Name, Description: billing.Describe(o.Tariff, cfg.Lang), Stars: o.Stars, Rub: o.Rub})
+			v := offer{ID: o.Tariff.ID, Name: o.Tariff.Name, Description: billing.DescribeOffer(o, cfg.Lang), Stars: o.Stars, Rub: o.Rub}
+			for _, t := range o.Terms {
+				v.Terms = append(v.Terms, term{Days: t.Days, Label: billing.TermLabel(o.Tariff, t.Days, cfg.Lang),
+					Description: billing.Describe(o.Tariff, t.Days, cfg.Lang), Stars: t.Stars, Rub: t.Rub})
+			}
+			out.Offers = append(out.Offers, v)
 		}
 		_ = json.NewEncoder(w).Encode(out)
 		return
 	}
+	if strings.TrimSpace(in.PromoCode) != "" && !h.promoLimit.allow(tgID, h.now(), in.PromoCode) {
+		fail(http.StatusTooManyRequests, "promo_try_later")
+		return
+	}
 	var p db.Payment
 	if in.PackageID != 0 {
-		p, err = h.shop.PackageInvoice(ctx, billing.PackageRequest{TgID: tgID, UserID: userID, PackageID: in.PackageID, Provider: billing.AdapterOf(in.Provider)})
+		p, err = h.shop.PackageInvoice(ctx, billing.PackageRequest{TgID: tgID, UserID: userID, PackageID: in.PackageID, Provider: billing.AdapterOf(in.Provider), PromoCode: in.PromoCode})
 	} else {
-		p, err = h.shop.Invoice(ctx, billing.InvoiceRequest{TgID: tgID, UserID: userID, TariffID: in.TariffID, Provider: billing.AdapterOf(in.Provider)})
+		p, err = h.shop.Invoice(ctx, billing.InvoiceRequest{TgID: tgID, UserID: userID, TariffID: in.TariffID, TermDays: in.TermDays, Provider: billing.AdapterOf(in.Provider), PromoCode: in.PromoCode})
 	}
 	if err != nil {
+		if strings.TrimSpace(in.PromoCode) != "" && promoError(err) {
+			fail(h.promoAttempt(err))
+			return
+		}
 		status, code, unexplained := invoiceFailure(err)
 		if unexplained {
 			h.log.Warn("mini app: the invoice was not made", "provider", in.Provider, "err", err)
@@ -370,14 +436,229 @@ func (h *Handler) miniAppShop(w http.ResponseWriter, r *http.Request, rest strin
 	_ = json.NewEncoder(w).Encode(map[string]string{"url": p.PayUrl, "provider": p.Provider})
 }
 
+func promoError(err error) bool {
+	for _, candidate := range []error{promo.ErrNotFound, promo.ErrInactive, promo.ErrExpired, promo.ErrLimit, promo.ErrUserLimit,
+		promo.ErrTariff, promo.ErrMinimum, promo.ErrNewUser, promo.ErrFirstPurchase, promo.ErrCurrency, promo.ErrUnavailable,
+		promo.ErrNotDiscount, promo.ErrInvalidValue, promo.ErrRefundUnsupported, promo.ErrAlreadyApplied,
+		promo.ErrSubscription, promo.ErrNoExpiry, promo.ErrReservationExpired} {
+		if errors.Is(err, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// miniAppPromo validates a code or immediately redeems a bonus. Discount codes are only
+// validated here; they are reserved atomically with the payment when the order is opened.
+func (h *Handler) miniAppPromo(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		InitData     string `json:"init_data"`
+		Token        string `json:"token"`
+		Code         string `json:"code"`
+		TariffID     int64  `json:"tariff_id"`
+		TermDays     *int64 `json:"term_days"`
+		PackageID    int64  `json:"package_id"`
+		Provider     string `json:"provider"`
+		ValidateOnly bool   `json:"validate_only"`
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	fail := func(status int, code string) {
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": code})
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&in) != nil || strings.TrimSpace(in.Code) == "" {
+		fail(http.StatusBadRequest, "bad_request")
+		return
+	}
+	tgID, users, err := h.tg.MiniAppUser(r.Context(), in.InitData)
+	if err != nil {
+		fail(http.StatusUnauthorized, "init_data")
+		return
+	}
+	if !h.promoLimit.allow(tgID, h.now(), in.Code) {
+		fail(http.StatusTooManyRequests, "promo_try_later")
+		return
+	}
+	var userID int64
+	if in.Token != "" {
+		for _, u := range users {
+			if u.SubToken == in.Token {
+				userID = u.ID
+				break
+			}
+		}
+		if userID == 0 {
+			fail(http.StatusForbidden, billing.ErrNotYours.Error())
+			return
+		}
+	}
+	if in.ValidateOnly {
+		tariffID, amount, currency, err := h.miniAppPromoOrder(r.Context(), userID, in.TariffID, in.TermDays, in.PackageID, billing.AdapterOf(in.Provider))
+		if err != nil {
+			fail(http.StatusConflict, "promo_unavailable")
+			return
+		}
+		p, err := h.promos.Validate(r.Context(), tgID, userID, tariffID, amount, currency, in.Code)
+		if err == nil && p.Type != "percent" && p.Type != "fixed" {
+			err = promo.ErrNotDiscount
+		}
+		if err != nil {
+			fail(h.promoAttempt(err))
+			return
+		}
+		discount := promo.DiscountAmount(p, amount)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "type": p.Type, "discount": discount, "final_amount": amount - discount, "currency": currency})
+		return
+	}
+	p, err := h.promos.Check(r.Context(), tgID, userID, in.Code)
+	if err != nil {
+		fail(h.promoAttempt(err))
+		return
+	}
+	switch p.Type {
+	case "days", "traffic":
+		r, err := h.promos.RedeemBonus(r.Context(), tgID, userID, in.Code)
+		if err != nil {
+			fail(h.promoAttempt(err))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "type": p.Type, "days": r.Days, "bytes": r.Bytes, "message": "promo_applied"})
+	case "percent", "fixed":
+		// A discount needs an order: the page keeps the code for the checkout, where it is
+		// checked against the price and reserved with the payment.
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "type": p.Type, "code": p.Code})
+	default:
+		fail(http.StatusConflict, "promo_unavailable")
+	}
+}
+
+// miniAppPromoOrder is the order a discount code is checked against: the tariff, and the
+// price of the chosen term (days nil: the first) or of the package, with provider.
+func (h *Handler) miniAppPromoOrder(ctx context.Context, userID, tariffID int64, days *int64, packageID int64, provider string) (int64, int64, string, error) {
+	if h.shop == nil || provider == "" {
+		return 0, 0, "", promo.ErrUnavailable
+	}
+	if packageID != 0 {
+		offers, _, err := h.shop.PackageOffers(ctx, userID)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		user, err := h.st.Q.GetUser(ctx, userID)
+		if err != nil || !user.TariffID.Valid {
+			return 0, 0, "", promo.ErrTariff
+		}
+		for _, offer := range offers {
+			if offer.Package.ID == packageID {
+				if amount, currency, ok := promoOrderPrice(provider, offer.Stars, offer.Rub); ok {
+					return user.TariffID.Int64, amount, currency, nil
+				}
+			}
+		}
+		return 0, 0, "", promo.ErrUnavailable
+	}
+	offers, _, err := h.shop.Offers(ctx)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	for _, offer := range offers {
+		if offer.Tariff.ID == tariffID {
+			t, ok := offer.Term(days)
+			if !ok {
+				break
+			}
+			if amount, currency, ok := promoOrderPrice(provider, t.Stars, t.Rub); ok {
+				return offer.Tariff.ID, amount, currency, nil
+			}
+		}
+	}
+	return 0, 0, "", promo.ErrUnavailable
+}
+
+func promoOrderPrice(provider string, stars, rub int64) (int64, string, bool) {
+	switch {
+	case provider == billing.Stars && stars > 0:
+		return stars, "XTR", true
+	case strings.HasPrefix(provider, billing.AddonPrefix) && rub > 0:
+		return rub, "RUB", true
+	default:
+		return 0, "", false
+	}
+}
+
+func (h *Handler) miniAppPromoHistory(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		InitData string `json:"init_data"`
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&in) != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	tgID, _, err := h.tg.MiniAppUser(r.Context(), in.InitData)
+	if err != nil {
+		w.WriteHeader(401)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "init_data"})
+		return
+	}
+	rs, err := h.st.Q.ListPromoRedemptionsByTgWithCode(r.Context(), db.ListPromoRedemptionsByTgWithCodeParams{TgID: tgID, Lim: 100})
+	if err != nil {
+		w.WriteHeader(500)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "internal"})
+		return
+	}
+	type item struct {
+		Code     string `json:"code"`
+		Days     int64  `json:"days"`
+		Bytes    int64  `json:"bytes"`
+		Discount int64  `json:"discount"`
+		Currency string `json:"currency"`
+		At       int64  `json:"at"`
+	}
+	out := struct {
+		Items []item `json:"items"`
+	}{Items: []item{}}
+	for _, row := range rs {
+		redemption := row
+		out.Items = append(out.Items, item{Code: row.Code, Days: redemption.Days, Bytes: redemption.Bytes, Discount: redemption.DiscountAmount, Currency: redemption.Currency, At: redemption.RedeemedAt})
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// promoAttempt is the answer to a code that could not be used. Why a code does not apply is
+// not told: "promo_unavailable" for all of it, so codes cannot be probed. Anything else is
+// the panel's trouble, logged and answered as such.
+// promoAttempt answers a refused code without saying why (the buyer must not learn which
+// codes exist or who they are for); the admin finds the reason in the log.
+func (h *Handler) promoAttempt(err error) (int, string) {
+	if code := promoAttemptCode(err); code != "" {
+		h.log.Info("mini app: promo code refused", "reason", err)
+		return http.StatusConflict, code
+	}
+	h.log.Error("mini app: promo code failed", "err", err)
+	return http.StatusInternalServerError, "internal"
+}
+
+func promoAttemptCode(err error) string {
+	if promoError(err) || errors.Is(err, promo.ErrNotBonus) {
+		return "promo_unavailable"
+	}
+	return ""
+}
+
 // invoiceFailure is what the Mini App answers when no invoice could be made. What the buyer
 // can act on is told as it is. A provider that is switched off is "provider_off". Anything
 // else, a provider that failed, a database that was busy, is the panel's trouble: the buyer
 // is told it did not work, not that payment is off, and unexplained says nobody has logged
 // the cause yet (billing logs a provider's failure itself).
 func invoiceFailure(err error) (status int, code string, unexplained bool) {
-	for _, e := range []error{billing.ErrNotForSale, billing.ErrNewOff, billing.ErrTooManySubs, billing.ErrTooMany, billing.ErrNotYours} {
+	for _, e := range []error{billing.ErrNotForSale, billing.ErrNewOff, billing.ErrTooManySubs, billing.ErrTooMany, billing.ErrNotYours,
+		promo.ErrNotFound, promo.ErrInactive, promo.ErrExpired, promo.ErrLimit, promo.ErrUserLimit, promo.ErrTariff, promo.ErrMinimum, promo.ErrNewUser, promo.ErrFirstPurchase, promo.ErrCurrency, promo.ErrUnavailable, promo.ErrNotDiscount, promo.ErrInvalidValue, promo.ErrRefundUnsupported} {
 		if errors.Is(err, e) {
+			if strings.HasPrefix(e.Error(), "promo_") {
+				return http.StatusConflict, "promo_unavailable", false
+			}
 			return http.StatusConflict, e.Error(), false
 		}
 	}
@@ -448,7 +729,7 @@ func (h *Handler) profile(ctx context.Context, u db.User, cfg Config, slot db.Sl
 
 // userInfoHeaders: the traffic and term apps show. With traffic packages left the total
 // is what the user can reach: what is used plus what is left.
-func (h *Handler) userInfoHeaders(w http.ResponseWriter, u db.User, grants int64, cfg Config) {
+func (h *Handler) userInfoHeaders(w http.ResponseWriter, u db.User, grants int64, cfg Config, vars map[string]string) {
 	var total, expire int64
 	if u.TrafficLimit.Valid {
 		total = u.TrafficLimit.Int64
@@ -464,28 +745,53 @@ func (h *Handler) userInfoHeaders(w http.ResponseWriter, u db.User, grants int64
 		"; total="+strconv.FormatInt(total, 10)+"; expire="+strconv.FormatInt(expire, 10))
 	// Hourly: a port or target the panel changed on its own reaches clients soon.
 	hd.Set("Profile-Update-Interval", "1")
-	hd.Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(cfg.Brand)))
+	hd.Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(profileTitle(cfg, vars))))
 	if cfg.SupportURL != "" {
 		hd.Set("Support-Url", cfg.SupportURL)
 	}
 }
 
+// operatorHeaders: the subscription page, the announcement and the app branding
+// (OperatorHeaders). Devices are counted only for branding, which shows them.
+func (h *Handler) operatorHeaders(w http.ResponseWriter, r *http.Request, u db.User, cfg Config) {
+	devices := int64(-1)
+	var bot string
+	if cfg.App.Enabled {
+		if cfg.Binding && u.DeviceLimit.Valid {
+			if n, err := h.st.Q.CountBoundDevices(r.Context(), u.ID); err == nil {
+				devices = n
+			}
+		}
+		if h.tg != nil {
+			bot = BotURL(h.tg.LinkURL(r.Context(), u.ID))
+		}
+	}
+	page := PageURL(r)
+	if cfg.SubBase != "" {
+		page = cfg.SubBase + "/" + u.SubToken
+	}
+	OperatorHeaders(w.Header(), u, cfg, page, bot, devices)
+}
+
 // Info is what the subscription page shows. Credentials are not included: the page
 // offers import buttons that point back at this subscription URL.
 type Info struct {
-	Name       string     `json:"name"`
-	Brand      string     `json:"brand"`
-	SupportURL string     `json:"support_url,omitempty"`
-	State      string     `json:"state"`
-	UsedUp     int64      `json:"used_up"`
-	UsedDown   int64      `json:"used_down"`
-	Limit      *int64     `json:"limit,omitempty"`
-	Extra      int64      `json:"extra,omitempty"` // bytes left in traffic packages, spent after Limit
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	ResetsAt   *time.Time `json:"resets_at,omitempty"`
-	Devices    int        `json:"device_limit"`
-	Protocols  []string   `json:"protocols"`
-	Locations  []string   `json:"locations,omitempty"`
+	Name       string       `json:"name"`
+	Brand      string       `json:"brand"`
+	Theme      string       `json:"theme"`
+	Logo       string       `json:"logo,omitempty"`
+	Modules    []PageModule `json:"modules,omitempty"`
+	SupportURL string       `json:"support_url,omitempty"`
+	State      string       `json:"state"`
+	UsedUp     int64        `json:"used_up"`
+	UsedDown   int64        `json:"used_down"`
+	Limit      *int64       `json:"limit,omitempty"`
+	Extra      int64        `json:"extra,omitempty"` // bytes left in traffic packages, spent after Limit
+	ExpiresAt  *time.Time   `json:"expires_at,omitempty"`
+	ResetsAt   *time.Time   `json:"resets_at,omitempty"`
+	Devices    int          `json:"device_limit"`
+	Protocols  []string     `json:"protocols"`
+	Locations  []string     `json:"locations,omitempty"`
 	// Telegram opens the bot with this subscription tied to the account; empty without a bot.
 	Telegram string `json:"telegram,omitempty"`
 	// Bound devices, when binding is on. The device id itself stays in the admin panel.
@@ -515,7 +821,7 @@ func (h *Handler) info(ctx context.Context, w http.ResponseWriter, u db.User, pr
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	out := Info{Name: u.Name, Brand: cfg.Brand, SupportURL: cfg.SupportURL, State: domain.State(u, grants.Main(u.ID), now), UsedUp: u.UsedUp, UsedDown: u.UsedDown,
+	out := Info{Name: u.Name, Brand: cfg.Brand, Theme: cfg.PageTheme, Logo: cfg.PageLogo, Modules: cfg.PageModules, SupportURL: cfg.SupportURL, State: domain.State(u, grants.Main(u.ID), now), UsedUp: u.UsedUp, UsedDown: u.UsedDown,
 		Binding: cfg.Binding, Bound: []DeviceItem{}}
 	if u.TrafficLimit.Valid {
 		out.Extra = grants.Main(u.ID)
@@ -623,6 +929,7 @@ func (h *Handler) stub(w http.ResponseWriter, u db.User, cfg Config, format stri
 		w.Header().Set("X-Hwid-Not-Supported", "true")
 	default:
 		w.Header().Set("X-Hwid-Max-Devices-Reached", "true")
+		w.Header().Set("X-Hwid-Limit", "true") // v2RayTun shows the notice only with it
 	}
 	if format == "clash" {
 		main := cfg.Groups.WithDefaults(cfg.Lang).Main
@@ -699,7 +1006,7 @@ func (h *Handler) poolInfo(ctx context.Context, userID int64, grants domain.Gran
 	var out []PoolInfo
 	for _, r := range rows {
 		used := r.UsedUp + r.UsedDown
-		if !r.TrafficLimit.Valid && used == 0 {
+		if r.Excluded || !r.TrafficLimit.Valid && used == 0 {
 			continue
 		}
 		pi := PoolInfo{Name: names[r.PoolID], Used: used}

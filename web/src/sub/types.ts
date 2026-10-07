@@ -6,6 +6,9 @@
 export type Info = {
   name: string;
   brand: string;
+  theme?: "mikan" | "midnight" | "ocean" | "sakura" | "forest";
+  logo?: string;
+  modules?: { id: string; enabled: boolean }[];
   support_url?: string;
   state: "active" | "expiring" | "limited" | "expired" | "disabled";
   used_up: number;

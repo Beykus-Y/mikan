@@ -55,8 +55,8 @@ func AddMonths(base time.Time, n int, billingDay sql.NullInt64) time.Time {
 	return e
 }
 
-// termMonths turns a tariff's duration into months for a billing day: 30 days is one.
-func termMonths(days int64) int {
+// TermMonths turns a tariff's duration into months for a billing day: 30 days is one.
+func TermMonths(days int64) int {
 	return max(1, int((days+15)/30))
 }
 
@@ -66,7 +66,7 @@ func tariffExpiry(now time.Time, t durationTariff) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	if t.billingDay.Valid {
-		return sql.NullInt64{Int64: AddMonths(now, termMonths(t.days), t.billingDay).Unix(), Valid: true}
+		return sql.NullInt64{Int64: AddMonths(now, TermMonths(t.days), t.billingDay).Unix(), Valid: true}
 	}
 	return expiry(now.Unix(), t.days)
 }

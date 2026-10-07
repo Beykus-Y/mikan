@@ -115,6 +115,8 @@ func (d *Devices) bind(ctx context.Context, u db.User, hwid string, in DeviceInf
 		return slot, false, err
 	}
 	err = d.st.Tx(ctx, func(q *db.Queries) error {
+		// A conflict runs this again: a device an attempt made and rolled back is not made.
+		slot, created = db.Slot{}, false
 		dev, err := q.GetBoundDevice(ctx, db.GetBoundDeviceParams{UserID: u.ID, Hwid: hwid})
 		if err == nil {
 			// Apps do not send every header every time: keep what is known.

@@ -7,7 +7,7 @@ import (
 
 	"mikan/internal/nodeapi"
 	"mikan/internal/panel/domain"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 )
 
 type noChanges struct{}
@@ -18,7 +18,7 @@ func (noChanges) SlotsChanged()    {}
 // A user online from two devices with keys of their own is one user online.
 func TestOverviewCountsUsersNotDevices(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

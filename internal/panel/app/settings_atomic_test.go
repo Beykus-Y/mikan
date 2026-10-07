@@ -23,7 +23,7 @@ func TestSettingsOfOneRequestAreWrittenTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	// One of the keys refuses to be written (a full disk or a busy database would do the same).
-	if _, err := h.st.DB.ExecContext(ctx, "CREATE TRIGGER refuse_lang BEFORE INSERT ON settings WHEN NEW.key = '"+settings.KeyDefaultLang+"' BEGIN SELECT RAISE(ABORT, 'refused'); END"); err != nil {
+	if _, err := h.st.DB.ExecContext(ctx, "ALTER TABLE settings ADD CONSTRAINT refuse_lang CHECK(key <> '"+settings.KeyDefaultLang+"') NOT VALID"); err != nil {
 		t.Fatal(err)
 	}
 	for range 5 { // the order the keys are written in is random
@@ -38,7 +38,7 @@ func TestSettingsOfOneRequestAreWrittenTogether(t *testing.T) {
 			t.Fatal("the quiet hour of the failed request was kept")
 		}
 	}
-	if _, err := h.st.DB.ExecContext(ctx, "DROP TRIGGER refuse_lang"); err != nil {
+	if _, err := h.st.DB.ExecContext(ctx, "ALTER TABLE settings DROP CONSTRAINT refuse_lang"); err != nil {
 		t.Fatal(err)
 	}
 	if resp, body := h.do(http.MethodPatch, api+"/settings", map[string]any{"brand": "After", "default_lang": "en"}, csrf); resp.StatusCode != http.StatusOK {

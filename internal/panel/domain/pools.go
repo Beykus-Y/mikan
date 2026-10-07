@@ -12,8 +12,8 @@ import (
 // apart from the main quota. Users get their pool limits from the tariff, like the main
 // limit, and the admin may change them per user.
 
-// ApplyTariffPools gives the user the tariff's pool limits: pools the tariff does not
-// list become unlimited. What the user used stays.
+// ApplyTariffPools gives the user the tariff's pool limits and the pools it leaves out:
+// pools the tariff does not list become unlimited. What the user used stays.
 func ApplyTariffPools(ctx context.Context, q *db.Queries, userID, tariffID int64) error {
 	if err := q.ClearUserPoolLimits(ctx, userID); err != nil {
 		return err
@@ -23,7 +23,8 @@ func ApplyTariffPools(ctx context.Context, q *db.Queries, userID, tariffID int64
 		return err
 	}
 	for _, p := range ps {
-		if err := q.SetUserPoolLimit(ctx, db.SetUserPoolLimitParams{UserID: userID, PoolID: p.PoolID, TrafficLimit: sql.NullInt64{Int64: p.TrafficLimit, Valid: true}}); err != nil {
+		limit := sql.NullInt64{Int64: p.TrafficLimit, Valid: !p.Excluded}
+		if err := q.SetUserPoolLimit(ctx, db.SetUserPoolLimitParams{UserID: userID, PoolID: p.PoolID, TrafficLimit: limit, Excluded: p.Excluded}); err != nil {
 			return err
 		}
 	}
@@ -36,7 +37,8 @@ func PoolExhausted(p db.UserPool, grants int64) bool {
 	return TrafficLeft(p.TrafficLimit, p.UsedUp+p.UsedDown, grants) == 0
 }
 
-// ExhaustedPools are the user's pools with nothing left, by pool id.
+// ExhaustedPools are the user's pools that do not serve: nothing left, or left out of the
+// user's tariff, by pool id.
 func ExhaustedPools(ctx context.Context, q *db.Queries, userID int64, now time.Time) (map[int64]bool, error) {
 	ps, err := q.ListUserPools(ctx, userID)
 	if err != nil {
@@ -48,7 +50,7 @@ func ExhaustedPools(ctx context.Context, q *db.Queries, userID int64, now time.T
 	}
 	out := map[int64]bool{}
 	for _, p := range ps {
-		if PoolExhausted(p, left.Pool(userID, p.PoolID)) {
+		if p.Excluded || PoolExhausted(p, left.Pool(userID, p.PoolID)) {
 			out[p.PoolID] = true
 		}
 	}

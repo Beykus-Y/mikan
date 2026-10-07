@@ -14,11 +14,15 @@ import (
 // path, or nothing. Everything else gets the same bare 404, so a scanner cannot tell
 // a panel from any other HTTPS endpoint.
 type Server struct {
-	paths atomic.Pointer[settings.Paths]
-	admin http.Handler
-	sub   http.Handler
-	hsts  atomic.Pointer[func() bool]
+	paths  atomic.Pointer[settings.Paths]
+	admin  http.Handler
+	sub    http.Handler
+	legacy http.Handler // the old panel's links (settings.Paths.Legacy); nil: none
+	hsts   atomic.Pointer[func() bool]
 }
+
+// SetLegacy takes the handler of the old panel's subscription links.
+func (s *Server) SetLegacy(h http.Handler) { s.legacy = h }
 
 func New(admin, sub http.Handler) *Server {
 	s := &Server{admin: admin, sub: sub}
@@ -67,6 +71,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, admin bool) {
 		s.forward(w, r, s.admin, seg, rest, p)
 	case seg != "" && paths.Sub != "" && secure.Equal(seg, paths.Sub):
 		s.forward(w, r, s.sub, seg, rest, p)
+	case s.legacy != nil && paths.Legacy != "" && strings.HasPrefix(p, "/"+paths.Legacy+"/"):
+		// The old panel's links: on every port, as the old panel had them on its own.
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = p[len(paths.Legacy)+1:]
+		r2.URL.RawPath = ""
+		s.legacy.ServeHTTP(w, r2)
 	default:
 		NotFound(w)
 	}

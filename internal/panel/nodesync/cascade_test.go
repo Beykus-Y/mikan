@@ -45,7 +45,7 @@ func TestCascadeChain(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := domain.EnsureRelay(ctx, q, x, time.Now()); err != nil {
+		if _, err := domain.EnsureRelay(ctx, q, x, time.Now(), nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := domain.RelayUser(ctx, q, exit, src); err != nil {
@@ -101,7 +101,7 @@ func TestCascadeChain(t *testing.T) {
 
 	// C switched off: B's relay still goes to "C", which cannot be reached — no leak.
 	n, _ := q.GetNode(ctx, nc.ID)
-	if _, err := q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain, Enabled: 0, ID: n.ID}); err != nil {
+	if _, err := q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain, PublicName: n.PublicName, Enabled: 0, ID: n.ID}); err != nil {
 		t.Fatal(err)
 	}
 	db_, _ = b.desired(ctx)
@@ -112,3 +112,49 @@ func TestCascadeChain(t *testing.T) {
 }
 
 func nullID(id int64) sql.NullInt64 { return sql.NullInt64{Int64: id, Valid: true} }
+
+// The health view names the relay's port like an inbound's, so a failed relay listener is
+// read against the port it failed on, and carries what the node said listens on its
+// server: the panel keeps the relay's port and the moved inbounds' off those.
+func TestHealthCarriesTheRelayPortAndHostPorts(t *testing.T) {
+	s, node, st, _, _ := setup(t)
+	ctx := context.Background()
+	q := st.Q
+	panel, _ := nodetls.Generate("mikan-panel", x509.ExtKeyUsageClientAuth, time.Now())
+	nb, _, err := domain.AddNode(ctx, st, panel, domain.NodeInput{Name: "B", Host: "198.51.100.20", APIPort: 40000}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := q.GetNode(ctx, s.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := domain.EnsureRelay(ctx, q, local, time.Now(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := domain.RelayUser(ctx, q, s.id, nb.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.applyState(ctx)
+	rev := node.applied[len(node.applied)-1].Revision
+	host := &nodeapi.HostPorts{TCP: []int{22, 2083}, UDP: []int{443}}
+	node.health = nodeapi.Health{Revision: rev, Host: host}
+	s.refreshHealth(ctx)
+	hv := s.Health()
+	if hv.Ports[nodeapi.RelayListener] != relay.Port || hv.Ports["vless-xhttp"] != "443" {
+		t.Fatalf("ports of the applied state: %v, the relay is on %s", hv.Ports, relay.Port)
+	}
+	if got := hv.HostPorts(); got == nil || !got.Listens("tcp", 2083) || !got.Listens("udp", 443) || got.Listens("tcp", 443) {
+		t.Fatalf("host ports: %+v", got)
+	}
+	// A node before 0.5.0.2 says nothing; one that does not answer is no source of ports.
+	node.health = nodeapi.Health{Revision: rev}
+	s.refreshHealth(ctx)
+	if got := s.Health().HostPorts(); got != nil {
+		t.Fatalf("host ports of a node that says none: %+v", got)
+	}
+	if got := (HealthView{Health: nodeapi.Health{Host: host}}).HostPorts(); got != nil {
+		t.Fatalf("host ports of a node that did not answer: %+v", got)
+	}
+}

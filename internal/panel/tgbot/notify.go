@@ -2,7 +2,6 @@ package tgbot
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -71,20 +70,23 @@ func noticeKey(userID int64, n notice) string {
 func (b *Bot) claimNotice(ctx context.Context, userID int64, n notice, now time.Time) (string, bool) {
 	key := noticeKey(userID, n)
 	b.noticeMu.Lock()
-	defer b.noticeMu.Unlock()
 	if st := b.notices[key]; st != nil && (st.queued || st.sent || now.Before(st.retryAt)) {
+		b.noticeMu.Unlock()
 		return "", false
 	}
-	var one int
-	err := b.d.Store.DB.QueryRowContext(ctx, `SELECT 1 FROM tg_notices WHERE user_id = ? AND kind = ? AND period = ?`, userID, n.kind, n.period).Scan(&one)
-	switch {
-	case err == nil:
-		return "", false // delivered
-	case !errors.Is(err, sql.ErrNoRows):
-		b.d.Log.Error("telegram: notices", "err", err)
-		return "", false
-	}
+	// Taken before the database is asked, which is asked without the lock held.
 	b.notices[key] = &noticeState{queued: true}
+	b.noticeMu.Unlock()
+	sent, err := b.d.Store.Q.TgNoticeSent(ctx, db.TgNoticeSentParams{UserID: userID, Kind: n.kind, Period: n.period})
+	if err != nil || sent {
+		if err != nil {
+			b.d.Log.Error("telegram: notices", "err", err)
+		}
+		b.noticeMu.Lock()
+		delete(b.notices, key)
+		b.noticeMu.Unlock()
+		return "", false
+	}
 	return key, true
 }
 
@@ -95,23 +97,29 @@ func (b *Bot) noticeDone(userID int64, n notice, key string, err error) {
 	var ae *APIError
 	// A refusal below 500 is Telegram's final word; a failure on its side is not.
 	delivered := err == nil || errors.As(err, &ae) && ae.Code < 500
+	if !delivered {
+		b.noticeMu.Lock()
+		defer b.noticeMu.Unlock()
+		if st := b.notices[key]; st != nil {
+			if errors.Is(err, context.Canceled) {
+				delete(b.notices, key) // the bot was stopped: the next round after it starts sends it
+				return
+			}
+			st.queued, st.retryAt = false, b.d.Now().Add(noticeRetry)
+		}
+		return
+	}
+	// Written without the lock held; the notice stays queued meanwhile, so it is not claimed.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, werr := b.d.Store.Q.AddTgNotice(ctx, db.AddTgNoticeParams{UserID: userID, Kind: n.kind, Period: n.period, SentAt: b.d.Now().Unix()})
 	b.noticeMu.Lock()
 	defer b.noticeMu.Unlock()
 	st := b.notices[key]
 	if st == nil {
 		return
 	}
-	if !delivered {
-		if errors.Is(err, context.Canceled) {
-			delete(b.notices, key) // the bot was stopped: the next round after it starts sends it
-			return
-		}
-		st.queued, st.retryAt = false, b.d.Now().Add(noticeRetry)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, werr := b.d.Store.Q.AddTgNotice(ctx, db.AddTgNoticeParams{UserID: userID, Kind: n.kind, Period: n.period, SentAt: b.d.Now().Unix()}); werr != nil {
+	if werr != nil {
 		b.d.Log.Error("telegram: notice sent, but not recorded", "err", werr)
 		st.queued, st.sent = false, true
 		return
@@ -149,24 +157,14 @@ func (b *Bot) Notify(ctx context.Context) {
 	now := b.d.Now()
 	silent := cfg.QuietNight && night(now)
 	b.forgetNotices(now)
-	links, err := b.d.Store.Q.ListTgLinks(ctx)
+	subs, err := b.d.Store.Q.ListNoticeSubscriptions(ctx, now.Unix())
 	if err != nil {
 		b.d.Log.Error("telegram: notices", "err", err)
 		return
 	}
-	for _, l := range links {
-		if l.Blocked.Valid && l.Blocked.Int64 != 0 {
-			continue
-		}
-		u, err := b.d.Store.Q.GetUser(ctx, l.UserID)
-		if err != nil {
-			continue
-		}
-		grants, err := domain.UserGrantsLeft(ctx, b.d.Store.Q, u.ID, now)
-		if err != nil {
-			continue
-		}
-		for _, n := range due(u, grants.Main(u.ID), now, cfg.Notify) {
+	for _, l := range subs {
+		u := l.User
+		for _, n := range due(u, l.GrantsLeft, now, cfg.Notify) {
 			key, ok := b.claimNotice(ctx, u.ID, n, now)
 			if !ok {
 				continue
@@ -186,7 +184,9 @@ func (b *Bot) Notify(ctx context.Context) {
 		}
 	}
 	if now.Hour() == 3 && now.Minute() < 10 {
-		_ = b.d.Store.Q.PruneTgNotices(ctx, now.Add(-90*24*time.Hour).Unix())
+		if err := b.d.Store.Q.PruneTgNotices(ctx, now.Add(-90*24*time.Hour).Unix()); err != nil {
+			b.d.Log.Error("telegram: prune notices", "err", err)
+		}
 	}
 }
 

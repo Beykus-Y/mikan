@@ -6,8 +6,26 @@ import { safeHref } from "../lib/url";
 export const pageURL = location.origin + location.pathname.replace(/\/$/, "");
 export const tgMode = /\/tg$/.test(pageURL);
 export const subRoot = pageURL.replace(/\/tg$/, "");
-// Telegram's launch data after the #: the Mini App's sign-in.
-export const initData = new URLSearchParams(location.hash.slice(1)).get("tgWebAppData") ?? "";
+// What follows the #. Telegram puts its launch data there; an address with its own anchor
+// (the bot's "Promo codes" opens #promocodes) gets the data after a "?" instead, the way
+// telegram-web-app.js reads it: #promocodes?tgWebAppData=…
+const hash = location.hash.slice(1);
+const query = hash.indexOf("?");
+const head = query >= 0 ? hash.slice(0, query) : (hash.split("&")[0] ?? "");
+/** The anchor the page was opened at, without Telegram's data: "promocodes". */
+export const hashAnchor = head.includes("=") ? "" : decodeAnchor(head);
+/** The key=value pairs after the #. */
+export const hashParams = new URLSearchParams(query >= 0 ? hash.slice(query + 1) : hash);
+// Telegram's launch data: the Mini App's sign-in.
+export const initData = hashParams.get("tgWebAppData") ?? "";
+
+function decodeAnchor(s: string) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return "";
+  }
+}
 
 /** The token a subscription URL ends with. */
 export const tokenOf = (url: string) => url.slice(url.lastIndexOf("/") + 1);

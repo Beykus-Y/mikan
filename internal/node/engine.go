@@ -70,12 +70,17 @@ type Engine struct {
 	errs   map[string]string // listener name → last listen error
 	marker chan string
 
-	sys *sysSampler
+	sys  *sysSampler
+	host hostPortsCache
 
 	routes string // routesKey of what tunnel's proxies and rules hold now
 	warpMu sync.Mutex
-	warp   nodeapi.WarpStatus             // the last check, kept for a minute
-	probes map[string]nodeapi.ProbeResult // the same for the exits to other nodes
+	warp   nodeapi.WarpStatus // the last check, kept for a minute
+	// warpState is what the log last said about WARP: "ok" or the error code; empty
+	// before the first check of a config.
+	warpState string
+	warpCheck func(ctx context.Context, proxy, endpoint string) nodeapi.WarpStatus // probe, unless a test swaps it
+	probes    map[string]nodeapi.ProbeResult                                       // the same for the exits to other nodes
 }
 
 // routesKey covers what the outbound side of the config depends on.
@@ -88,21 +93,61 @@ func routesKey(st nodeapi.DesiredState, allowPrivate bool) string {
 	return string(raw)
 }
 
-// WarpStatus checks the internet through WARP, at most once a minute.
-func (e *Engine) WarpStatus(ctx context.Context) nodeapi.WarpStatus {
+const (
+	warpCacheTTL   = time.Minute
+	warpForceEvery = 5 * time.Second // a forced check is let through this often
+)
+
+// WarpStatus checks the internet through WARP, at most once a minute. force asks for a
+// new check at once, but not more often than every few seconds: the admin's button must
+// not turn the node into a way to hammer Cloudflare.
+func (e *Engine) WarpStatus(ctx context.Context, force bool) nodeapi.WarpStatus {
 	e.mu.Lock()
 	configured := e.applied.Warp != nil
+	endpoint := ""
+	if configured {
+		endpoint = e.applied.Warp.Endpoint
+	}
 	e.mu.Unlock()
 	if !configured {
 		return nodeapi.WarpStatus{}
 	}
 	e.warpMu.Lock()
 	defer e.warpMu.Unlock()
-	if !e.warp.CheckedAt.IsZero() && time.Since(e.warp.CheckedAt) < time.Minute {
-		return e.warp
+	if !e.warp.CheckedAt.IsZero() {
+		age := time.Since(e.warp.CheckedAt)
+		if age < warpCacheTTL && (!force || age < warpForceEvery) {
+			return e.warp
+		}
 	}
-	e.warp = probe(ctx, warpProxy)
+	check := e.warpCheck
+	if check == nil {
+		check = probe
+	}
+	e.warp = check(ctx, warpProxy, endpoint)
+	e.logWarp(e.warp, endpoint)
 	return e.warp
+}
+
+// logWarp writes a failed WARP check to the log once per change (ok to failed, failed
+// to ok, another reason), not once per probe: the panel polls every cycle.
+func (e *Engine) logWarp(s nodeapi.WarpStatus, endpoint string) {
+	state := "ok"
+	if !s.OK {
+		state = s.Error
+		if state == "" {
+			state = "failed"
+		}
+	}
+	prev := e.warpState
+	e.warpState = state
+	switch {
+	case state == prev:
+	case state != "ok":
+		e.log.Warn("WARP check failed", "reason", state, "detail", s.Detail, "endpoint", endpoint)
+	case prev != "":
+		e.log.Info("WARP works again", "ip", s.IP, "colo", s.Colo)
+	}
 }
 
 func Start(o Options) (*Engine, error) {
@@ -210,6 +255,7 @@ func (e *Engine) Apply(st nodeapi.DesiredState) (nodeapi.ApplyResult, error) {
 		e.routes = key
 		e.warpMu.Lock()
 		e.warp = nodeapi.WarpStatus{}
+		e.warpState = ""
 		e.probes = nil
 		e.warpMu.Unlock()
 	}
@@ -217,6 +263,7 @@ func (e *Engine) Apply(st nodeapi.DesiredState) (nodeapi.ApplyResult, error) {
 	e.Reg.SetSlots(st.Slots)
 	e.Reg.SetPolicies(st.Epoch, st.Policies)
 	e.Reg.SetShared(sharedListeners(st))
+	e.Reg.SetTorrent(st.Torrent)
 	pools := map[string]string{}
 	for _, in := range st.Inbounds {
 		if in.Pool != "" {
@@ -240,7 +287,7 @@ func (e *Engine) Apply(st nodeapi.DesiredState) (nodeapi.ApplyResult, error) {
 	for name, l := range cfg.Listeners {
 		ls := nodeapi.ListenerStatus{Name: name, OK: true}
 		if msg, bad := e.errs[name]; bad {
-			ls.OK, ls.Error = false, msg
+			ls = listenFailed(name, msg)
 		} else {
 			failed[name] = l
 		}
@@ -339,7 +386,8 @@ func policyShape(ps []nodeapi.Policy) string {
 		for _, q := range p.Pools {
 			pools = append(pools, q.Pool+strconv.FormatBool(q.Remaining < 0))
 		}
-		_ = enc.Encode([]any{p.Slot, p.Allowed, p.Inbounds, p.DeviceLimit, p.QuotaRemaining < 0, p.OtherIPs, pools})
+		_ = enc.Encode([]any{p.Slot, p.Allowed, p.Inbounds, p.DeviceLimit, p.QuotaRemaining < 0, p.OtherIPs, pools,
+			p.TorrentExempt, p.BannedUntil})
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -355,7 +403,7 @@ func (e *Engine) Health() nodeapi.Health {
 	sort.Slice(ls, func(i, j int) bool { return ls[i].Name < ls[j].Name })
 	return nodeapi.Health{
 		Version: e.version, Core: "mihomo " + mihomoVersion(), Revision: rev, StartedAt: e.started,
-		Listeners: ls, Conns: e.Reg.ConnCount(), System: e.sys.last(),
+		Listeners: ls, Conns: e.Reg.ConnCount(), System: e.sys.last(), Update: e.UpdateStatus(), Host: e.host.get(),
 	}
 }
 
@@ -447,6 +495,16 @@ func parseListenErr(msg string) (name, reason string, ok bool) {
 	}
 	name, reason, ok = strings.Cut(msg[len(p):], mid)
 	return name, reason, ok
+}
+
+// listenFailed is the status of a listener that could not bind. A port another program
+// holds is named by a code, not left to the OS's wording: the panel moves such an inbound.
+func listenFailed(name, msg string) nodeapi.ListenerStatus {
+	ls := nodeapi.ListenerStatus{Name: name, Error: msg}
+	if nodeapi.AddrInUse(msg) {
+		ls.Code = nodeapi.ListenerAddrInUse
+	}
+	return ls
 }
 
 func withoutRejected(names []string, rejected []nodeapi.ListenerStatus) []string {
@@ -563,7 +621,7 @@ func setAside(path string, why error, log *slog.Logger) error {
 // minute per outbound: only WARP and the exits to other nodes may be asked about.
 func (e *Engine) Probe(ctx context.Context, proxy string) (nodeapi.ProbeResult, bool) {
 	if proxy == warpProxy {
-		return e.WarpStatus(ctx), true
+		return e.WarpStatus(ctx, false), true
 	}
 	e.mu.Lock()
 	known := false
@@ -579,7 +637,7 @@ func (e *Engine) Probe(ctx context.Context, proxy string) (nodeapi.ProbeResult, 
 	if r, ok := e.probes[proxy]; ok && time.Since(r.CheckedAt) < time.Minute {
 		return r, true
 	}
-	r := probe(ctx, proxy)
+	r := probe(ctx, proxy, "")
 	if e.probes == nil {
 		e.probes = map[string]nodeapi.ProbeResult{}
 	}

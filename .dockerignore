@@ -3,9 +3,26 @@
 web/dist
 docs
 bin
+dist
 data
 test/e2e/.work
 *.db
 *.db-*
 .env
 .env.*
+
+# build output of the installer and local release files
+installer/target
+release
+
+# signing material never enters a build context, wherever it lies
+**/*.pem
+**/release-signing*
+
+# editors, agents and local scripts
+.claude
+.idea
+.vscode
+.check.sh
+**/.DS_Store
+**/Thumbs.db

@@ -18,6 +18,7 @@ func TestListenReachesTheNode(t *testing.T) {
 	if err := st.Q.SetInboundListen(ctx, db.SetInboundListenParams{Listen: "127.0.0.1", ID: inside.ID}); err != nil {
 		t.Fatal(err)
 	}
+	s.m.SlotsChanged() // what the API does after the change
 	s.applyState(ctx)
 	if len(node.applied) != 2 {
 		t.Fatalf("the new address must be applied: %d states", len(node.applied))

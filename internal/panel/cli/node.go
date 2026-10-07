@@ -142,7 +142,7 @@ func nodeCmd(ctx context.Context, st *store.Store, dataDir string, args []string
 			on = 1
 		}
 		n, err = st.Q.UpdateNode(ctx, db.UpdateNodeParams{Name: strings.TrimSpace(*name), Address: n.Address, PublicHost: *host,
-			Domain: *dom, Enabled: on, UpdatedAt: time.Now().Unix(), ID: n.ID})
+			Domain: *dom, PublicName: n.PublicName, Enabled: on, UpdatedAt: time.Now().Unix(), ID: n.ID})
 		if err != nil {
 			return err
 		}

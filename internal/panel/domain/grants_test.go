@@ -56,14 +56,18 @@ func (e *grantsEnv) grant(pool, bytes int64, lifetime string, days int64) db.Tra
 
 func (e *grantsEnv) count(n int64) {
 	e.t.Helper()
-	if err := e.st.Tx(e.ctx, func(q *db.Queries) error { return CountUserTraffic(e.ctx, q, e.u.ID, 0, n, *e.now) }); err != nil {
+	if err := e.st.TxRC(e.ctx, func(q *db.Queries) error {
+		return CountTraffic(e.ctx, q, TrafficBatch{Main: map[int64]Bytes{e.u.ID: {Down: n}}}, *e.now)
+	}); err != nil {
 		e.t.Fatal(err)
 	}
 }
 
 func (e *grantsEnv) countPool(pool, n int64) {
 	e.t.Helper()
-	if err := e.st.Tx(e.ctx, func(q *db.Queries) error { return CountPoolTraffic(e.ctx, q, e.u.ID, pool, n, 0, *e.now) }); err != nil {
+	if err := e.st.TxRC(e.ctx, func(q *db.Queries) error {
+		return CountTraffic(e.ctx, q, TrafficBatch{Pools: map[[2]int64]Bytes{{e.u.ID, pool}: {Up: n}}}, *e.now)
+	}); err != nil {
 		e.t.Fatal(err)
 	}
 }
@@ -258,6 +262,38 @@ func TestGrantsAtPeriodReset(t *testing.T) {
 	}
 	if e.grantsLeft().Main(e.u.ID) != 40 {
 		t.Fatalf("period grant %d survived StartPeriod", once3.ID)
+	}
+}
+
+// The scheduled reset decides on a row read before its transaction: a period a payment
+// began meanwhile is newer than the one it meant to end, and it is left alone.
+func TestScheduledResetSkipsNewerPeriod(t *testing.T) {
+	e := newGrantsEnv(t, 100)
+	stale := e.u.PeriodStart + 1 // what the upkeep worked out from the old row
+	*e.now = e.now.Add(time.Hour)
+	if _, err := e.users.ResetTraffic(e.ctx, e.u.ID); err != nil { // the payment's reset
+		t.Fatal(err)
+	}
+	e.count(60)
+	once := e.grant(0, 50, LifetimePeriod, 0)
+	var reset bool
+	err := e.st.TxRC(e.ctx, func(q *db.Queries) (err error) {
+		reset, err = StartPeriodIfOlder(e.ctx, q, e.u.ID, stale, *e.now)
+		return err
+	})
+	if err != nil || reset {
+		t.Fatalf("reset over a newer period: %v %v", reset, err)
+	}
+	u, _ := e.st.Q.GetUser(e.ctx, e.u.ID)
+	if u.UsedDown != 60 || e.left(once)[0] != 50 || e.grantsLeft().Main(u.ID) != 50 {
+		t.Fatalf("the newer period was touched: used %d, grant %+v", u.UsedDown, e.grantsLeft())
+	}
+	err = e.st.TxRC(e.ctx, func(q *db.Queries) (err error) {
+		reset, err = StartPeriodIfOlder(e.ctx, q, e.u.ID, e.now.Unix()+1, *e.now)
+		return err
+	})
+	if u, _ = e.st.Q.GetUser(e.ctx, e.u.ID); err != nil || !reset || u.UsedDown != 0 || e.grantsLeft().Main(u.ID) != 0 {
+		t.Fatalf("an older period is reset: %v %v used %d", reset, err, u.UsedDown)
 	}
 }
 

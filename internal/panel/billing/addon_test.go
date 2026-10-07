@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"mikan/internal/panel/addons"
+	"mikan/internal/panel/promo"
+	"mikan/internal/panel/store/db"
 )
 
 const adapterSecret = "sk_live_ADAPTERsecret0"
@@ -25,10 +27,13 @@ const adapterSecret = "sk_live_ADAPTERsecret0"
 // fakeAdapter is a payment adapter of protocol v1 for a provider that signs its webhooks
 // with a header.
 type fakeAdapter struct {
-	id       string // what /v1/info answers as; "fake" when empty
-	mu       sync.Mutex
-	status   map[string]addons.Status
-	invoices []addons.InvoiceRequest
+	id          string // what /v1/info answers as; "fake" when empty
+	noRefund    bool
+	mu          sync.Mutex
+	status      map[string]addons.Status
+	invoices    []addons.InvoiceRequest
+	refunds     []string
+	refundCalls []string
 }
 
 func (f *fakeAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +60,12 @@ func (f *fakeAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if id == "" {
 			id = "fake"
 		}
-		_, _ = io.WriteString(w, `{"id":"`+id+`","protocol":1,"version":"1.0.0","name":{"en":"Fake"},"currencies":["RUB"],"capabilities":["webhook"],
+		caps := []string{"webhook"}
+		if !f.noRefund {
+			caps = append(caps, "refund")
+		}
+		capsJSON, _ := json.Marshal(caps)
+		_, _ = io.WriteString(w, `{"id":"`+id+`","protocol":1,"version":"1.0.0","name":{"en":"Fake"},"currencies":["RUB"],"capabilities":`+string(capsJSON)+`,
 			"settings":[{"key":"shop_id","type":"string","required":true,"pattern":"^[0-9]+$"},{"key":"secret_key","type":"string","secret":true,"required":true},{"key":"testnet","type":"bool"}]}`)
 		return
 	}
@@ -78,6 +88,12 @@ func (f *fakeAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(st)
+	case "/v1/refund":
+		f.refundCalls = append(f.refundCalls, in.IdempotencyKey)
+		if f.status["refund:"+in.IdempotencyKey].Status == "" {
+			f.refunds = append(f.refunds, in.ExternalID)
+			f.status["refund:"+in.IdempotencyKey] = addons.Status{Status: "refunded"}
+		}
 	case "/v1/webhook":
 		if len(in.Headers["X-Sig"]) != 1 || in.Headers["X-Sig"][0] != "ok" {
 			fail(http.StatusBadRequest, "bad_request")
@@ -89,6 +105,116 @@ func (f *fakeAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(body, &n)
 		_ = json.NewEncoder(w).Encode(map[string]string{"external_id": n.ID})
+	}
+}
+
+func TestExpiredDiscountedAddonPaymentIsRefunded(t *testing.T) {
+	e, fa := addonEnv(t)
+	ctx := context.Background()
+	if _, err := e.s.SetAddonConfig(ctx, "fake", true, addons.Settings{"shop_id": "12", "secret_key": adapterSecret}); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "SHORT", Type: "percent", Value: 10,
+		Currency: "RUB", PerUserLimit: 1, DiscountTtl: 60, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	p, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: "addon:fake", PromoCode: pc.Code})
+	must(t, err)
+	if p.Amount >= e.sale.PriceRub.Int64 {
+		t.Fatalf("promo discount was not applied: amount %d", p.Amount)
+	}
+	e.now = e.now.Add(8 * 24 * time.Hour)
+	if _, err := e.st.Q.SetPaymentStatus(ctx, db.SetPaymentStatusParams{NewStatus: "expired", ID: p.ID, OldStatus: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.d.Promo.ReleasePayment(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	fa.set(p.ExternalID.String, func(s *addons.Status) { s.Status, s.Amount = "paid", p.Amount })
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	workers := []*Service{e.s, New(e.s.d)} // distinct process-local locks share only SQLite
+	for _, worker := range workers {
+		wg.Add(1)
+		go func(s *Service) {
+			defer wg.Done()
+			errs <- s.checkAddon(ctx, p.Provider, p.ExternalID.String)
+		}(worker)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("late paid invoice should be safely refunded: %v", err)
+		}
+	}
+	if got := e.payment(p.ID); got.Status != "refunded" || !got.RefundedAt.Valid || got.RefundedAt.Int64 != e.now.Unix() {
+		t.Fatalf("payment status/refunded_at = %q/%+v, want refunded with current timestamp", got.Status, got.RefundedAt)
+	}
+	if len(fa.refunds) != 1 || fa.refunds[0] != p.ExternalID.String {
+		t.Fatalf("refund calls = %v", fa.refunds)
+	}
+	if len(fa.refundCalls) != 1 || fa.refundCalls[0] != "mikan-promo-late-"+strconv.FormatInt(p.ID, 10) {
+		t.Fatalf("refund idempotency keys = %v", fa.refundCalls)
+	}
+	if e.users() != 0 {
+		t.Fatalf("late payment created a subscription")
+	}
+	r, err := e.s.d.Promo.GetPaymentRedemption(ctx, p.ID)
+	if err != nil || r.Status != "released" {
+		t.Fatalf("reservation status = %q, err=%v; want released", r.Status, err)
+	}
+}
+
+func TestDiscountedAddonRequiresRefundCapability(t *testing.T) {
+	e, fa := addonEnv(t)
+	fa.noRefund = true
+	ctx := context.Background()
+	if _, err := e.s.SetAddonConfig(ctx, "fake", true, addons.Settings{"shop_id": "12", "secret_key": adapterSecret}); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "NOREFUND", Type: "percent", Value: 10,
+		Currency: "RUB", PerUserLimit: 1, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	if _, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: "addon:fake", PromoCode: pc.Code}); !errors.Is(err, promo.ErrRefundUnsupported) {
+		t.Fatalf("discounted invoice accepted without refund support: %v", err)
+	}
+	var n int
+	if err := e.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM payments`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("unsupported provider created %d payment(s)", n)
+	}
+}
+
+func TestCanceledDiscountedAddonReleasesPromoReservation(t *testing.T) {
+	e, fa := addonEnv(t)
+	ctx := context.Background()
+	if _, err := e.s.SetAddonConfig(ctx, "fake", true, addons.Settings{"shop_id": "12", "secret_key": adapterSecret}); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "CANCEL", Type: "percent", Value: 10,
+		Currency: "RUB", PerUserLimit: 1, DiscountTtl: 60, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	p, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: "addon:fake", PromoCode: pc.Code})
+	must(t, err)
+	fa.set(p.ExternalID.String, func(s *addons.Status) { s.Status = "canceled" })
+	if err := e.s.checkAddon(ctx, p.Provider, p.ExternalID.String); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.payment(p.ID); got.Status != "failed" {
+		t.Fatalf("payment status = %q, want failed", got.Status)
+	}
+	r, err := e.s.d.Promo.GetPaymentRedemption(ctx, p.ID)
+	if err != nil || r.Status != "released" {
+		t.Fatalf("reservation status = %q, err=%v; want released", r.Status, err)
+	}
+	stored, err := e.st.Q.GetPromoCodeByCode(ctx, pc.Code)
+	if err != nil || stored.UsedCount != 0 {
+		t.Fatalf("promo uses = %d, err=%v; want reservation released", stored.UsedCount, err)
 	}
 }
 

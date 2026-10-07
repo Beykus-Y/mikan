@@ -25,6 +25,11 @@ impl EnvFile {
         Self::parse(path.as_ref().to_path_buf(), "")
     }
 
+    /// The file at path as text kept from before (an update's copy of the old .env).
+    pub fn from_text(path: impl AsRef<Path>, text: &str) -> Self {
+        Self::parse(path.as_ref().to_path_buf(), text)
+    }
+
     fn parse(path: PathBuf, text: &str) -> Self {
         Self { path, lines: text.lines().map(str::to_owned).collect() }
     }
@@ -39,7 +44,8 @@ impl EnvFile {
     /// Sets key to value, in place when the key is there; a key repeated by a hand edit is
     /// left once, because compose takes the last and a change of the first would not show.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        if !plain(value) {
+        let fits = if key == DSN_KEY { plain_dsn(value) } else { plain(value) };
+        if !fits {
             bail!("{key}: the value has characters that compose reads differently ($, quotes, spaces, #)");
         }
         let line = format!("{key}={value}");
@@ -62,6 +68,11 @@ impl EnvFile {
         Ok(())
     }
 
+    /// Removes every line of key.
+    pub fn remove(&mut self, key: &str) {
+        self.lines.retain(|l| !l.strip_prefix(key).is_some_and(|r| r.starts_with('=')));
+    }
+
     pub fn render(&self) -> String {
         let mut s = self.lines.join("\n");
         s.push('\n');
@@ -79,6 +90,15 @@ impl EnvFile {
 /// at ` #`, so anything but plain image names, versions, ports and keys is refused.
 fn plain(value: &str) -> bool {
     value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/@+=,-".contains(&b))
+}
+
+/// The PostgreSQL address of the panel, the one value that is a URL with a query.
+const DSN_KEY: &str = "MIKAN_DATABASE_URL";
+
+/// A DSN also takes its query (`?host=…&sslmode=…`) and percent-escapes: compose gives
+/// `?`, `&` and `%` no meaning, only the image names and keys of the rest never have them.
+fn plain_dsn(value: &str) -> bool {
+    value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/@+=,-?&%".contains(&b))
 }
 
 /// Writes a file readable by root only, replacing it at once: a new file under its own
@@ -132,9 +152,40 @@ mod tests {
         for ok in ["ghcr.io/miroshka000/mikan@sha256:ab12", "0.4.4-rc.1+b2", "mikan1.AbC_-9", "21355", ""] {
             e.set("K", ok).unwrap();
         }
-        for bad in ["a$HOME", "${X}", "a b", "a #b", "\"q\"", "'q'", "a`b", "a\\b", "a;b", "a\nb"] {
+        for bad in ["a$HOME", "${X}", "a b", "a #b", "\"q\"", "'q'", "a`b", "a\\b", "a;b", "a\nb", "img?x=1", "a&b", "a%20b"] {
             assert!(e.set("K", bad).is_err(), "{bad:?} was taken");
         }
+    }
+
+    // The database address carries a query and escapes; nothing else needs them, and it
+    // still refuses what compose would read differently.
+    #[test]
+    fn the_dsn_takes_its_query_and_nothing_compose_reinterprets() {
+        let mut e = EnvFile::parse("x".into(), "");
+        for ok in
+            ["postgresql://mikan:Ab9@localhost/mikan?host=/run/postgresql", "postgres://u:p%40ss@h/db?sslmode=require&connect_timeout=10"]
+        {
+            e.set("MIKAN_DATABASE_URL", ok).unwrap();
+            assert_eq!(e.get("MIKAN_DATABASE_URL"), Some(ok));
+        }
+        for bad in [
+            "postgres://u:$P@h/db",
+            "postgres://u:p@h/db #x",
+            "postgres://u:p@h/db?a='b'",
+            "postgres://u:p w@h/db",
+            "postgres://h/db?a=1;b",
+        ] {
+            assert!(e.set("MIKAN_DATABASE_URL", bad).is_err(), "{bad:?} was taken");
+        }
+        assert!(e.set("MIKAN_IMAGE", "postgresql://h/db?host=/run").is_err(), "a query only in the DSN");
+    }
+
+    #[test]
+    fn a_key_is_removed_and_text_is_parsed() {
+        let mut e = EnvFile::from_text("x", "A=1\nMIKAN_DATABASE_URL=postgresql://h/db\nAB=2\nMIKAN_DATABASE_URL=again\n");
+        e.remove("MIKAN_DATABASE_URL");
+        e.remove("A");
+        assert_eq!(e.render(), "AB=2\n");
     }
 
     // A key repeated by a hand edit: compose reads the last, so the update must see and

@@ -11,7 +11,7 @@ import (
 
 const addInboundEvent = `-- name: AddInboundEvent :exec
 INSERT INTO inbound_events (inbound_id, node_id, kind, network, old_value, new_value, reason, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 `
 
 type AddInboundEventParams struct {
@@ -78,7 +78,7 @@ func (q *Queries) LastInboundEvents(ctx context.Context) ([]InboundEvent, error)
 }
 
 const listInboundEventsSince = `-- name: ListInboundEventsSince :many
-SELECT id, inbound_id, node_id, kind, network, old_value, new_value, reason, created_at FROM inbound_events WHERE created_at >= ? ORDER BY id
+SELECT id, inbound_id, node_id, kind, network, old_value, new_value, reason, created_at FROM inbound_events WHERE created_at >= $1 ORDER BY id
 `
 
 func (q *Queries) ListInboundEventsSince(ctx context.Context, createdAt int64) ([]InboundEvent, error) {
@@ -115,7 +115,7 @@ func (q *Queries) ListInboundEventsSince(ctx context.Context, createdAt int64) (
 }
 
 const listInboundReachSince = `-- name: ListInboundReachSince :many
-SELECT slot, inbound_id, at FROM inbound_reach WHERE at >= ?
+SELECT slot, inbound_id, at FROM inbound_reach WHERE at >= $1
 `
 
 func (q *Queries) ListInboundReachSince(ctx context.Context, at int64) ([]InboundReach, error) {
@@ -142,7 +142,7 @@ func (q *Queries) ListInboundReachSince(ctx context.Context, at int64) ([]Inboun
 }
 
 const listSubFetchesSince = `-- name: ListSubFetchesSince :many
-SELECT user_id, ip, fetched_at FROM sub_fetches WHERE fetched_at >= ?
+SELECT user_id, ip, fetched_at FROM sub_fetches WHERE fetched_at >= $1
 `
 
 func (q *Queries) ListSubFetchesSince(ctx context.Context, fetchedAt int64) ([]SubFetch, error) {
@@ -169,7 +169,7 @@ func (q *Queries) ListSubFetchesSince(ctx context.Context, fetchedAt int64) ([]S
 }
 
 const pruneInboundEvents = `-- name: PruneInboundEvents :exec
-DELETE FROM inbound_events WHERE created_at < ?
+DELETE FROM inbound_events WHERE created_at < $1
 `
 
 func (q *Queries) PruneInboundEvents(ctx context.Context, createdAt int64) error {
@@ -178,7 +178,7 @@ func (q *Queries) PruneInboundEvents(ctx context.Context, createdAt int64) error
 }
 
 const pruneInboundReach = `-- name: PruneInboundReach :exec
-DELETE FROM inbound_reach WHERE at < ?
+DELETE FROM inbound_reach WHERE at < $1
 `
 
 func (q *Queries) PruneInboundReach(ctx context.Context, at int64) error {
@@ -187,7 +187,7 @@ func (q *Queries) PruneInboundReach(ctx context.Context, at int64) error {
 }
 
 const pruneSubFetches = `-- name: PruneSubFetches :exec
-DELETE FROM sub_fetches WHERE fetched_at < ?
+DELETE FROM sub_fetches WHERE fetched_at < $1
 `
 
 func (q *Queries) PruneSubFetches(ctx context.Context, fetchedAt int64) error {
@@ -196,7 +196,7 @@ func (q *Queries) PruneSubFetches(ctx context.Context, fetchedAt int64) error {
 }
 
 const recordSubFetch = `-- name: RecordSubFetch :exec
-INSERT INTO sub_fetches (user_id, ip, fetched_at) VALUES (?, ?, ?)
+INSERT INTO sub_fetches (user_id, ip, fetched_at) VALUES ($1, $2, $3)
 ON CONFLICT (user_id, ip) DO UPDATE SET fetched_at = excluded.fetched_at
 `
 
@@ -212,7 +212,7 @@ func (q *Queries) RecordSubFetch(ctx context.Context, arg RecordSubFetchParams) 
 }
 
 const setInboundAuto = `-- name: SetInboundAuto :exec
-UPDATE inbounds SET auto_port = ?, auto_sni = ? WHERE id = ?
+UPDATE inbounds SET auto_port = $1, auto_sni = $2 WHERE id = $3
 `
 
 type SetInboundAutoParams struct {
@@ -228,7 +228,7 @@ func (q *Queries) SetInboundAuto(ctx context.Context, arg SetInboundAutoParams) 
 }
 
 const setInboundListen = `-- name: SetInboundListen :exec
-UPDATE inbounds SET listen = ? WHERE id = ?
+UPDATE inbounds SET listen = $1 WHERE id = $2
 `
 
 type SetInboundListenParams struct {
@@ -243,8 +243,8 @@ func (q *Queries) SetInboundListen(ctx context.Context, arg SetInboundListenPara
 }
 
 const upsertInboundReach = `-- name: UpsertInboundReach :exec
-INSERT INTO inbound_reach (slot, inbound_id, at) VALUES (?, ?, ?)
-ON CONFLICT (slot, inbound_id) DO UPDATE SET at = max(at, excluded.at)
+INSERT INTO inbound_reach (slot, inbound_id, at) VALUES ($1, $2, $3)
+ON CONFLICT (slot, inbound_id) DO UPDATE SET at = GREATEST(inbound_reach.at, excluded.at)
 `
 
 type UpsertInboundReachParams struct {

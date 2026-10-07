@@ -12,13 +12,19 @@ import { Section } from "./section";
 
 export function DevicesSection({ u }: { u: User }) {
   const devices = useDevices(u.id);
+  // With binding a place is a bound device; addresses are only where they connect from.
+  const binding = !!useSettings().data?.device_binding;
   const toast = useToast();
   const update = useUserMutation(userActions.update);
   const list = devices.data ?? [];
   const setLimit = (n: number | null) =>
     update.mutate({ id: u.id, body: n === null ? { devices_unlimited: true } : { device_limit: n } }, { onError: (e) => toast.error(errorText(e)) });
   return (
-    <Section title={t("userDrawer.devices")} aside={t("userDrawer.devicesAside", { online: u.online_ips.length, limit: u.device_limit ?? "∞" })}>
+    <Section title={t("userDrawer.devices")} aside={
+        binding
+          ? t("userDrawer.devicesAsideBound", { used: u.bound_devices, limit: u.device_limit ?? "∞", online: u.online_ips.length })
+          : t("userDrawer.devicesAside", { online: u.online_ips.length, limit: u.device_limit ?? "∞" })
+      }>
       <div className="mb-4 flex items-center gap-2 text-[13px]">
         <span className="text-[var(--ink-600)]">{t("userDrawer.deviceLimit")}</span>
         <div className="seg" role="group" aria-label={t("userDrawer.deviceLimit")}>
@@ -46,7 +52,7 @@ export function DevicesSection({ u }: { u: User }) {
             <li key={d.ip} className="panel-soft grid grid-cols-[36px_minmax(0,1fr)] items-center gap-3 p-2">
               <span className="grid h-9 w-9 place-items-center rounded-[10px] bg-[var(--hover)] text-[var(--ink-600)]"><Smartphone size={18} /></span>
               <div className="min-w-0">
-                <div className="text-[13px] font-medium">{t("userDrawer.device")}</div>
+                <div className="text-[13px] font-medium">{binding ? t("userDrawer.address") : t("userDrawer.device")}</div>
                 <div className="text-xs text-[var(--ink-500)]">
                   <span className="mono">{maskIP(d.ip)}</span> · {d.online ? <span className="text-[var(--leaf-700)]">{t("users.onlineNow")}</span> : ago(d.last_seen)}
                 </div>
@@ -55,7 +61,7 @@ export function DevicesSection({ u }: { u: User }) {
           ))}
         </ul>
       )}
-      <p className="mt-2 text-xs text-[var(--ink-500)]">{t("userDrawer.devicesNote")}</p>
+      <p className="mt-2 text-xs text-[var(--ink-500)]">{binding ? t("userDrawer.devicesNoteBound") : t("userDrawer.devicesNote")}</p>
     </Section>
   );
 }

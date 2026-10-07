@@ -7,11 +7,10 @@ package db
 
 import (
 	"context"
-	"database/sql"
 )
 
 const addTgNotice = `-- name: AddTgNotice :execrows
-INSERT OR IGNORE INTO tg_notices (user_id, kind, period, sent_at) VALUES (?, ?, ?, ?)
+INSERT INTO tg_notices (user_id, kind, period, sent_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING
 `
 
 type AddTgNoticeParams struct {
@@ -85,7 +84,7 @@ func (q *Queries) CountTgLinks(ctx context.Context) (int64, error) {
 }
 
 const countTgLinksOf = `-- name: CountTgLinksOf :one
-SELECT COUNT(*) FROM tg_links WHERE tg_id = ?
+SELECT COUNT(*) FROM tg_links WHERE tg_id = $1
 `
 
 func (q *Queries) CountTgLinksOf(ctx context.Context, tgID int64) (int64, error) {
@@ -96,7 +95,7 @@ func (q *Queries) CountTgLinksOf(ctx context.Context, tgID int64) (int64, error)
 }
 
 const getTgChat = `-- name: GetTgChat :one
-SELECT tg_id, username, first_name, menu_msg_id, "current", blocked, created_at, updated_at FROM tg_chats WHERE tg_id = ?
+SELECT tg_id, username, first_name, menu_msg_id, current, blocked, created_at, updated_at FROM tg_chats WHERE tg_id = $1
 `
 
 func (q *Queries) GetTgChat(ctx context.Context, tgID int64) (TgChat, error) {
@@ -116,7 +115,7 @@ func (q *Queries) GetTgChat(ctx context.Context, tgID int64) (TgChat, error) {
 }
 
 const getTgLink = `-- name: GetTgLink :one
-SELECT user_id, tg_id, created_at FROM tg_links WHERE user_id = ?
+SELECT user_id, tg_id, created_at FROM tg_links WHERE user_id = $1
 `
 
 func (q *Queries) GetTgLink(ctx context.Context, userID int64) (TgLink, error) {
@@ -127,7 +126,7 @@ func (q *Queries) GetTgLink(ctx context.Context, userID int64) (TgLink, error) {
 }
 
 const linkTg = `-- name: LinkTg :exec
-INSERT INTO tg_links (user_id, tg_id, created_at) VALUES (?, ?, ?)
+INSERT INTO tg_links (user_id, tg_id, created_at) VALUES ($1, $2, $3)
 ON CONFLICT (user_id) DO UPDATE SET tg_id = excluded.tg_id, created_at = excluded.created_at
 `
 
@@ -142,41 +141,8 @@ func (q *Queries) LinkTg(ctx context.Context, arg LinkTgParams) error {
 	return err
 }
 
-const listTgLinks = `-- name: ListTgLinks :many
-SELECT l.user_id, l.tg_id, c.blocked FROM tg_links l LEFT JOIN tg_chats c ON c.tg_id = l.tg_id
-`
-
-type ListTgLinksRow struct {
-	UserID  int64
-	TgID    int64
-	Blocked sql.NullInt64
-}
-
-func (q *Queries) ListTgLinks(ctx context.Context) ([]ListTgLinksRow, error) {
-	rows, err := q.db.QueryContext(ctx, listTgLinks)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListTgLinksRow{}
-	for rows.Next() {
-		var i ListTgLinksRow
-		if err := rows.Scan(&i.UserID, &i.TgID, &i.Blocked); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listTgLinksOf = `-- name: ListTgLinksOf :many
-SELECT u.id, u.name, u.contact, u.note, u.tags, u.status, u.tariff_id, u.traffic_limit, u.device_limit, u.reset_strategy, u.period_days, u.period_start, u.used_up, u.used_down, u.total_up, u.total_down, u.expires_at, u.inbounds, u.sub_token, u.slot_id, u.online_at, u.created_at, u.updated_at, u.billing_day, u.unbound_at FROM tg_links l JOIN users u ON u.id = l.user_id WHERE l.tg_id = ? ORDER BY l.created_at, u.id
+SELECT u.id, u.name, u.contact, u.note, u.tags, u.status, u.tariff_id, u.traffic_limit, u.device_limit, u.reset_strategy, u.period_days, u.period_start, u.used_up, u.used_down, u.total_up, u.total_down, u.expires_at, u.inbounds, u.sub_token, u.slot_id, u.online_at, u.created_at, u.updated_at, u.billing_day, u.unbound_at FROM tg_links l JOIN users u ON u.id = l.user_id WHERE l.tg_id = $1 ORDER BY l.created_at, u.id
 `
 
 // The subscriptions a Telegram account owns, oldest link first.
@@ -230,7 +196,7 @@ func (q *Queries) ListTgLinksOf(ctx context.Context, tgID int64) ([]User, error)
 }
 
 const pruneTgNotices = `-- name: PruneTgNotices :exec
-DELETE FROM tg_notices WHERE sent_at < ?
+DELETE FROM tg_notices WHERE sent_at < $1
 `
 
 func (q *Queries) PruneTgNotices(ctx context.Context, sentAt int64) error {
@@ -239,7 +205,7 @@ func (q *Queries) PruneTgNotices(ctx context.Context, sentAt int64) error {
 }
 
 const setTgBlocked = `-- name: SetTgBlocked :exec
-UPDATE tg_chats SET blocked = ? WHERE tg_id = ?
+UPDATE tg_chats SET blocked = $1 WHERE tg_id = $2
 `
 
 type SetTgBlockedParams struct {
@@ -253,7 +219,7 @@ func (q *Queries) SetTgBlocked(ctx context.Context, arg SetTgBlockedParams) erro
 }
 
 const setTgCurrent = `-- name: SetTgCurrent :exec
-UPDATE tg_chats SET current = ? WHERE tg_id = ?
+UPDATE tg_chats SET current = $1 WHERE tg_id = $2
 `
 
 type SetTgCurrentParams struct {
@@ -267,7 +233,7 @@ func (q *Queries) SetTgCurrent(ctx context.Context, arg SetTgCurrentParams) erro
 }
 
 const setTgMenu = `-- name: SetTgMenu :exec
-UPDATE tg_chats SET menu_msg_id = ? WHERE tg_id = ?
+UPDATE tg_chats SET menu_msg_id = $1 WHERE tg_id = $2
 `
 
 type SetTgMenuParams struct {
@@ -282,7 +248,7 @@ func (q *Queries) SetTgMenu(ctx context.Context, arg SetTgMenuParams) error {
 
 const tgLinkOfUser = `-- name: TgLinkOfUser :one
 SELECT l.tg_id, COALESCE(c.username, '') AS username, COALESCE(c.first_name, '') AS first_name
-FROM tg_links l LEFT JOIN tg_chats c ON c.tg_id = l.tg_id WHERE l.user_id = ?
+FROM tg_links l LEFT JOIN tg_chats c ON c.tg_id = l.tg_id WHERE l.user_id = $1
 `
 
 type TgLinkOfUserRow struct {
@@ -299,7 +265,7 @@ func (q *Queries) TgLinkOfUser(ctx context.Context, userID int64) (TgLinkOfUserR
 }
 
 const unlinkTg = `-- name: UnlinkTg :exec
-DELETE FROM tg_links WHERE user_id = ?
+DELETE FROM tg_links WHERE user_id = $1
 `
 
 func (q *Queries) UnlinkTg(ctx context.Context, userID int64) error {
@@ -308,7 +274,7 @@ func (q *Queries) UnlinkTg(ctx context.Context, userID int64) error {
 }
 
 const upsertTgChat = `-- name: UpsertTgChat :exec
-INSERT INTO tg_chats (tg_id, username, first_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+INSERT INTO tg_chats (tg_id, username, first_name, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (tg_id) DO UPDATE SET username = excluded.username, first_name = excluded.first_name, blocked = 0, updated_at = excluded.updated_at
 `
 

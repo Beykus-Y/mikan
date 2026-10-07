@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/promo"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 type noChanges struct{}
@@ -26,17 +28,37 @@ func (noChanges) SlotsChanged()    {}
 
 // fakeTG is the bot: Stars links, refunds and what buyers were told.
 type fakeTG struct {
-	mu      sync.Mutex
-	paid    []db.Payment
-	refunds []string
+	mu        sync.Mutex
+	paid      []db.Payment
+	refunds   []string
+	refundErr error
+	invoices  int
+	refunded  []refundNote
+	onRefund  func() // runs after Telegram accepted a refund
+}
+
+// refundNote is what the buyer was told about a refund.
+type refundNote struct {
+	p        db.Payment
+	u        db.User
+	disabled bool
 }
 
 func (f *fakeTG) InvoiceLink(_ context.Context, _, _, payload string, stars int64) (string, error) {
+	f.mu.Lock()
+	f.invoices++
+	f.mu.Unlock()
 	return "https://t.me/$" + payload[:8] + "?stars=" + strconv.FormatInt(stars, 10), nil
 }
 func (f *fakeTG) RefundStars(_ context.Context, _ int64, charge string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.refundErr != nil {
+		return f.refundErr
+	}
+	if f.onRefund != nil {
+		f.onRefund()
+	}
 	f.refunds = append(f.refunds, charge)
 	return nil
 }
@@ -45,11 +67,26 @@ func (f *fakeTG) Paid(_ context.Context, p db.Payment, _ db.User, _ bool) {
 	defer f.mu.Unlock()
 	f.paid = append(f.paid, p)
 }
+func (f *fakeTG) Refunded(_ context.Context, p db.Payment, u db.User, disabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refunded = append(f.refunded, refundNote{p, u, disabled})
+}
+func (f *fakeTG) refundNotes() []refundNote {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]refundNote(nil), f.refunded...)
+}
 func (f *fakeTG) BotURL(context.Context) string { return "https://t.me/mikan_test_bot" }
 func (f *fakeTG) told() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.paid)
+}
+func (f *fakeTG) invoiceCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.invoices
 }
 
 type env struct {
@@ -68,7 +105,7 @@ func newEnv(t *testing.T) *env {
 	ctx := context.Background()
 	e := &env{t: t, now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC), logs: &bytes.Buffer{}, tg: &fakeTG{}}
 	var err error
-	if e.st, err = store.Open(ctx, t.TempDir()); err != nil {
+	if e.st, err = storetest.Open(ctx, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.st.Close() })
@@ -133,6 +170,182 @@ func (e *env) hook(provider, token, ip string, body []byte, hdr map[string]strin
 	w := httptest.NewRecorder()
 	e.s.Webhook().ServeHTTP(w, r)
 	return w.Code
+}
+
+func TestDiscountedStarsInvoicePersistsAmountAndReusesInvoice(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "SALE25", Type: "percent", Value: 25, Currency: "XTR", PerUserLimit: 1, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	req := InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars, PromoCode: pc.Code}
+	p, err := e.s.Invoice(ctx, req)
+	must(t, err)
+	if p.Amount != 113 {
+		t.Fatalf("invoice amount = %d, want 113", p.Amount)
+	}
+	if stored := e.payment(p.ID); stored.Amount != 113 {
+		t.Fatalf("stored amount = %d, want discounted 113", stored.Amount)
+	}
+	ordinary, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars})
+	must(t, err)
+	if ordinary.ID == p.ID {
+		t.Fatal("ordinary invoice unexpectedly reused the discounted payment")
+	}
+	calls := e.tg.invoiceCount()
+	if again, err := e.s.Invoice(ctx, req); err != nil || again.ID != p.ID || e.tg.invoiceCount() != calls {
+		t.Fatalf("invoice was not reused: payment=%+v err=%v calls=%d->%d", again, err, calls, e.tg.invoiceCount())
+	}
+	must(t, e.s.PreCheckout(ctx, 555, p.Payload, "XTR", 113))
+	must(t, e.s.StarsPaid(ctx, 555, p.Payload, "ch-discount", "XTR", 113))
+	if e.payment(p.ID).Status != "applied" {
+		t.Fatalf("discounted payment not applied: %+v", e.payment(p.ID))
+	}
+}
+
+func TestConcurrentInvoicesWithSingleUsePromoShareReservation(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "ONCE", Type: "percent", Value: 10, Currency: "XTR", MaxUses: sql.NullInt64{Int64: 1, Valid: true}, PerUserLimit: 1, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	req := InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars, PromoCode: pc.Code}
+	payments := make([]db.Payment, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range payments {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payments[i], errs[i] = e.s.Invoice(ctx, req)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent promo invoice: %v", err)
+		}
+	}
+	if payments[0].ID != payments[1].ID {
+		t.Fatalf("parallel calls opened payments %d and %d", payments[0].ID, payments[1].ID)
+	}
+	var uses, redemptions int
+	if err := e.st.DB.QueryRowContext(ctx, `SELECT used_count FROM promo_codes WHERE id=$1`, pc.ID).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.DB.QueryRowContext(ctx, `SELECT count(*) FROM promo_redemptions WHERE promo_id=$1 AND status='reserved'`, pc.ID).Scan(&redemptions); err != nil {
+		t.Fatal(err)
+	}
+	if uses != 1 || redemptions != 1 {
+		t.Fatalf("promo use count=%d reservations=%d, want 1 each", uses, redemptions)
+	}
+}
+
+func TestExpiredDiscountedStarsCaptureIsRefunded(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "SHORT", Type: "percent", Value: 10,
+		Currency: "XTR", PerUserLimit: 1, DiscountTtl: 30, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	p, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars, PromoCode: pc.Code})
+	must(t, err)
+	e.now = e.now.Add(31 * time.Second)
+	if err := e.s.StarsPaid(ctx, 555, p.Payload, "late-charge", p.Currency, p.Amount); err != nil {
+		t.Fatalf("late capture should be refunded: %v", err)
+	}
+	if got := e.payment(p.ID); got.Status != "refunded" {
+		t.Fatalf("payment status = %q, want refunded", got.Status)
+	}
+	e.tg.mu.Lock()
+	refunds := append([]string(nil), e.tg.refunds...)
+	e.tg.mu.Unlock()
+	if len(refunds) != 1 || refunds[0] != "late-charge" {
+		t.Fatalf("refunds = %v", refunds)
+	}
+	if e.users() != 0 {
+		t.Fatal("late payment created a subscription")
+	}
+	r, err := e.s.d.Promo.GetPaymentRedemption(ctx, p.ID)
+	if err != nil || r.Status != "released" {
+		t.Fatalf("reservation status = %q, err=%v; want released", r.Status, err)
+	}
+}
+
+func TestLateStarsRefundFailureRetriesInReconcile(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "RETRY", Type: "percent", Value: 10,
+		Currency: "XTR", PerUserLimit: 1, DiscountTtl: 30, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	p, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars, PromoCode: pc.Code})
+	must(t, err)
+	e.now = e.now.Add(31 * time.Second)
+	e.tg.refundErr = errors.New("Telegram unavailable")
+	if err := e.s.StarsPaid(ctx, 555, p.Payload, "retry-charge", p.Currency, p.Amount); err == nil {
+		t.Fatal("the first refund attempt unexpectedly succeeded")
+	}
+	failed := e.payment(p.ID)
+	if failed.Error != "promo_late_refund_failed" || failed.ExternalID.String != "retry-charge" {
+		t.Fatalf("payment after failed refund: %+v", failed)
+	}
+	r, err := e.s.d.Promo.GetPaymentRedemption(ctx, p.ID)
+	if err != nil || r.RefundStartedAt.Valid {
+		t.Fatalf("failed refund claim remains set: %+v err=%v", r.RefundStartedAt, err)
+	}
+	e.tg.refundErr = nil
+	e.s.Reconcile(ctx)
+	if got := e.payment(p.ID); got.Status != "refunded" || got.Error != "" {
+		t.Fatalf("reconciled payment status=%q error=%q", got.Status, got.Error)
+	}
+	e.tg.mu.Lock()
+	refunds := append([]string(nil), e.tg.refunds...)
+	e.tg.mu.Unlock()
+	if len(refunds) != 1 || refunds[0] != "retry-charge" {
+		t.Fatalf("refunds=%v", refunds)
+	}
+}
+
+func TestStarsPaymentReleasedDuringPaymentTransitionGetsRefunded(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pc, err := e.st.Q.CreatePromoCode(ctx, db.CreatePromoCodeParams{Code: "NOEXPIRY", Type: "percent", Value: 10,
+		Currency: "XTR", PerUserLimit: 1, TariffIds: "[]", Enabled: 1, CreatedAt: e.now.Unix()})
+	must(t, err)
+	e.s.d.Promo = promo.New(e.st, func() time.Time { return e.now })
+	p, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: e.sale.ID, Provider: Stars, PromoCode: pc.Code})
+	must(t, err)
+	if _, err := e.st.Q.SetPaymentStatus(ctx, db.SetPaymentStatusParams{NewStatus: "expired", ID: p.ID, OldStatus: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	e.now = e.now.Add(31 * time.Minute)
+	baseNow := e.s.d.Now
+	released := false
+	e.s.d.Now = func() time.Time {
+		if !released {
+			released = true
+			if err := e.s.d.Promo.ReleasePayment(ctx, p.ID); err != nil {
+				t.Errorf("release during paid transition: %v", err)
+			}
+		}
+		return baseNow()
+	}
+	if err := e.s.StarsPaid(ctx, 555, p.Payload, "race-charge", p.Currency, p.Amount); err != nil {
+		t.Fatalf("late payment race should be refunded: %v", err)
+	}
+	if got := e.payment(p.ID); got.Status != "refunded" || !got.RefundedAt.Valid || got.Error != "" {
+		t.Fatalf("payment after release race = %q refunded_at=%+v error=%q", got.Status, got.RefundedAt, got.Error)
+	}
+	e.tg.mu.Lock()
+	refunds := append([]string(nil), e.tg.refunds...)
+	e.tg.mu.Unlock()
+	if len(refunds) != 1 || refunds[0] != "race-charge" {
+		t.Fatalf("refunds = %v", refunds)
+	}
+	if e.users() != 0 {
+		t.Fatal("late payment created a subscription")
+	}
 }
 
 // A new buyer pays in Stars: one subscription, linked to the account, told once — however
@@ -200,11 +413,16 @@ func TestStarsNewSubscription(t *testing.T) {
 		t.Fatal("an applied invoice passed pre-checkout")
 	}
 	// Refund: Stars go back through the bot, the payment says so.
-	must(t, e.s.Refund(ctx, p.ID))
+	if _, err := e.s.Refund(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
 	if e.payment(p.ID).Status != "refunded" || len(e.tg.refunds) != 1 || e.tg.refunds[0] != "ch-1" {
 		t.Fatalf("refund: %+v %v", e.payment(p.ID), e.tg.refunds)
 	}
-	if err := e.s.Refund(ctx, p.ID); !errors.Is(err, ErrNotRefunable) {
+	if off, _ := e.st.Q.GetUser(ctx, got.UserID.Int64); off.Status != "disabled" {
+		t.Fatalf("the refunded subscription is %q", off.Status)
+	}
+	if _, err := e.s.Refund(ctx, p.ID); !errors.Is(err, ErrNotRefunable) {
 		t.Fatalf("second refund: %v", err)
 	}
 }
@@ -218,7 +436,7 @@ func TestRenewal(t *testing.T) {
 	u, err := domain.NewUsers(e.st, domain.NewPool(e.st, clock), noChanges{}, clock).Create(ctx, domain.CreateInput{Name: "a", TariffID: e.sale.ID})
 	must(t, err)
 	must(t, e.st.Q.LinkTg(ctx, db.LinkTgParams{UserID: u.ID, TgID: 555, CreatedAt: e.now.Unix()}))
-	_, err = e.st.DB.ExecContext(ctx, "UPDATE users SET used_up = 1000, used_down = 2000 WHERE id = ?", u.ID)
+	_, err = e.st.DB.ExecContext(ctx, "UPDATE users SET used_up = 1000, used_down = 2000 WHERE id = $1", u.ID)
 	must(t, err)
 
 	if _, err := e.s.Invoice(ctx, InvoiceRequest{TgID: 777, UserID: u.ID, TariffID: e.sale.ID, Provider: Stars}); !errors.Is(err, ErrNotYours) {
@@ -272,6 +490,58 @@ func TestInvoiceRefusals(t *testing.T) {
 	}
 }
 
+// Taps at once: the same purchase gives one invoice, and different ones together cannot
+// pass the hourly limit, also when two panels (services) share the database.
+func TestConcurrentInvoices(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	other := New(e.s.d)
+	other.SetTelegram(e.tg)
+	// Tap i goes through services[i % len]: across services only the database's lock holds.
+	taps := func(n int, tariff func(i int) int64, services ...*Service) []error {
+		var wg sync.WaitGroup
+		errs := make([]error, n)
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = services[i%len(services)].Invoice(ctx, InvoiceRequest{TgID: 555, TariffID: tariff(i), Provider: Stars})
+			}()
+		}
+		wg.Wait()
+		return errs
+	}
+	for _, err := range taps(5, func(int) int64 { return e.sale.ID }, e.s) {
+		must(t, err)
+	}
+	all, err := e.st.Q.CountRecentInvoices(ctx, db.CountRecentInvoicesParams{TgID: 555, CreatedAt: 0})
+	if err != nil || all != 1 {
+		t.Fatalf("a double tap made %d invoices (%v), want 1", all, err)
+	}
+
+	// Different tariffs, so none is reused: only what is left of the hour's limit goes in.
+	var tariffs []int64
+	for i := range maxPerHour + 5 {
+		tr, err := e.st.Q.CreateTariff(ctx, db.CreateTariffParams{Name: "t" + strconv.Itoa(i), DurationDays: 30, ResetStrategy: "none",
+			PriceStars: sql.NullInt64{Int64: 10, Valid: true}, OnSale: 1, CreatedAt: e.now.Unix()})
+		must(t, err)
+		tariffs = append(tariffs, tr.ID)
+	}
+	tooMany := 0
+	for _, err := range taps(len(tariffs), func(i int) int64 { return tariffs[i] }, e.s, other) {
+		switch {
+		case errors.Is(err, ErrTooMany):
+			tooMany++
+		case err != nil:
+			t.Fatal(err)
+		}
+	}
+	all, _ = e.st.Q.CountRecentInvoices(ctx, db.CountRecentInvoicesParams{TgID: 555, CreatedAt: 0})
+	if all != maxPerHour || tooMany != len(tariffs)-(maxPerHour-1) {
+		t.Fatalf("%d invoices and %d refused, want %d and %d", all, tooMany, maxPerHour, len(tariffs)-(maxPerHour-1))
+	}
+}
+
 // With the reset off a renewal only adds the term: the traffic counter runs on.
 func TestRenewalKeepsTraffic(t *testing.T) {
 	e := newEnv(t)
@@ -281,7 +551,7 @@ func TestRenewalKeepsTraffic(t *testing.T) {
 	u, err := domain.NewUsers(e.st, domain.NewPool(e.st, clock), noChanges{}, clock).Create(ctx, domain.CreateInput{Name: "a", TariffID: e.sale.ID})
 	must(t, err)
 	must(t, e.st.Q.LinkTg(ctx, db.LinkTgParams{UserID: u.ID, TgID: 555, CreatedAt: e.now.Unix()}))
-	_, err = e.st.DB.ExecContext(ctx, "UPDATE users SET used_up = 1000, used_down = 2000 WHERE id = ?", u.ID)
+	_, err = e.st.DB.ExecContext(ctx, "UPDATE users SET used_up = 1000, used_down = 2000 WHERE id = $1", u.ID)
 	must(t, err)
 	p := e.invoice(555, u.ID, Stars)
 	must(t, e.s.StarsPaid(ctx, 555, p.Payload, "ch-k", "XTR", 150))
@@ -321,7 +591,7 @@ func TestSalesOff(t *testing.T) {
 func TestSalesDefault(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	_, err := e.st.DB.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", KeyConfig)
+	_, err := e.st.DB.ExecContext(ctx, "DELETE FROM settings WHERE key = $1", KeyConfig)
 	must(t, err)
 	if e.s.Config(ctx).Enabled || e.s.Available(ctx).Any() {
 		t.Fatal("selling on in a panel that never set it up")

@@ -23,7 +23,7 @@ func (q *Queries) CountAPIKeys(ctx context.Context) (int64, error) {
 
 const createAPIKey = `-- name: CreateAPIKey :one
 INSERT INTO api_keys (admin_id, name, prefix, hash, scope, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id, admin_id, name, prefix, hash, scope, created_at, expires_at, last_used_at, last_ip
 `
 
@@ -64,7 +64,7 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Api
 }
 
 const deleteAPIKey = `-- name: DeleteAPIKey :execrows
-DELETE FROM api_keys WHERE id = ?
+DELETE FROM api_keys WHERE id = $1
 `
 
 func (q *Queries) DeleteAPIKey(ctx context.Context, id int64) (int64, error) {
@@ -76,7 +76,7 @@ func (q *Queries) DeleteAPIKey(ctx context.Context, id int64) (int64, error) {
 }
 
 const deleteAPIKeysOf = `-- name: DeleteAPIKeysOf :execrows
-DELETE FROM api_keys WHERE admin_id = ?
+DELETE FROM api_keys WHERE admin_id = $1
 `
 
 func (q *Queries) DeleteAPIKeysOf(ctx context.Context, adminID int64) (int64, error) {
@@ -88,7 +88,7 @@ func (q *Queries) DeleteAPIKeysOf(ctx context.Context, adminID int64) (int64, er
 }
 
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
-SELECT id, admin_id, name, prefix, hash, scope, created_at, expires_at, last_used_at, last_ip FROM api_keys WHERE hash = ?
+SELECT id, admin_id, name, prefix, hash, scope, created_at, expires_at, last_used_at, last_ip FROM api_keys WHERE hash = $1
 `
 
 func (q *Queries) GetAPIKeyByHash(ctx context.Context, hash string) (ApiKey, error) {
@@ -148,8 +148,8 @@ func (q *Queries) ListAPIKeys(ctx context.Context) ([]ApiKey, error) {
 }
 
 const touchAPIKey = `-- name: TouchAPIKey :exec
-UPDATE api_keys SET last_used_at = ?, last_ip = ?
-WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)
+UPDATE api_keys SET last_used_at = $1, last_ip = $2
+WHERE id = $3 AND (last_used_at IS NULL OR last_used_at < $4)
 `
 
 type TouchAPIKeyParams struct {

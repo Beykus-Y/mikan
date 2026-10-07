@@ -126,6 +126,30 @@ func TestDeviceBindingOverHTTP(t *testing.T) {
 	if resp, _ := h.do(http.MethodDelete, api+"/"+strconv.FormatInt(bound[0].ID, 10), nil, map[string]string{"X-CSRF-Token": h.csrf}); resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("the admin unbinds without the daily limit: %d", resp.StatusCode)
 	}
+	// The places taken are the bound devices, in the user and in the list alike: two of
+	// the three are left, however many addresses they connect from.
+	var one struct {
+		BoundDevices int64 `json:"bound_devices"`
+	}
+	resp, body = h.do(http.MethodGet, "/"+adminPath+"/api/v1/users/"+strconv.FormatInt(u.ID, 10), nil, nil)
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &one) != nil || one.BoundDevices != 2 {
+		t.Fatalf("the user's bound devices: %d %s", resp.StatusCode, body)
+	}
+	var list struct {
+		Items []struct {
+			ID           int64 `json:"id"`
+			BoundDevices int64 `json:"bound_devices"`
+		} `json:"items"`
+	}
+	resp, body = h.do(http.MethodGet, "/"+adminPath+"/api/v1/users", nil, nil)
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &list) != nil {
+		t.Fatalf("users: %d %s", resp.StatusCode, body)
+	}
+	for _, it := range list.Items {
+		if it.ID == u.ID && it.BoundDevices != 2 {
+			t.Fatalf("the list's bound devices: %d", it.BoundDevices)
+		}
+	}
 
 	// Strict mode: an app without an id gets no keys.
 	if err := settings.Set(ctx, set, settings.KeyRequireHWID, true); err != nil {

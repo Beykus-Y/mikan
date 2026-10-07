@@ -100,7 +100,7 @@ func TestTrafficPoolsOverHTTP(t *testing.T) {
 		return len(prof.Proxies)
 	}
 	before := countLinks()
-	if _, err := h.st.DB.ExecContext(ctx, "UPDATE user_pools SET used_down = 2048 WHERE user_id = ?", u.ID); err != nil {
+	if _, err := h.st.DB.ExecContext(ctx, "UPDATE user_pools SET used_down = 2048 WHERE user_id = $1", u.ID); err != nil {
 		t.Fatal(err)
 	}
 

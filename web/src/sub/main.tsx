@@ -12,8 +12,9 @@ import { bytes, dateLong, dateShort, days, daysUntil } from "../lib/format";
 import { safeHref } from "../lib/url";
 import { APPS, detect, enc, type Platform } from "./apps";
 import { Devices } from "./devices";
-import { initData, json, openOutside, outside, pageURL, request, subRoot, tgEvent, tgMode, tokenOf } from "./net";
+import { hashParams, initData, json, openOutside, outside, pageURL, request, subRoot, tgEvent, tgMode, tokenOf } from "./net";
 import { loadShop, Shop, type ShopData } from "./shop";
+import { PromoSection } from "./promo";
 import type { Info, TgSub } from "./types";
 
 /** Pauses between the reloads after a payment: the panel applies a paid one within seconds. */
@@ -34,8 +35,13 @@ function SubPage() {
   const [tg, setTg] = useState<{ state: "loading" | "none" | "failed" | "ok"; subs: TgSub[] }>({ state: tgMode ? "loading" : "ok", subs: [] });
   const [shop, setShop] = useState<ShopData | null>(null);
   const [packages, setPackages] = useState<{ token: string; data: ShopData } | null>(null);
+  const [promoCode, setPromoCode] = useState("");
   const current = info && info.url === subURL ? info.data : null;
   const failed = !current && failedURL === subURL;
+
+  useEffect(() => {
+    if (current?.theme) document.documentElement.dataset.theme = current.theme;
+  }, [current?.theme]);
 
   const loadInfo = useCallback(async (url: string, signal?: AbortSignal) => {
     const d = await request(url + "/info", { signal }).then((r) => json<Info>(r));
@@ -151,7 +157,7 @@ function SubPage() {
   const launched = useRef(false);
   useEffect(() => {
     if (tgMode || !current || launched.current) return;
-    const want = new URLSearchParams(location.hash.slice(1)).get("open");
+    const want = hashParams.get("open");
     if (!want) return;
     launched.current = true;
     history.replaceState(null, "", location.pathname + location.search);
@@ -183,6 +189,7 @@ function SubPage() {
         openInvoice={(slug) => tgEvent("web_app_open_invoice", { slug })}
         openLink={openOutside}
         onRefresh={refresh}
+        promoCode={promoCode}
       />
     ) : null;
   // Traffic packages are for the subscription on screen.
@@ -201,6 +208,7 @@ function SubPage() {
         openInvoice={(slug) => tgEvent("web_app_open_invoice", { slug })}
         openLink={openOutside}
         onRefresh={refresh}
+        promoCode={promoCode}
       />
     ) : null;
 
@@ -211,6 +219,7 @@ function SubPage() {
           <h1 className="font-display text-xl font-medium">{t("sub.tgNoSubTitle")}</h1>
           <p className="mt-2 text-[13px] text-[var(--ink-500)]">{t("sub.tgNoSubText")}</p>
         </section>
+        <PromoSection token="" activeCode={promoCode} onApplied={(c) => setPromoCode(c)} onBonusApplied={refresh} />
         {shopFor("", t("sub.shopNew"))}
       </Shell>
     );
@@ -281,7 +290,7 @@ function SubPage() {
   const telegram = safeHref(current.telegram);
 
   return (
-    <Shell brand={current.brand}>
+    <Shell brand={current.brand} logo={current.logo}>
       {tg.subs.length > 1 ? (
         <div className="flex gap-1 overflow-x-auto rounded-[14px] bg-[var(--hover)] p-1" role="group" aria-label={t("sub.link")}>
           {tg.subs.map((s) => (
@@ -297,7 +306,7 @@ function SubPage() {
           ))}
         </div>
       ) : null}
-      <section className="glass reveal rounded-3xl p-4">
+      <PageModule id="status" modules={current.modules}><section className="glass reveal rounded-3xl p-4">
         <h1 className="font-display text-xl leading-7 font-medium tracking-tight">{t(`sub.status.${current.state}`, { name: firstName })}</h1>
         <div className="mt-2 flex items-center justify-between gap-2 text-[13px] text-[var(--ink-600)]">
           <span>{current.expires_at ? t("sub.until", { date: dateLong(current.expires_at) }) : t("sub.forever")}</span>
@@ -308,12 +317,13 @@ function SubPage() {
             {t("sub.renew")}
           </a>
         ) : null}
-      </section>
+      </section></PageModule>
 
-      {tgMode ? shopFor(token, t("sub.shop")) : null}
-      {tgMode ? packagesShop : null}
+      <PageModule id="promo" modules={current.modules}>{tgMode ? <PromoSection token={subURL} activeCode={promoCode} onApplied={(c) => setPromoCode(c)} onBonusApplied={refresh} /> : null}</PageModule>
+      <PageModule id="shop" modules={current.modules}>{tgMode ? shopFor(token, t("sub.shop")) : null}</PageModule>
+      <PageModule id="packages" modules={current.modules}>{tgMode ? packagesShop : null}</PageModule>
 
-      <section className="glass grid grid-cols-[104px_1fr] items-center gap-4 rounded-3xl p-4">
+      <PageModule id="usage" modules={current.modules}><section className="glass grid grid-cols-[104px_1fr] items-center gap-4 rounded-3xl p-4">
         <Ring size={104} pct={current.limit != null ? pct : 100} label={leftValue} sub={left != null ? t("sub.left", { unit: leftUnit ?? "" }) : t("sub.unlimited")} />
         <div className="flex flex-col gap-2 text-xs text-[var(--ink-500)]">
           <div>
@@ -333,9 +343,9 @@ function SubPage() {
             </div>
           ) : null}
         </div>
-      </section>
+      </section></PageModule>
 
-      {current.pools?.length ? (
+      <PageModule id="pools" modules={current.modules}>{current.pools?.length ? (
         <section className="glass rounded-3xl p-4">
           <h2 className="mb-3 text-[15px] font-semibold">{t("sub.pools")}</h2>
           <ul className="flex flex-col gap-3">
@@ -351,19 +361,20 @@ function SubPage() {
             ))}
           </ul>
         </section>
-      ) : null}
+      ) : null}</PageModule>
 
-      {current.binding || current.devices?.length ? <Devices info={current} subURL={subURL} reload={() => loadInfo(subURL).catch(() => undefined)} /> : null}
+      <PageModule id="devices" modules={current.modules}>{current.binding || current.devices?.length ? <Devices info={current} subURL={subURL} reload={() => loadInfo(subURL).catch(() => undefined)} /> : null}</PageModule>
 
-      <section className="glass rounded-3xl p-4">
+      <PageModule id="apps" modules={current.modules}><section className="glass rounded-3xl p-4">
         <h2 className="mb-3 text-[15px] font-semibold">{t("sub.connect")}</h2>
-        <div className="mb-3 flex gap-1 rounded-[14px] bg-[var(--hover)] p-1" role="group" aria-label={t("sub.platform")}>
+        <div className="mb-3 flex gap-1 overflow-x-auto rounded-[14px] bg-[var(--hover)] p-1" role="group" aria-label={t("sub.platform")}>
           {(
             [
               ["ios", "iPhone"],
               ["android", "Android"],
               ["windows", "Windows"],
               ["macos", "Mac"],
+              ["linux", "Linux"],
             ] as const
           ).map(([k, l]) => (
             <button
@@ -371,7 +382,7 @@ function SubPage() {
               type="button"
               aria-pressed={platform === k}
               onClick={() => setPlatform(k)}
-              className="h-8 flex-1 rounded-[10px] text-xs font-semibold text-[var(--ink-600)] aria-pressed:bg-white aria-pressed:text-[var(--ink-900)] aria-pressed:shadow-sm"
+              className="h-8 flex-auto shrink-0 rounded-[10px] px-1.5 text-xs font-semibold whitespace-nowrap text-[var(--ink-600)] aria-pressed:bg-white aria-pressed:text-[var(--ink-900)] aria-pressed:shadow-sm"
             >
               {l}
             </button>
@@ -401,9 +412,9 @@ function SubPage() {
             </div>
           ))}
         </div>
-      </section>
+      </section></PageModule>
 
-      <section className="glass rounded-3xl p-4">
+      <PageModule id="instructions" modules={current.modules}><section className="glass rounded-3xl p-4">
         <h2 className="mb-3 text-[15px] font-semibold">{t("sub.howTo")}</h2>
         <ol className="flex flex-col gap-3 text-[13px] text-[var(--ink-600)]">
           {([1, 2, 3] as const).map((n) => (
@@ -416,9 +427,9 @@ function SubPage() {
             </li>
           ))}
         </ol>
-      </section>
+      </section></PageModule>
 
-      <section className="glass rounded-3xl p-4">
+      <PageModule id="link" modules={current.modules}><section className="glass rounded-3xl p-4">
         <h2 className="mb-3 text-[15px] font-semibold">{t("sub.link")}</h2>
         <div className="link-field">
           <span className="mono">{subURL}</span>
@@ -434,27 +445,35 @@ function SubPage() {
             <QR value={subURL} size={200} />
           </div>
         ) : null}
-      </section>
+      </section></PageModule>
 
-      {telegram && !tgMode ? (
+      <PageModule id="telegram" modules={current.modules}>{telegram && !tgMode ? (
         <a className="btn btn-glass btn-block h-12 rounded-2xl" href={telegram} target="_blank" rel="noreferrer noopener">
           <Send size={18} aria-hidden /> {t("sub.openTelegram")}
         </a>
-      ) : null}
-      {support ? (
+      ) : null}</PageModule>
+      <PageModule id="support" modules={current.modules}>{support ? (
         <a className="btn btn-glass btn-block h-12 rounded-2xl" href={support} target="_blank" rel="noreferrer noopener" {...outside(support)}>
           <LifeBuoy size={18} aria-hidden /> {t("sub.support")}
         </a>
-      ) : null}
+      ) : null}</PageModule>
     </Shell>
   );
 }
 
-function Shell({ brand, children }: { brand?: string; children: React.ReactNode }) {
+const DEFAULT_MODULE_ORDER = ["status", "usage", "pools", "devices", "apps", "instructions", "link", "promo", "shop", "packages", "telegram", "support"];
+
+function PageModule({ id, modules, children }: { id: string; modules?: Info["modules"]; children: React.ReactNode }) {
+  const config = modules?.find((module) => module.id === id);
+  const index = modules?.findIndex((module) => module.id === id) ?? -1;
+  return <div style={{ order: index >= 0 ? index : DEFAULT_MODULE_ORDER.indexOf(id) }} hidden={config?.enabled === false}>{children}</div>;
+}
+
+function Shell({ brand, logo, children }: { brand?: string; logo?: string; children: React.ReactNode }) {
   return (
     <main className="calm-glass mx-auto flex max-w-[440px] flex-col gap-3 px-4 pt-[calc(24px+env(safe-area-inset-top))] pb-[calc(40px+env(safe-area-inset-bottom))]">
       <div className="flex items-center gap-2 px-1 pb-1">
-        <span className="font-display grid h-7 w-7 place-items-center rounded-[9px] bg-[var(--ink-900)] text-[13px] font-semibold text-white">{(brand ?? "V")[0]}</span>
+        {logo?.startsWith("https://") ? <img src={logo} alt="" className="h-7 w-7 rounded-[9px] object-cover" /> : <span className="font-display grid h-7 w-7 place-items-center rounded-[9px] bg-[var(--ink-900)] text-[13px] font-semibold text-white">{logo || (brand ?? "V")[0]}</span>}
         <span className="font-display text-[15px] font-semibold tracking-tight">{brand ?? ""}</span>
         <LangSwitch className="ml-auto" />
       </div>

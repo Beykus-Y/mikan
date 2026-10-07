@@ -21,11 +21,68 @@ use crate::envfile::EnvFile;
 use crate::lock::{self, Wait};
 use crate::ops::Install;
 use crate::panelfs::{self, Dir};
-use crate::{DIR, docker, setup, signals};
+use crate::{DIR, docker, setup, signals, system};
 
-/// Backups an update makes on its own are kept this many; the admin's own are never removed.
-const KEEP_UPDATE: usize = 5;
-const KEEP_RESTORE: usize = 3;
+/// The kinds of archive mikan makes on its own; the admin's are "mikan".
+pub const PRE_UPDATE: &str = "pre-update";
+/// An update that moves SQLite to PostgreSQL: the archives with the original SQLite. A
+/// failed move leaves .env on PostgreSQL, so its retries are "pre-update" and can never
+/// rotate these away.
+pub const PRE_POSTGRES: &str = "pre-postgres";
+const PRE_RESTORE: &str = "pre-restore";
+
+/// How many archives of a kind are kept; the admin's own are never removed.
+fn keep(kind: &str) -> Option<usize> {
+    match kind {
+        PRE_UPDATE => Some(5),
+        PRE_POSTGRES | PRE_RESTORE => Some(3),
+        _ => None,
+    }
+}
+
+/// Where the panel's database lies below /opt/mikan: a backup's PostgreSQL dump or
+/// SQLite copy, a restore's dump, and the SQLite file itself with its journal.
+const DUMP: &str = "data/panel/backup.dump";
+const SQLITE_COPY: &str = "data/panel/backup.db";
+const RESTORE_DUMP: &str = "data/panel/restore.dump";
+const SQLITE: &str = "data/panel/mikan.db";
+const SQLITE_WAL: &str = "data/panel/mikan.db-wal";
+const SQLITE_SHM: &str = "data/panel/mikan.db-shm";
+
+/// The name in data/panel of one of the paths above.
+fn panel_name(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or(rel, |(_, n)| n)
+}
+
+/// A dump of PostgreSQL at DUMP; what an interrupted one left there goes first.
+fn dump_postgres(panel: &Dir) -> Result<()> {
+    docker::postgres_ready()?;
+    panel.discard(panel_name(DUMP))?;
+    docker::database(&["backup", &format!("/{DUMP}")])?;
+    Ok(())
+}
+
+/// Room left for a dump and an archive beyond the estimate, which is generous anyway.
+const MARGIN: u64 = 256 << 20;
+
+/// A full disk half way through a dump or an archive is found out before it starts: the
+/// data as they are plus the database's volume (a dump is smaller than its tables and
+/// indexes) must fit with a margin.
+fn ensure_room(root: &Path, postgres: bool) -> Result<()> {
+    let Some(free) = system::disk_free_bytes(root) else { return Ok(()) };
+    let db = if postgres { docker::volume_mountpoint(docker::PG_VOLUME).map_or(0, |p| system::tree_bytes(&p)) } else { 0 };
+    let need = system::tree_bytes(&root.join("data")) + db + MARGIN;
+    if free < need {
+        bail!(
+            "not enough free disk for a backup: {} MB free in {}, about {} MB needed; free some space (old archives are in {}) and try again",
+            free >> 20,
+            root.display(),
+            need >> 20,
+            root.join("backups").display()
+        );
+    }
+    Ok(())
+}
 
 /// What a restore may put back, below /opt/mikan: the settings, and the data of the panel
 /// and the node. Anything else in an archive is not a mikan backup.
@@ -60,8 +117,11 @@ fn create(dir: &Path, kind: &str) -> Result<(File, PathBuf)> {
 /// tar of members (paths below root) into a new private archive in dir.
 fn pack(root: &Path, dir: &Path, kind: &str, members: &[String]) -> Result<PathBuf> {
     let (file, path) = create(dir, kind)?;
+    // What the node's panel and the updater say to each other (data/node/update) is of the
+    // moment: a restore must not bring back an old request, or a status that says an update
+    // runs. The panel's own directory is not a member at all.
     let out = Command::new("tar")
-        .args(["-czf", "-", "-C"])
+        .args(["-czf", "-", "--exclude=data/node/update", "-C"])
         .arg(root)
         .args(members)
         .stdin(Stdio::null())
@@ -88,8 +148,9 @@ fn pack(root: &Path, dir: &Path, kind: &str, members: &[String]) -> Result<PathB
     }
 }
 
-/// Removes the oldest archives of a kind beyond keep.
-fn prune(dir: &Path, kind: &str, keep: usize) {
+/// Removes the oldest archives of a kind beyond what it keeps.
+fn prune(dir: &Path, kind: &str) {
+    let Some(keep) = keep(kind) else { return };
     let prefix = format!("{kind}-");
     let mut names: Vec<String> = fs::read_dir(dir)
         .map(|d| {
@@ -122,15 +183,23 @@ pub fn backup_as(kind: &str, say: &mut dyn FnMut(&str)) -> Result<PathBuf> {
     let install = Install::load()?;
     let root = Path::new(DIR);
     let dir = backups_dir(root)?;
+    let postgres = !install.node && install.env.get("MIKAN_DATABASE_URL").is_some();
+    ensure_room(root, postgres)?;
     let mut members: Vec<String> = TOP.iter().map(|s| (*s).to_owned()).collect();
     let panel = if install.node {
         None
     } else {
         let panel = Dir::open(root, "data/panel", false)?.context("data/panel is not there")?;
         // What an interrupted backup left would make the database copy fail.
-        panel.discard("backup.db")?;
-        docker::check(docker::admin(&["backup", "/data/panel/backup.db"], None)?)?;
-        members.push("data/panel/backup.db".into());
+        let copy = if postgres {
+            dump_postgres(&panel)?;
+            DUMP
+        } else {
+            panel.discard(panel_name(SQLITE_COPY))?;
+            docker::check(docker::admin(&["backup", &format!("/{SQLITE_COPY}")], None)?)?;
+            SQLITE_COPY
+        };
+        members.push(copy.into());
         if exists(root, "data/panel/tls") {
             members.push("data/panel/tls".into());
         }
@@ -139,16 +208,19 @@ pub fn backup_as(kind: &str, say: &mut dyn FnMut(&str)) -> Result<PathBuf> {
     if exists(root, "data/node") {
         members.push("data/node".into());
     }
+    if exists(root, "addons/state.json") {
+        members.push("addons/state.json".into());
+    }
+    if exists(root, "data/panel/addons") {
+        members.push("data/panel/addons".into());
+    }
     let packed = pack(root, &dir, kind, &members);
     if let Some(panel) = &panel {
-        let _ = panel.discard("backup.db");
+        let _ = panel.discard(panel_name(SQLITE_COPY));
+        let _ = panel.discard(panel_name(DUMP));
     }
     let file = packed?;
-    match kind {
-        "pre-update" => prune(&dir, kind, KEEP_UPDATE),
-        "pre-restore" => prune(&dir, kind, KEEP_RESTORE),
-        _ => {}
-    }
+    prune(&dir, kind);
     Ok(file)
 }
 
@@ -173,7 +245,10 @@ fn allowed_name(name: &str) -> bool {
     if n.is_empty() || n.split('/').any(|c| c.is_empty() || c == ".." || c == ".") {
         return false;
     }
-    TOP.contains(&n) || ["data", "data/panel", "data/node"].contains(&n) || n.starts_with("data/panel/") || n.starts_with("data/node/")
+    TOP.contains(&n)
+        || ["data", "data/panel", "data/node", "addons", "addons/state.json"].contains(&n)
+        || n.starts_with("data/panel/")
+        || n.starts_with("data/node/")
 }
 
 /// Judges the two listings of an archive (`tar -tzf`, names; `tar -tvzf`, with types).
@@ -265,24 +340,69 @@ fn verify_tree(dir: &Path, depth: usize) -> Result<()> {
 
 /// What an unpacked archive puts back: (where it is, where it goes below /opt/mikan).
 fn plan(stage: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
+    let items = plan_items(stage);
+    if !items.iter().any(|(_, r)| *r == ".env") {
+        bail!("the archive has no .env: it is not a mikan backup");
+    }
+    Ok(items)
+}
+
+/// What an archive without .env puts back: the panel's PostgreSQL dump alone, as the panel
+/// sends it to Telegram. The server's settings, certificates, adapters and node data stay
+/// as they are.
+fn plan_database(stage: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
+    let items: Vec<_> = plan_items(stage).into_iter().filter(|(_, r)| *r == RESTORE_DUMP).collect();
+    if items.is_empty() {
+        bail!("the archive has neither .env nor the panel's PostgreSQL dump: it is not a mikan backup");
+    }
+    Ok(items)
+}
+
+fn plan_items(stage: &Path) -> Vec<(PathBuf, &'static str)> {
     let mut items = Vec::new();
-    for rel in [".env", "compose.yaml", "data/panel/tls", "data/node"] {
+    for rel in [".env", "compose.yaml", "data/panel/tls", "data/node", "addons/state.json", "data/panel/addons"] {
         if fs::symlink_metadata(stage.join(rel)).is_ok() {
             items.push((stage.join(rel), rel));
         }
     }
-    if !items.iter().any(|(_, r)| *r == ".env") {
-        bail!("the archive has no .env: it is not a mikan backup");
-    }
     // The panel's database comes as the consistent copy a backup makes, or as the file a
     // snapshot took with the panel stopped.
-    for db in ["data/panel/backup.db", "data/panel/mikan.db"] {
+    for db in [DUMP, SQLITE_COPY, SQLITE] {
         if fs::symlink_metadata(stage.join(db)).is_ok() {
-            items.push((stage.join(db), "data/panel/mikan.db"));
+            items.push((stage.join(db), if db == DUMP { RESTORE_DUMP } else { SQLITE }));
+            if db == SQLITE && stage.join(SQLITE_WAL).is_file() {
+                // Raw stopped snapshots can still contain committed transactions in
+                // WAL (a forced shutdown). VACUUM backup.db has no accompanying WAL.
+                items.push((stage.join(SQLITE_WAL), SQLITE_WAL));
+            }
             break;
         }
     }
-    Ok(items)
+    items
+}
+
+/// Fits what a panel's archive puts back to this server: its database credentials and
+/// image stay (POSTGRES_PASSWORD on an existing volume does not change the role's
+/// password, and an image runs the database it was made for). A server that went back to
+/// SQLite (an update that could not move it) keeps its compose file and takes only an
+/// SQLite database: a PostgreSQL dump needs the move first.
+fn fit_to_panel(items: &mut Vec<(PathBuf, &'static str)>, archived: &mut EnvFile, current: &EnvFile) -> Result<()> {
+    for key in ["MIKAN_DATABASE_URL", "MIKAN_POSTGRES_PASSWORD", "MIKAN_IMAGE", "MIKAN_VERSION"] {
+        match current.get(key) {
+            Some(v) => archived.set(key, v)?,
+            None => archived.remove(key),
+        }
+    }
+    if current.get("MIKAN_DATABASE_URL").is_none() {
+        items.retain(|(_, r)| *r != "compose.yaml");
+        if items.iter().any(|(_, r)| *r == RESTORE_DUMP) {
+            bail!("this server still runs SQLite and the backup holds a PostgreSQL database: run mikan update first, then restore");
+        }
+    }
+    if !items.iter().any(|(_, r)| [SQLITE, RESTORE_DUMP].contains(r)) {
+        bail!("the panel backup has no database");
+    }
+    Ok(())
 }
 
 /// Moves the items in, each current one aside first; when one step fails, everything that
@@ -305,10 +425,10 @@ fn swap(root: &Path, items: &[(PathBuf, &str)]) -> Result<()> {
         };
         for (from, rel) in items {
             away(rel)?;
-            if *rel == "data/panel/mikan.db" {
+            if *rel == SQLITE {
                 // The journal of the old database does not belong to the new one.
-                away("data/panel/mikan.db-wal")?;
-                away("data/panel/mikan.db-shm")?;
+                away(SQLITE_WAL)?;
+                away(SQLITE_SHM)?;
             }
             let to = root.join(rel);
             if let Some(parent) = to.parent() {
@@ -331,41 +451,50 @@ fn swap(root: &Path, items: &[(PathBuf, &str)]) -> Result<()> {
     result
 }
 
-/// The current data as it is, with the containers stopped, in a pre-restore archive.
-fn snapshot(root: &Path) -> Result<PathBuf> {
+/// The data as they are once the panel has stopped, in a kind archive: nothing it wrote
+/// before the stop is missing. SQLite goes as its raw file with the WAL (a forced
+/// shutdown leaves committed transactions there), PostgreSQL as a dump taken now; with
+/// dump false only the files go (a database that cannot be dumped, `restore
+/// --no-db-snapshot`).
+pub fn archive_stopped(root: &Path, kind: &str, dump: bool) -> Result<PathBuf> {
     let dir = backups_dir(root)?;
+    let postgres = EnvFile::load(root.join(".env"))?.get("MIKAN_DATABASE_URL").is_some();
+    let pg = dump && postgres;
+    ensure_room(root, pg)?;
+    if pg {
+        dump_postgres(&Dir::open(root, "data/panel", false)?.context("data/panel is missing")?)?;
+    }
     let members: Vec<String> = [
         ".env",
         "compose.yaml",
-        "data/panel/mikan.db",
-        "data/panel/mikan.db-wal",
-        "data/panel/mikan.db-shm",
+        SQLITE,
+        SQLITE_WAL,
+        SQLITE_SHM,
         "data/panel/tls",
         "data/node",
+        "addons/state.json",
+        "data/panel/addons",
+        DUMP,
     ]
     .iter()
     .filter(|m| exists(root, m))
+    // A dump not taken now is a stale one, and so is the SQLite of a server on
+    // PostgreSQL without its dump: a restore of this archive would take either for
+    // the database.
+    .filter(|m| match **m {
+        DUMP => pg,
+        SQLITE | SQLITE_WAL | SQLITE_SHM => pg || !postgres,
+        _ => true,
+    })
     .map(|m| (*m).to_owned())
     .collect();
-    let file = pack(root, &dir, "pre-restore", &members)?;
-    prune(&dir, "pre-restore", KEEP_RESTORE);
+    let packed = pack(root, &dir, kind, &members);
+    if pg && let Some(panel) = Dir::open(root, "data/panel", false)? {
+        panel.discard(panel_name(DUMP))?;
+    }
+    let file = packed?;
+    prune(&dir, kind);
     Ok(file)
-}
-
-/// Puts the panel's database back from an archive of this installer's own making, with the
-/// containers stopped and nothing else touched. The update uses it when the new version did
-/// not start and the old one does not run on what the new one did to the database.
-pub fn restore_database(file: &Path) -> Result<()> {
-    let root = Path::new(DIR);
-    check_archive(file)?;
-    let stage = Stage::new(root)?;
-    extract(file, &stage.0)?;
-    verify_tree(&stage.0, 0)?;
-    let db = plan(&stage.0)?.into_iter().find(|(_, to)| *to == "data/panel/mikan.db").context("the archive has no database")?;
-    docker::compose_run(&["down"])?;
-    real_data_dirs(root)?;
-    swap(root, &[db])?;
-    panelfs::own_dirs(root, true)
 }
 
 /// data/panel and data/node are directories, not links the panel put there: the swap
@@ -380,11 +509,13 @@ fn real_data_dirs(root: &Path) -> Result<()> {
 
 /// Replaces the data with a backup's. The archive is checked first and unpacked aside; the
 /// current data go to a pre-restore archive before anything changes, and a restore that
-/// fails half way puts them back.
-pub fn restore(file: &Path, say: &mut dyn FnMut(&str)) -> Result<()> {
+/// fails half way puts them back. no_db_snapshot leaves the current PostgreSQL data out of
+/// that archive: a database too broken to dump can still be replaced.
+pub fn restore(file: &Path, no_db_snapshot: bool, say: &mut dyn FnMut(&str)) -> Result<()> {
     let _lock = lock::acquire(Wait::Block, say)?;
     let install = Install::load()?;
     let root = Path::new(DIR);
+    let postgres = !install.node && install.env.get("MIKAN_DATABASE_URL").is_some();
     if !file.is_file() {
         bail!("no file {}", file.display());
     }
@@ -396,22 +527,44 @@ pub fn restore(file: &Path, say: &mut dyn FnMut(&str)) -> Result<()> {
     let stage = Stage::new(root)?;
     extract(file, &stage.0)?;
     verify_tree(&stage.0, 0)?;
-    let items = plan(&stage.0)?;
-    let archived = EnvFile::load(stage.0.join(".env"))?;
-    if (archived.get("MIKAN_MODE") == Some("node")) != install.node {
-        bail!(
-            "the backup is a {}'s, this server is a {}",
-            if install.node { "panel" } else { "node" },
-            if install.node { "node" } else { "panel" }
-        );
-    }
+    let items = if fs::symlink_metadata(stage.0.join(".env")).is_ok() {
+        let mut items = plan(&stage.0)?;
+        let mut archived = EnvFile::load(stage.0.join(".env"))?;
+        if (archived.get("MIKAN_MODE") == Some("node")) != install.node {
+            bail!(
+                "the backup is a {}'s, this server is a {}",
+                if install.node { "panel" } else { "node" },
+                if install.node { "node" } else { "panel" }
+            );
+        }
+        if !install.node {
+            fit_to_panel(&mut items, &mut archived, &install.env)?;
+            archived.save()?;
+        }
+        items
+    } else {
+        if !postgres {
+            bail!(
+                "the archive holds only a panel's PostgreSQL database; this server is a node or still runs SQLite (run mikan update first)"
+            );
+        }
+        let items = plan_database(&stage.0)?;
+        say("The archive holds only the panel's database: the settings, certificates, adapters and node data stay as they are");
+        items
+    };
 
     let _critical = signals::critical();
     say("Stopping mikan");
-    docker::compose_run(&["down"])?;
+    crate::addon::down();
+    docker::compose_run(&["stop"])?;
     let again = |say: &mut dyn FnMut(&str)| {
         if let Err(e) = docker::compose_run(&["up", "-d"]) {
             say(&format!("mikan did not start again: {e:#}"));
+        }
+        if !install.node
+            && let Err(e) = crate::addon::resume()
+        {
+            say(&format!("Payment adapters did not start again: {e:#}"));
         }
     };
     // With the containers down nothing can swap a directory for a link any more: this is
@@ -420,11 +573,23 @@ pub fn restore(file: &Path, say: &mut dyn FnMut(&str)) -> Result<()> {
         again(say);
         return Err(e);
     }
-    let snap = match snapshot(root) {
+    let dump = !(postgres && no_db_snapshot);
+    if !dump {
+        say("--no-db-snapshot: the current PostgreSQL data are NOT saved, only the files; if this restore fails, they are lost");
+    }
+    let snap = match archive_stopped(root, PRE_RESTORE, dump) {
         Ok(s) => s,
         Err(e) => {
             again(say);
-            return Err(e.context("the current data could not be saved first, so nothing was replaced"));
+            let hint = if dump && postgres {
+                format!(
+                    ". If PostgreSQL itself is broken and its current data are not needed, save only the files first: mikan restore --no-db-snapshot {}",
+                    file.display()
+                )
+            } else {
+                String::new()
+            };
+            return Err(e.context(format!("the current data could not be saved first, so nothing was replaced{hint}")));
         }
     };
     say(&format!("The current data are saved in {}", snap.display()));
@@ -433,18 +598,41 @@ pub fn restore(file: &Path, say: &mut dyn FnMut(&str)) -> Result<()> {
         return Err(e.context("the data were not replaced"));
     }
     let started = (|| -> Result<()> {
-        // The backup may carry the compose file of an older mikan: it gets the current one.
-        docker::ensure_compose(root, install.node)?;
-        panelfs::layout(root, !install.node)?;
+        if postgres {
+            // The backup may carry the compose file of an older mikan: it gets the current one.
+            docker::ensure_compose(root, false)?;
+            panelfs::layout(root, true)?;
+            docker::postgres_ready()?;
+            let source = if items.iter().any(|(_, r)| *r == RESTORE_DUMP) { RESTORE_DUMP } else { SQLITE };
+            docker::database(&["restore", &format!("/{source}")])?;
+        } else if install.node {
+            docker::ensure_compose(root, true)?;
+            panelfs::layout(root, false)?;
+        } else {
+            // Back on SQLite with the compose file it went back to, which may mount all of
+            // data/: it is not sealed, and the panel reads its database itself on start.
+            panelfs::own_dirs(root, true)?;
+        }
         docker::compose_run(&["up", "-d"])?;
         setup::wait_ready(Install::load()?.node_port(), Duration::from_secs(90))
     })();
+    // A full copy of the database with its secrets: the archive keeps it, data/panel not.
+    if items.iter().any(|(_, r)| *r == RESTORE_DUMP)
+        && let Some(panel) = Dir::open(root, "data/panel", false).ok().flatten()
+        && let Err(e) = panel.discard(panel_name(RESTORE_DUMP))
+    {
+        say(&format!("Remove {} by hand: {e:#}", root.join(RESTORE_DUMP).display()));
+    }
     if let Err(e) = started {
+        let _ = docker::compose_run(&["stop", "panel"]);
         return Err(e.context(format!(
             "the backup is in place but mikan does not start; the data before it are in {}: mikan restore {}",
             snap.display(),
             snap.display()
         )));
+    }
+    if !install.node {
+        crate::addon::resume()?;
     }
     Ok(())
 }
@@ -469,6 +657,26 @@ mod tests {
 
     // The secrets of the server are in the archive: nobody but root may see the file
     // while tar writes it, and the directory keeps the names private too.
+    #[test]
+    fn a_database_backup_puts_back_the_database_alone() {
+        let d = tmpdir("plan-db");
+        assert!(plan_database(&d).is_err(), "nothing in it");
+        file(&d, "data/panel/backup.dump", "PGDMP");
+        let items = plan_database(&d).unwrap();
+        assert_eq!(items.iter().map(|(_, r)| *r).collect::<Vec<_>>(), ["data/panel/restore.dump"]);
+        assert!(plan(&d).is_err(), "a database alone is not a full backup");
+        // Whatever else came along is not taken without the full restore.
+        file(&d, "data/node/state.json", "{}");
+        file(&d, "data/panel/tls/panel.key", "k");
+        assert_eq!(plan_database(&d).unwrap().len(), 1);
+        // A SQLite copy alone is not what the panel sends.
+        let e = tmpdir("plan-db-sqlite");
+        file(&e, "data/panel/backup.db", "db");
+        assert!(plan_database(&e).is_err());
+        fs::remove_dir_all(&d).unwrap();
+        fs::remove_dir_all(&e).unwrap();
+    }
+
     #[test]
     fn a_backup_is_private_from_its_first_byte() {
         let root = tmpdir("private");
@@ -496,6 +704,24 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    // The node's talk with the updater is no part of a backup: the pre-update backup is made
+    // while its status says "running", and a restore must not bring that back.
+    #[test]
+    fn a_backup_leaves_out_what_the_nodes_updater_and_panel_say() {
+        let root = tmpdir("node-update");
+        file(&root, ".env", "MIKAN_MODE=node\n");
+        file(&root, "data/node/state.json", "{}");
+        file(&root, "data/node/update/status.json", r#"{"state":"running"}"#);
+        file(&root, "data/node/update/request", r#"{"version":"0.5.0.2"}"#);
+        let dir = backups_dir(&root).unwrap();
+        let a = pack(&root, &dir, "mikan", &[".env".into(), "data/node".into()]).unwrap();
+        let listing = Command::new("tar").arg("-tzf").arg(&a).output().unwrap();
+        let names = String::from_utf8_lossy(&listing.stdout);
+        assert!(names.contains("data/node/state.json"), "{names}");
+        assert!(!names.contains("update"), "{names}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn automatic_backups_are_rotated_and_the_admins_stay() {
         let dir = tmpdir("prune");
@@ -504,16 +730,89 @@ mod tests {
         }
         fs::write(dir.join("mikan-20260101-000000.tar.gz"), "mine").unwrap();
         fs::write(dir.join("pre-restore-20260101-000000.tar.gz"), "snap").unwrap();
-        prune(&dir, "pre-update", KEEP_UPDATE);
+        // the original SQLite of the move to PostgreSQL, older than every retry after it
+        fs::write(dir.join("pre-postgres-20260101-000000.tar.gz"), "sqlite").unwrap();
+        prune(&dir, PRE_UPDATE);
+        prune(&dir, "mikan");
         let mut left: Vec<String> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(left.iter().filter(|n| n.starts_with("pre-update-")).count(), 5);
         assert!(left.contains(&"pre-update-20261008-000000.tar.gz".to_string()), "the newest stays");
         assert!(!left.contains(&"pre-update-20261001-000000.tar.gz".to_string()), "the oldest goes");
-        assert!(
-            left.contains(&"mikan-20260101-000000.tar.gz".to_string()) && left.contains(&"pre-restore-20260101-000000.tar.gz".to_string())
+        for kept in ["mikan-20260101-000000.tar.gz", "pre-restore-20260101-000000.tar.gz", "pre-postgres-20260101-000000.tar.gz"] {
+            assert!(left.contains(&kept.to_string()), "{kept}");
+        }
+        for n in 2..=5 {
+            fs::write(dir.join(format!("pre-postgres-2026010{n}-000000.tar.gz")), "x").unwrap();
+        }
+        prune(&dir, PRE_POSTGRES);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("pre-postgres-")).count(),
+            3
         );
+        assert!(dir.join("pre-postgres-20260105-000000.tar.gz").exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A panel's archive keeps this server's database credentials and image; a server back
+    // on SQLite keeps its compose file and refuses a PostgreSQL dump.
+    #[test]
+    fn an_archive_is_fitted_to_the_server_it_is_restored_on() {
+        let d = tmpdir("fit");
+        file(
+            &d,
+            ".env",
+            "MIKAN_DATABASE_URL=postgresql://mikan:old@localhost/mikan?host=/run/postgresql\nMIKAN_POSTGRES_PASSWORD=old\nMIKAN_IMAGE=archived\nPANEL_PORT=1\n",
+        );
+        file(&d, "compose.yaml", "archived compose");
+        file(&d, "data/panel/backup.dump", "pgdump");
+        let current = EnvFile::from_text(
+            "x",
+            "MIKAN_IMAGE=live\nMIKAN_VERSION=0.5.0.1\nMIKAN_POSTGRES_PASSWORD=live\nMIKAN_DATABASE_URL=postgresql://mikan:live@localhost/mikan?host=/run/postgresql\n",
+        );
+        let mut items = plan(&d).unwrap();
+        let mut archived = EnvFile::load(d.join(".env")).unwrap();
+        fit_to_panel(&mut items, &mut archived, &current).unwrap();
+        for key in ["MIKAN_IMAGE", "MIKAN_VERSION", "MIKAN_POSTGRES_PASSWORD", "MIKAN_DATABASE_URL"] {
+            assert_eq!(archived.get(key), current.get(key), "{key}");
+        }
+        assert_eq!(archived.get("PANEL_PORT"), Some("1"), "the settings are the archive's");
+        assert!(items.iter().any(|(_, r)| *r == "compose.yaml") && items.iter().any(|(_, r)| *r == RESTORE_DUMP));
+
+        // back on SQLite, with the password of a volume an update initialized
+        let sqlite = EnvFile::from_text("x", "MIKAN_IMAGE=old\nMIKAN_VERSION=0.4.4\nMIKAN_POSTGRES_PASSWORD=kept\n");
+        let mut archived = EnvFile::load(d.join(".env")).unwrap();
+        let err = fit_to_panel(&mut plan(&d).unwrap(), &mut archived, &sqlite).unwrap_err();
+        assert!(format!("{err}").contains("mikan update first"), "{err}");
+        fs::remove_file(d.join("data/panel/backup.dump")).unwrap();
+        file(&d, "data/panel/backup.db", "sqlite copy");
+        let mut items = plan(&d).unwrap();
+        let mut archived = EnvFile::load(d.join(".env")).unwrap();
+        fit_to_panel(&mut items, &mut archived, &sqlite).unwrap();
+        assert_eq!((archived.get("MIKAN_DATABASE_URL"), archived.get("MIKAN_POSTGRES_PASSWORD")), (None, Some("kept")));
+        assert_eq!(archived.get("MIKAN_IMAGE"), Some("old"));
+        assert!(!items.iter().any(|(_, r)| *r == "compose.yaml"), "its own compose file stays");
+        assert!(items.iter().any(|(_, r)| *r == SQLITE));
+        // no database at all
+        fs::remove_file(d.join("data/panel/backup.db")).unwrap();
+        assert!(fit_to_panel(&mut plan(&d).unwrap(), &mut EnvFile::load(d.join(".env")).unwrap(), &current).is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    // Without the dump of a server on PostgreSQL, neither a stale dump nor the SQLite of
+    // before the move goes in: a restore of the archive must not take them for the data.
+    #[test]
+    fn a_files_only_snapshot_holds_no_stale_database() {
+        let root = tmpdir("no-db");
+        server(&root);
+        file(&root, ".env", "MIKAN_DATABASE_URL=postgresql://mikan:p@localhost/mikan?host=/run/postgresql\n");
+        file(&root, DUMP, "interrupted dump");
+        let snap = archive_stopped(&root, PRE_RESTORE, false).unwrap();
+        let out = Command::new("tar").arg("-tzf").arg(&snap).output().unwrap();
+        let names = String::from_utf8_lossy(&out.stdout);
+        assert!(names.lines().any(|n| n == ".env") && names.lines().any(|n| n == "data/panel/tls/stale.key"), "{names}");
+        assert!(!names.lines().any(|n| n.starts_with("data/panel/mikan.db") || n == DUMP), "{names}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -535,7 +834,7 @@ mod tests {
             ("../etc/passwd", "outside"),
             ("data/../../etc/cron.d/x", "a way out inside"),
             ("etc/passwd", "somewhere else"),
-            ("data/addons/state.json", "the root's own"),
+            ("data/unknown/state.json", "unknown data"),
             ("data/panel/../../x", "nested dots"),
             ("evil", "a stranger"),
         ] {
@@ -596,6 +895,37 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    #[test]
+    fn postgres_archive_wins_over_preserved_sqlite_and_keeps_addons() {
+        let d = tmpdir("postgres-plan");
+        file(&d, ".env", "MIKAN_DATABASE_URL=postgresql://x\n");
+        file(&d, "data/panel/backup.dump", "pgdump");
+        file(&d, "data/panel/mikan.db", "old sqlite");
+        file(&d, "addons/state.json", "{}");
+        let items = plan(&d).unwrap();
+        let to: Vec<&str> = items.iter().map(|(_, r)| *r).collect();
+        assert!(to.contains(&"data/panel/restore.dump"));
+        assert!(!to.contains(&"data/panel/mikan.db"));
+        assert!(to.contains(&"addons/state.json"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn raw_sqlite_snapshots_restore_their_committed_wal() {
+        let root = tmpdir("wal-swap");
+        server(&root);
+        let stage = root.join("stage");
+        file(&stage, ".env", "RESTORED=1\n");
+        file(&stage, "data/panel/mikan.db", "checkpointed pages");
+        file(&stage, "data/panel/mikan.db-wal", "committed payment after checkpoint");
+        let items = plan(&stage).unwrap();
+        assert!(items.iter().any(|(_, to)| *to == "data/panel/mikan.db-wal"));
+        swap(&root, &items).unwrap();
+        assert_eq!(fs::read_to_string(root.join("data/panel/mikan.db-wal")).unwrap(), "committed payment after checkpoint");
+        assert_eq!(fs::read_to_string(root.join("data/panel/mikan.db")).unwrap(), "checkpointed pages");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn server(root: &Path) {
         file(root, ".env", "OLD=1\n");
         file(root, "compose.yaml", "old compose");
@@ -654,7 +984,7 @@ mod tests {
     fn a_snapshot_holds_the_current_data() {
         let root = tmpdir("snapshot");
         server(&root);
-        let snap = snapshot(&root).unwrap();
+        let snap = archive_stopped(&root, PRE_RESTORE, true).unwrap();
         assert!(snap.starts_with(root.join("backups")));
         let out = Command::new("tar").arg("-tzf").arg(&snap).output().unwrap();
         let names = String::from_utf8_lossy(&out.stdout);

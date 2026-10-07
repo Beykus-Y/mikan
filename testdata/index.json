@@ -1,0 +1,85 @@
+{
+  "_comment": "The release index as the panel (internal/release) and the installer (installer/src/release.rs) read it; both run this table, so the two cannot drift. decode: an index document (the exact text) and the versions of the entries a reader keeps, or error. choose: entries, then for a server of a version on a channel the release it updates to now (target, empty for none) and the newest release of its channels.",
+  "decode": [
+    {
+      "name": "unknown fields and a future rollout are ignored",
+      "doc": "{\"schema\":1,\"published\":\"2026-10-04T10:00:00Z\",\"mirror\":{\"x\":1},\"releases\":[{\"version\":\"0.5.0.0\",\"channel\":\"stable\",\"manifest\":\"https://github.com/Miroshka000/mikan/releases/download/v0.5.0.0/manifest.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.1\",\"channel\":\"stable\",\"manifest\":\"https://github.com/Miroshka000/mikan/releases/download/v0.5.0.1/manifest.json\",\"from\":\"0.4.5\",\"rollout\":25,\"size\":{\"x86_64\":1}}]}",
+      "versions": ["0.5.0.0", "0.5.0.1"]
+    },
+    {
+      "name": "entries a reader cannot use are skipped, never fatal",
+      "doc": "{\"schema\":1,\"releases\":[{\"version\":5,\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"v0.5.0.1\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.2\",\"channel\":\"nightly\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.3\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\"},{\"version\":\"0.5.0.4\",\"channel\":\"stable\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.5\",\"channel\":\"stable\",\"manifest\":\"http://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.6-rc.1\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"Version\":\"0.5.0.7\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},\"0.5.0.8\",null,{\"version\":\"0.5.0.9\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.6.0.0\"},{\"version\":\"0.5.0.10\",\"channel\":\"Stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.11\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":null},{\"version\":\"0.5.0.12\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.13-rc.1\",\"channel\":\"beta\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"},{\"version\":\"0.5.0.14\",\"channel\":\"beta\",\"manifest\":\"https://x/m.json\",\"from\":\"0.5.0.14\"}]}",
+      "versions": ["0.5.0.12", "0.5.0.13-rc.1", "0.5.0.14"]
+    },
+    {
+      "name": "the last of a repeated key wins",
+      "doc": "{\"releases\":[{\"version\":\"0.1.0\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.0.1\",\"version\":\"0.5.0.1\"}],\"releases\":[{\"version\":\"0.5.0.2\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"}]}",
+      "versions": ["0.5.0.2"]
+    },
+    {
+      "name": "a schema or a date this reader cannot read costs nothing",
+      "doc": "{\"schema\":\"two\",\"published\":5,\"releases\":[{\"version\":\"0.5.0.1\",\"channel\":\"stable\",\"manifest\":\"https://x/m.json\",\"from\":\"0.4.5\"}]}",
+      "versions": ["0.5.0.1"]
+    },
+    {"name": "an empty list", "doc": "{\"schema\":1,\"releases\":[]}", "versions": []},
+    {"name": "no list of releases", "doc": "{\"schema\":1}", "error": true},
+    {"name": "a null list", "doc": "{\"schema\":1,\"releases\":null}", "error": true},
+    {"name": "releases that are no list", "doc": "{\"schema\":1,\"releases\":{\"0.5.0.1\":{}}}", "error": true},
+    {"name": "not an object", "doc": "[{\"version\":\"0.5.0.1\"}]", "error": true},
+    {"name": "not JSON", "doc": "{\"releases\":[", "error": true},
+    {"name": "trailing data", "doc": "{\"releases\":[]} {}", "error": true}
+  ],
+  "choose": [
+    {
+      "releases": [
+        {"version": "0.4.5", "channel": "stable", "manifest": "https://github.com/Miroshka000/mikan/releases/download/v0.4.5/manifest.json", "from": "0.4.0"},
+        {"version": "0.5.0.0", "channel": "stable", "manifest": "https://github.com/Miroshka000/mikan/releases/download/v0.5.0.0/manifest.json", "from": "0.4.5"},
+        {"version": "0.5.0.1", "channel": "stable", "manifest": "https://github.com/Miroshka000/mikan/releases/download/v0.5.0.1/manifest.json", "from": "0.4.5"},
+        {"version": "0.5.0.2-rc.1", "channel": "beta", "manifest": "https://github.com/Miroshka000/mikan/releases/download/v0.5.0.2-rc.1/manifest.json", "from": "0.5.0.0"},
+        {"version": "0.6.0.0", "channel": "stable", "manifest": "https://github.com/Miroshka000/mikan/releases/download/v0.6.0.0/manifest.json", "from": "0.5.0.1"}
+      ],
+      "cases": [
+        {"current": "0.4.4", "beta": false, "target": "0.4.5", "newest": "0.6.0.0"},
+        {"current": "0.4.0", "beta": false, "target": "0.4.5", "newest": "0.6.0.0"},
+        {"current": "0.3.9", "beta": false, "target": "", "newest": "0.6.0.0"},
+        {"current": "0.4.5", "beta": false, "target": "0.5.0.1", "newest": "0.6.0.0"},
+        {"current": "0.4.5", "beta": true, "target": "0.5.0.1", "newest": "0.6.0.0"},
+        {"current": "0.5.0.0", "beta": false, "target": "0.5.0.1", "newest": "0.6.0.0"},
+        {"current": "0.5.0.0", "beta": true, "target": "0.5.0.2-rc.1", "newest": "0.6.0.0"},
+        {"current": "0.5.0.1", "beta": false, "target": "0.6.0.0", "newest": "0.6.0.0"},
+        {"current": "0.5.0.1", "beta": true, "target": "0.6.0.0", "newest": "0.6.0.0"},
+        {"current": "0.5.0.2-rc.1", "beta": false, "target": "0.6.0.0", "newest": "0.6.0.0"},
+        {"current": "0.6.0.0", "beta": false, "target": "", "newest": "0.6.0.0"},
+        {"current": "0.7.0.0", "beta": true, "target": "", "newest": "0.6.0.0"},
+        {"current": "", "beta": false, "target": "0.6.0.0", "newest": "0.6.0.0"},
+        {"current": "dev", "beta": false, "target": "0.6.0.0", "newest": "0.6.0.0"},
+        {"current": "unknown", "beta": true, "target": "0.6.0.0", "newest": "0.6.0.0"}
+      ]
+    },
+    {
+      "releases": [
+        {"version": "0.5.0.1", "channel": "stable", "manifest": "https://x/first.json", "from": "0.4.5"},
+        {"version": "0.5.0.1", "channel": "stable", "manifest": "https://x/second.json", "from": "0.4.5"},
+        {"version": "9.9.9", "channel": "nightly", "manifest": "https://x/m.json", "from": "0.0.1"},
+        {"version": "9.9.8-rc.1", "channel": "stable", "manifest": "https://x/m.json", "from": "0.0.1"},
+        {"version": "9.9.7", "channel": "stable", "manifest": "https://x/m.json", "from": "9.9.8"},
+        {"version": "0.5.0.3", "channel": "beta", "manifest": "https://x/beta.json", "from": "0.5.0.1"},
+        {"version": "0.5.0.2-rc.2", "channel": "beta", "manifest": "https://x/rc2.json", "from": "0.4.5"}
+      ],
+      "cases": [
+        {"current": "0.4.5", "beta": false, "target": "0.5.0.1", "newest": "0.5.0.1", "manifest": "https://x/first.json"},
+        {"current": "0.5.0.1", "beta": false, "target": "", "newest": "0.5.0.1"},
+        {"current": "0.4.5", "beta": true, "target": "0.5.0.2-rc.2", "newest": "0.5.0.3", "manifest": "https://x/rc2.json"},
+        {"current": "0.5.0.1", "beta": true, "target": "0.5.0.3", "newest": "0.5.0.3", "manifest": "https://x/beta.json"},
+        {"current": "0.5.0.2-rc.2", "beta": true, "target": "0.5.0.3", "newest": "0.5.0.3"}
+      ]
+    },
+    {
+      "releases": [],
+      "cases": [
+        {"current": "0.4.5", "beta": true, "target": "", "newest": ""},
+        {"current": "", "beta": false, "target": "", "newest": ""}
+      ]
+    }
+  ]
+}

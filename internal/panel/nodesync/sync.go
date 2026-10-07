@@ -13,6 +13,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +57,9 @@ type Syncer struct {
 	stateKey    string
 	policyKey   string
 	lastApplied nodeapi.ApplyResult
+	// ports are the inbounds' ports in the state of lastApplied, by name; replaced, never
+	// changed in place: health views share it.
+	ports       map[string]string
 	lastPush    time.Time // when the policies last reached the node
 	failedKey   string    // the state key the last failed Apply was for
 	retry       retry     // the pace of attempts at a node that does not answer
@@ -76,7 +80,21 @@ type HealthView struct {
 	Error     string
 	Health    nodeapi.Health
 	Listeners []nodeapi.ListenerStatus
+	// Ports are the listeners' ports in the state the node runs, by name (the relay's too,
+	// as nodeapi.RelayListener), when that is the state this panel last applied; nil
+	// otherwise. A listener's failure is about this port, not about the row's, which may
+	// have moved since.
+	Ports     map[string]string
 	CheckedAt time.Time
+}
+
+// HostPorts is what the node reported as listening on its server in this check; nil when
+// the node did not answer or does not say.
+func (v HealthView) HostPorts() *nodeapi.HostPorts {
+	if !v.OK {
+		return nil
+	}
+	return v.Health.Host
 }
 
 func newSyncer(m *Manager, id int64, t Target) *Syncer {
@@ -109,10 +127,14 @@ func (s *Syncer) Online() map[string]nodeapi.Online { return *s.online.Load() }
 func (s *Syncer) run(ctx context.Context) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		every(ctx, 2*time.Second, s.pullCounters)
+	}()
+	go func() {
+		defer wg.Done()
+		every(ctx, torrentPullEvery, s.pullTorrents)
 	}()
 	go func() {
 		defer wg.Done()
@@ -162,10 +184,11 @@ func (s *Syncer) desired(ctx context.Context) (nodeapi.DesiredState, error) {
 	if err != nil {
 		return st, err
 	}
-	inbounds, err := q.ListInbounds(ctx)
+	snap, err := s.m.snapshot(ctx, s.id)
 	if err != nil {
 		return st, err
 	}
+	inbounds := snap.inbounds
 	st.Inbounds = []nodeapi.Inbound{}
 	if st.Warp, err = s.warp(ctx, n, inbounds); err != nil {
 		return st, err
@@ -204,18 +227,15 @@ func (s *Syncer) desired(ctx context.Context) (nodeapi.DesiredState, error) {
 		st.Inbounds = append(st.Inbounds, ni)
 	}
 	s.noteBadInbounds(bad)
-	slots, err := q.ListSlots(ctx)
-	if err != nil {
-		return st, err
-	}
-	for _, sl := range slots {
+	for _, sl := range snap.slots {
 		st.Slots = append(st.Slots, nodeapi.Slot{Name: sl.Name, UUID: sl.Uuid, Secret: sl.Secret})
 	}
 	if st.TLS, err = s.tls(); err != nil {
 		return st, err
 	}
-	st.Epoch, st.Policies, _, err = s.policies(ctx)
-	return st, err
+	st.Torrent = snap.torrent.Block()
+	st.Epoch, st.Policies, _ = s.policiesFrom(snap)
+	return st, nil
 }
 
 func (s *Syncer) applyState(ctx context.Context) {
@@ -264,11 +284,19 @@ func (s *Syncer) applyState(ctx context.Context) {
 			s.log.Error("listener failed", "name", l.Name, "err", l.Error)
 		}
 	}
+	ports := make(map[string]string, len(st.Inbounds)+1)
+	for _, in := range st.Inbounds {
+		ports[in.Name] = in.Port
+	}
+	if st.Relay != nil {
+		ports[nodeapi.RelayListener] = st.Relay.Port
+	}
 	s.mu.Lock()
 	s.stateKey = key
 	s.policyKey = policyKey(st.Policies)
 	s.lastPush = now
 	s.lastApplied = res
+	s.ports = ports
 	s.failedKey = ""
 	recovered := s.retry.ok()
 	s.mu.Unlock()
@@ -348,60 +376,73 @@ func (s *Syncer) sendPolicies(ctx context.Context, epoch string, ps []nodeapi.Po
 // has the own slot and one per bound device: all of them get the user's rules, and the
 // device limit counts the user's devices under all of them.
 func (s *Syncer) policies(ctx context.Context) (epoch string, out []nodeapi.Policy, slotUser map[string]int64, err error) {
-	q := s.m.st.Q
-	epoch, seq, err := s.countersPos(ctx)
+	snap, err := s.m.snapshot(ctx, s.id)
 	if err != nil {
 		return "", nil, nil, err
 	}
-	users, err := q.ListUsers(ctx)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	owners, err := q.ListSlotUsers(ctx)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	inbounds, err := q.ListInbounds(ctx)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	slotUser = make(map[string]int64, len(owners))
+	epoch, out, slotUser = s.policiesFrom(snap)
+	return epoch, out, slotUser, nil
+}
+
+// policiesFrom builds the policies from one snapshot: the quotas refer to the counters
+// position read with them.
+func (s *Syncer) policiesFrom(snap *snapshot) (epoch string, out []nodeapi.Policy, slotUser map[string]int64) {
+	pos := snap.counters[s.id]
+	epoch, seq := pos.epoch, pos.seq
+	slotUser = make(map[string]int64, len(snap.owners))
 	slotsOf := map[int64][]string{}
-	for _, o := range owners {
+	for _, o := range snap.owners {
 		slotUser[o.SlotName] = o.UserID
 		slotsOf[o.UserID] = append(slotsOf[o.UserID], o.SlotName)
 	}
 	here := map[int64]string{}
-	for _, in := range inbounds {
+	inPool := map[int64][]int64{} // pool → its inbounds on this node
+	for _, in := range snap.inbounds {
 		if in.NodeID == s.id {
 			here[in.ID] = in.Name
+			if in.PoolID.Valid {
+				inPool[in.PoolID.Int64] = append(inPool[in.PoolID.Int64], in.ID)
+			}
+		}
+	}
+	// The inbounds here each user's tariff leaves out, through the pools they are in.
+	shut := map[int64]map[int64]bool{}
+	for _, up := range snap.pools {
+		if !up.Excluded {
+			continue
+		}
+		for _, id := range inPool[up.PoolID] {
+			if shut[up.UserID] == nil {
+				shut[up.UserID] = map[int64]bool{}
+			}
+			shut[up.UserID][id] = true
 		}
 	}
 	others := s.m.otherIPs(s.id, slotUser)
 	now := s.m.now()
-	grants, err := domain.LoadGrantsLeft(ctx, q, now)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	pools, err := userPoolQuotas(ctx, q, grants)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	for _, u := range users {
+	grants := snap.grants
+	pools := userPoolQuotas(snap.pools, grants)
+	for _, u := range snap.users {
 		names := slotsOf[u.ID]
 		sort.Strings(names)
 		for _, name := range names {
-			p := userPolicy(u, grants.Main(u.ID), name, seq, now, here, others[name])
+			p := userPolicy(u, grants.Main(u.ID), name, seq, now, here, shut[u.ID], others[name])
 			p.Pools = pools[u.ID]
+			p.TorrentExempt = snap.torrent.IsExempt(u.ID)
+			if !p.TorrentExempt {
+				// A user added to the exemptions after a catch is let in at once.
+				p.BannedUntil = snap.bans[u.ID]
+			}
 			out = append(out, p)
 		}
 	}
-	return epoch, out, slotUser, nil
+	return epoch, out, slotUser
 }
 
 // userPolicy is the user's rules for one of the user's slots; grants is what is left of
-// the user's main grants, added to the quota.
-func userPolicy(u db.User, grants int64, name string, seq int64, now time.Time, here map[int64]string, otherIPs []string) nodeapi.Policy {
+// the user's main grants, added to the quota, and shut the inbounds here the user's tariff
+// leaves out (an excluded pool).
+func userPolicy(u db.User, grants int64, name string, seq int64, now time.Time, here map[int64]string, shut map[int64]bool, otherIPs []string) nodeapi.Policy {
 	// A user whose main traffic ran out still gets in: the node turns away the inbounds
 	// outside every pool (QuotaRemaining 0) and keeps the pools that have traffic left.
 	state := domain.State(u, grants, now)
@@ -410,9 +451,17 @@ func userPolicy(u db.User, grants int64, name string, seq int64, now time.Time, 
 	if u.DeviceLimit.Valid {
 		p.DeviceLimit = int(u.DeviceLimit.Int64)
 	}
-	if allowed := domain.DecodeInbounds(u.Inbounds); len(allowed) > 0 {
+	allowed := domain.DecodeInbounds(u.Inbounds)
+	if len(allowed) == 0 && len(shut) > 0 {
+		// "All" but the excluded: the list is spelled out.
+		for id := range here {
+			allowed = append(allowed, id)
+		}
+		slices.Sort(allowed)
+	}
+	if len(allowed) > 0 {
 		for _, id := range allowed {
-			if n, ok := here[id]; ok {
+			if n, ok := here[id]; ok && !shut[id] {
 				p.Inbounds = append(p.Inbounds, n)
 			}
 		}
@@ -459,9 +508,19 @@ func (s *Syncer) pullCounters(ctx context.Context) {
 	}
 	now := s.m.now()
 	c = s.vet(c, now)
-	hour, day := now.Unix()/3600, now.Unix()/86400
-	err = s.m.st.Tx(ctx, func(q *db.Queries) error {
-		rows, err := q.ListSlotUsers(ctx)
+	names := make([]string, 0, len(c.Slots)+len(c.Pools))
+	for slot := range c.Slots {
+		names = append(names, slot)
+	}
+	for slot := range c.Pools {
+		if _, ok := c.Slots[slot]; !ok {
+			names = append(names, slot)
+		}
+	}
+	// See domain.CountTraffic for why READ COMMITTED is enough: batches of different nodes
+	// take turns on the users' rows instead of aborting each other.
+	err = s.m.st.TxRC(ctx, func(q *db.Queries) error {
+		rows, err := q.SlotOwners(ctx, names)
 		if err != nil {
 			return err
 		}
@@ -469,35 +528,17 @@ func (s *Syncer) pullCounters(ctx context.Context) {
 		for _, r := range rows {
 			owner[r.SlotName] = r.UserID
 		}
+		// Slots of the same user add up. Traffic past the base quota is taken from the
+		// grants on the batch's transaction: a batch delivered again is skipped above,
+		// grants included.
+		b := domain.TrafficBatch{Main: map[int64]domain.Bytes{}, Pools: map[[2]int64]domain.Bytes{}}
 		for slot, t := range c.Slots {
-			uid, ok := owner[slot]
-			if !ok {
-				continue
-			}
-			// Traffic past the base quota is taken from the grants here, on the batch's
-			// transaction: a batch delivered again is skipped above, grants included.
-			if err := domain.CountUserTraffic(ctx, q, uid, t.Up, t.Down, now); err != nil {
-				return err
-			}
-			if err := q.AddTrafficHourly(ctx, db.AddTrafficHourlyParams{UserID: uid, Hour: hour, Up: t.Up, Down: t.Down}); err != nil {
-				return err
-			}
-			if err := q.AddTrafficDaily(ctx, db.AddTrafficDailyParams{UserID: uid, Day: day, Up: t.Up, Down: t.Down}); err != nil {
-				return err
+			if uid, ok := owner[slot]; ok {
+				cur := b.Main[uid]
+				b.Main[uid] = domain.Bytes{Up: cur.Up + t.Up, Down: cur.Down + t.Down}
 			}
 		}
 		// Pool traffic counts to the pool, not to the main quota; the statistics take all.
-		// A pool deleted meanwhile is skipped: the batch must still go through.
-		known := map[int64]bool{}
-		if len(c.Pools) > 0 {
-			ps, err := q.ListTrafficPools(ctx)
-			if err != nil {
-				return err
-			}
-			for _, p := range ps {
-				known[p.ID] = true
-			}
-		}
 		for slot, pools := range c.Pools {
 			uid, ok := owner[slot]
 			if !ok {
@@ -505,25 +546,16 @@ func (s *Syncer) pullCounters(ctx context.Context) {
 			}
 			for pool, t := range pools {
 				id, err := strconv.ParseInt(pool, 10, 64)
-				if err == nil && !known[id] {
-					continue
-				}
 				if err != nil {
 					continue
 				}
-				if err := q.AddUserTotalTraffic(ctx, db.AddUserTotalTrafficParams{Up: t.Up, Down: t.Down, ID: uid}); err != nil {
-					return err
-				}
-				if err := domain.CountPoolTraffic(ctx, q, uid, id, t.Up, t.Down, now); err != nil {
-					return err
-				}
-				if err := q.AddTrafficHourly(ctx, db.AddTrafficHourlyParams{UserID: uid, Hour: hour, Up: t.Up, Down: t.Down}); err != nil {
-					return err
-				}
-				if err := q.AddTrafficDaily(ctx, db.AddTrafficDailyParams{UserID: uid, Day: day, Up: t.Up, Down: t.Down}); err != nil {
-					return err
-				}
+				k := [2]int64{uid, id}
+				cur := b.Pools[k]
+				b.Pools[k] = domain.Bytes{Up: cur.Up + t.Up, Down: cur.Down + t.Down}
 			}
+		}
+		if err := domain.CountTraffic(ctx, q, b, now); err != nil {
+			return err
 		}
 		if err := q.SetNodeState(ctx, db.SetNodeStateParams{Key: stateKeyOf("counters_epoch", s.id), Value: c.Epoch}); err != nil {
 			return err
@@ -535,6 +567,7 @@ func (s *Syncer) pullCounters(ctx context.Context) {
 		return
 	}
 	s.lastStored = now
+	s.m.noteBatch(s.id)
 	// An idle reply has no batch behind it: there is nothing for the node to drop, and it
 	// would answer the acknowledgement with stale_ack.
 	if !c.Idle {
@@ -641,9 +674,12 @@ func (s *Syncer) refreshHealth(ctx context.Context) {
 		return
 	}
 	view.OK, view.Health, view.Listeners = true, h, h.Listeners
-	s.health.Store(view)
 	s.mu.Lock()
 	applied := s.lastApplied.Revision
+	if applied != 0 && h.Revision == applied {
+		view.Ports = s.ports
+	}
+	s.health.Store(view)
 	// The node is back: what was held off for it goes out now.
 	back := s.retry.down
 	if back {
@@ -672,7 +708,8 @@ func stateKey(st nodeapi.DesiredState) string {
 		W *nodeapi.Warp
 		R *nodeapi.Relay
 		E []nodeapi.Exit
-	}{st.Inbounds, st.Slots, st.TLS, st.SelfStealPort, st.Warp, st.Relay, st.Exits})
+		B *nodeapi.TorrentBlock
+	}{st.Inbounds, st.Slots, st.TLS, st.SelfStealPort, st.Warp, st.Relay, st.Exits, st.Torrent})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -682,7 +719,8 @@ func stateKey(st nodeapi.DesiredState) string {
 func policyKey(ps []nodeapi.Policy) string {
 	h := sha256.New()
 	for _, p := range ps {
-		raw, _ := json.Marshal([]any{p.Slot, p.Allowed, p.Inbounds, p.DeviceLimit, p.QuotaRemaining < 0, p.OtherIPs, poolKey(p.Pools)})
+		raw, _ := json.Marshal([]any{p.Slot, p.Allowed, p.Inbounds, p.DeviceLimit, p.QuotaRemaining < 0, p.OtherIPs, poolKey(p.Pools),
+			p.TorrentExempt, p.BannedUntil})
 		h.Write(raw)
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -719,19 +757,20 @@ func (s *Syncer) warp(ctx context.Context, n db.Node, inbounds []db.Inbound) (*n
 	return out, nil
 }
 
-// Warp asks the node how it reaches the internet through WARP.
-func (m *Manager) Warp(ctx context.Context, id int64) (nodeapi.WarpStatus, error) {
+// Warp asks the node how it reaches the internet through WARP; force skips the node's
+// minute-old answer.
+func (m *Manager) Warp(ctx context.Context, id int64, force bool) (nodeapi.WarpStatus, error) {
 	s, ok := m.Syncer(id)
 	if !ok {
 		return nodeapi.WarpStatus{}, nodeapi.ErrUnavailable
 	}
 	c, ok := s.node.(interface {
-		Warp(ctx context.Context) (nodeapi.WarpStatus, error)
+		Warp(ctx context.Context, force bool) (nodeapi.WarpStatus, error)
 	})
 	if !ok {
 		return nodeapi.WarpStatus{}, nodeapi.ErrUnavailable
 	}
-	return c.Warp(ctx)
+	return c.Warp(ctx, force)
 }
 
 // cascade is the node's part in cascades: its relay listener when other nodes leave
@@ -880,11 +919,7 @@ func (m *Manager) Tunnel(ctx context.Context, id int64, addr string) (net.Conn, 
 
 // userPoolQuotas are the users' pool quotas with a limit: what is left of each, with the
 // pool's grants.
-func userPoolQuotas(ctx context.Context, q *db.Queries, grants domain.GrantsLeft) (map[int64][]nodeapi.PoolQuota, error) {
-	rows, err := q.ListAllUserPools(ctx)
-	if err != nil {
-		return nil, err
-	}
+func userPoolQuotas(rows []db.UserPool, grants domain.GrantsLeft) map[int64][]nodeapi.PoolQuota {
 	out := map[int64][]nodeapi.PoolQuota{}
 	for _, p := range rows {
 		if !p.TrafficLimit.Valid {
@@ -893,7 +928,7 @@ func userPoolQuotas(ctx context.Context, q *db.Queries, grants domain.GrantsLeft
 		left := domain.TrafficLeft(p.TrafficLimit, p.UsedUp+p.UsedDown, grants.Pool(p.UserID, p.PoolID))
 		out[p.UserID] = append(out[p.UserID], nodeapi.PoolQuota{Pool: strconv.FormatInt(p.PoolID, 10), Remaining: left})
 	}
-	return out, nil
+	return out
 }
 
 // poolKey: which pools have a quota, not how much is left (the node counts that down).

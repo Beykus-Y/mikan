@@ -1,38 +1,38 @@
 -- name: GetBoundDevice :one
-SELECT * FROM bound_devices WHERE user_id = ? AND hwid = ?;
+SELECT * FROM bound_devices WHERE user_id = $1 AND hwid = $2;
 
 -- name: GetBoundDeviceByID :one
-SELECT * FROM bound_devices WHERE id = ? AND user_id = ?;
+SELECT * FROM bound_devices WHERE id = $1 AND user_id = $2;
 
 -- name: ListBoundDevices :many
-SELECT * FROM bound_devices WHERE user_id = ? ORDER BY created_at, id;
+SELECT * FROM bound_devices WHERE user_id = $1 ORDER BY created_at, id;
 
 -- name: ListIdleBoundDevices :many
-SELECT * FROM bound_devices WHERE last_seen < ?;
+SELECT * FROM bound_devices WHERE last_seen < $1;
 
 -- name: CountBoundDevices :one
-SELECT count(*) FROM bound_devices WHERE user_id = ?;
+SELECT count(*) FROM bound_devices WHERE user_id = $1;
 
 -- name: CreateBoundDevice :one
 INSERT INTO bound_devices (user_id, hwid, slot_id, os, os_version, model, app, last_ip, created_at, last_seen)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
 
 -- name: TouchBoundDevice :exec
-UPDATE bound_devices SET os = ?, os_version = ?, model = ?, app = ?, last_ip = ?, last_seen = ? WHERE id = ?;
+UPDATE bound_devices SET os = $1, os_version = $2, model = $3, app = $4, last_ip = $5, last_seen = $6 WHERE id = $7;
 
 -- name: DeleteBoundDevice :exec
-DELETE FROM bound_devices WHERE id = ?;
+DELETE FROM bound_devices WHERE id = $1;
 
 -- name: DeleteBoundDevicesOf :exec
-DELETE FROM bound_devices WHERE user_id = ?;
+DELETE FROM bound_devices WHERE user_id = $1;
 
 -- name: SetUserSlot :exec
 -- A new own slot for the user, same subscription link (the shared device was unbound).
-UPDATE users SET slot_id = ?, updated_at = ? WHERE id = ?;
+UPDATE users SET slot_id = $1, updated_at = $2 WHERE id = $3;
 
 -- name: SetUserUnboundAt :exec
-UPDATE users SET unbound_at = ? WHERE id = ?;
+UPDATE users SET unbound_at = $1 WHERE id = $2;
 
 -- name: ListDeviceSlots :many
 -- Slots of bound devices with an id: keys of their own, profile fetches of their own.

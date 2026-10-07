@@ -110,6 +110,7 @@ function Body({ nodeId, c, refetch, checking }: { nodeId: number; c: Cascade; re
             ? t("cascade.sources", { list: c.relay.sources.map((s) => s.name || name(s.node_id)).join(", "), port: c.relay.port })
             : t("cascade.sourcesNone")}
         </p>
+        {c.relay ? <RelayListener relay={c.relay} /> : null}
         {save.error && !Object.keys(fields).length ? <div className="banner err mb-4">{errorText(save.error)}</div> : null}
         <Field label={t("cascade.route")} hint={t(`cascade.routeHint.${route}`)} error={fields.exit_node_id}>
           <Segmented
@@ -142,5 +143,25 @@ function Body({ nodeId, c, refetch, checking }: { nodeId: number; c: Cascade; re
         </Button>
       </section>
     </>
+  );
+}
+
+// The relay's listener on the node. A port another program holds keeps it from starting,
+// and the nodes that leave through it then reach that program instead.
+function RelayListener({ relay }: { relay: NonNullable<Cascade["relay"]> }) {
+  const state = relay.listener;
+  if (state === "unknown") return null;
+  return (
+    <div className="mb-3">
+      <Pill tone={state === "ok" ? "ok" : "bad"}>{t(`cascade.listener.${state}`, { port: relay.port })}</Pill>
+      {state === "ok" ? null : (
+        <div className="banner err mt-2" role="alert">
+          <div>
+            {t(state === "busy" ? "cascade.listener.busyText" : "cascade.listener.failedText", { port: relay.port })}
+            {relay.error ? <div className="mt-1 break-all font-mono text-xs opacity-80">{relay.error}</div> : null}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

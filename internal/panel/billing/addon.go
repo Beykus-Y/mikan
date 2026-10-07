@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"mikan/internal/panel/addons"
+	"mikan/internal/panel/promo"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store/db"
 )
@@ -189,6 +191,27 @@ func (s *Service) addonClient(ctx context.Context, id string) (*addons.Client, A
 	return cl, c, err
 }
 
+// Discounted payments can arrive after their promo reservation expires. Accept them only
+// from providers that advertise refunds, so Mikan can return money without issuing service
+// for a discount that is no longer reserved.
+func (s *Service) validatePromoProvider(ctx context.Context, provider string) error {
+	if provider == Stars {
+		return nil
+	}
+	id := AddonID(provider)
+	if id == "" || s.d.Addons == nil {
+		return promo.ErrRefundUnsupported
+	}
+	info, err := s.d.Addons.Info(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !info.Can("refund") {
+		return promo.ErrRefundUnsupported
+	}
+	return nil
+}
+
 // AddonName is the adapter's own name for buyers in lang; its id while it does not answer.
 func (s *Service) AddonName(ctx context.Context, id, lang string) string {
 	if s.d.Addons != nil {
@@ -284,10 +307,36 @@ func (s *Service) checkAddon(ctx context.Context, provider, ext string) error {
 			s.d.Log.Error("billing: adapter amount differs", "payment", pay.ID, "provider", provider, "amount", st.Amount, "currency", st.Currency)
 			return ErrBadPayment
 		}
+		if s.d.Promo != nil {
+			r, redemptionErr := s.d.Promo.GetPaymentRedemption(ctx, pay.ID)
+			late := redemptionErr == nil && latePromoPayment(r, paymentTime(pay, s.d.Now().Unix()))
+			if late {
+				handled, err := s.refundLatePromoPayment(ctx, pay.ID, ext, func(current db.Payment) error {
+					// This invoice already contains the discounted amount. The stable key
+					// makes adapter retries idempotent.
+					return cl.Refund(ctx, cfg.Values, ext, current.Amount, "mikan-promo-late-"+strconv.FormatInt(current.ID, 10))
+				})
+				if err != nil {
+					return fmt.Errorf("refund expired promo payment %d: %w", pay.ID, err)
+				}
+				if handled {
+					return nil
+				}
+			}
+			if redemptionErr != nil && !errors.Is(redemptionErr, sql.ErrNoRows) {
+				return redemptionErr
+			}
+		}
 		return s.paid(ctx, pay, ext)
 	case "canceled":
 		_, err := s.d.Store.Q.SetPaymentStatus(ctx, db.SetPaymentStatusParams{NewStatus: "failed", ID: pay.ID, OldStatus: "pending"})
-		return err
+		if err != nil {
+			return err
+		}
+		if s.d.Promo != nil && (pay.Status == "pending" || pay.Status == "expired" || pay.Status == "failed") {
+			return s.d.Promo.ReleasePayment(ctx, pay.ID)
+		}
+		return nil
 	}
 	return nil
 }

@@ -78,7 +78,7 @@ type AutoEvent struct {
 	Kind   string    `json:"kind" enum:"port,sni"`
 	Old    string    `json:"old"`
 	New    string    `json:"new"`
-	Reason string    `json:"reason" enum:"blocked,target_down,still_blocked"`
+	Reason string    `json:"reason" enum:"blocked,target_down,still_blocked,busy"`
 	At     time.Time `json:"at"`
 }
 
@@ -109,7 +109,7 @@ type patchInboundInput struct {
 		Listen      *string         `json:"listen,omitempty" maxLength:"64" doc:"Адрес, на котором нода слушает: пусто — все адреса, иначе один IP (127.0.0.1 — за nginx или HAProxy на том же сервере). Свой адрес выключает перенос порта"`
 		Client      *ClientEndpoint `json:"client,omitempty" doc:"Куда подключаются клиенты: адрес, порт и SNI прокси перед нодой; заменяет все три"`
 		AutoPort    *bool           `json:"auto_port,omitempty" doc:"Нельзя включить, пока у подключения свой адрес (listen)"`
-		AutoSNI     *bool           `json:"auto_sni,omitempty"`
+		AutoSNI     *bool           `json:"auto_sni,omitempty" doc:"Нельзя включить, пока у подключения свой адрес (listen)"`
 		Outbound    *string         `json:"outbound,omitempty" enum:"direct,warp,node" doc:"Выход в интернет: напрямую, через WARP ноды или через другую ноду"`
 		ExitNodeID  *int64          `json:"exit_node_id,omitempty" minimum:"1" doc:"Для outbound=node: через какую ноду"`
 		PoolID      *int64          `json:"pool_id,omitempty" minimum:"0" doc:"Пул трафика; 0 — основной трафик"`
@@ -340,6 +340,8 @@ func inboundError(err error, dest bool) error {
 		return huma.Error422UnprocessableEntity("bad_listen", &huma.ErrorDetail{Location: "body.listen", Message: "bad_listen"})
 	case errors.Is(err, domain.ErrAutoPortListen):
 		return huma.Error422UnprocessableEntity("auto_port_listen", &huma.ErrorDetail{Location: "body.auto_port", Message: "auto_port_listen"})
+	case errors.Is(err, domain.ErrAutoSNIListen):
+		return huma.Error422UnprocessableEntity("auto_sni_listen", &huma.ErrorDetail{Location: "body.auto_sni", Message: "auto_sni_listen"})
 	case errors.Is(err, domain.ErrInboundChanged):
 		return huma.Error409Conflict("inbound_changed")
 	case errors.Is(err, domain.ErrUnknownPool):

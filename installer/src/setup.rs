@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::envfile::{EnvFile, write_private};
 use crate::lock::{self, Wait};
 use crate::system::{self, Proto};
-use crate::{DIR, docker, host, panelfs, release};
+use crate::{DIR, acme, docker, host, panelfs, release};
 
 /// Present from the first file written until the last step is done: a server with it and
 /// a .env is an install that stopped half way, and `mikan install` continues it.
@@ -49,6 +49,10 @@ pub struct Options {
     /// Leave the kernel settings alone (BBR, UDP buffers)
     #[arg(long)]
     pub no_tune: bool,
+    /// With a domain and nginx or Caddy on port 80: leave their config alone and print the
+    /// rule for Let's Encrypt instead (with --yes it is added, tested and reloaded)
+    #[arg(long)]
+    pub no_proxy_rule: bool,
     /// Install a node of another panel with the key from its Nodes page. The key holds the
     /// node's private key: MIKAN_JOIN_KEY keeps it out of the process list.
     #[arg(long, value_name = "KEY", env = "MIKAN_JOIN_KEY", hide_env_values = true)]
@@ -90,6 +94,8 @@ pub struct Plan {
     pub image_tar: Option<String>,
     /// The admin agreed to replace a Docker without compose v2.
     pub replace_docker: bool,
+    /// The admin agreed to a rule for Let's Encrypt in the nginx or Caddy on port 80.
+    pub proxy_rule: bool,
     /// An earlier install stopped half way and this one continues it: .env says what it
     /// was, and what is running is not in the way.
     pub resume: bool,
@@ -115,6 +121,8 @@ impl Plan {
             image: o.image.clone(),
             image_tar: o.image_tar.clone(),
             replace_docker: o.replace_docker,
+            // Asked in the installer; --yes agrees to it, nothing else does.
+            proxy_rule: o.yes && !o.no_proxy_rule,
             resume: false,
         }
     }
@@ -225,6 +233,34 @@ pub struct Outcome {
     pub url: String,
     pub login: String,
     pub password: String,
+    /// A domain whose port 80 something else holds: what became of Let's Encrypt.
+    pub acme: Option<acme::Report>,
+}
+
+/// Port 80 of a panel with a domain, when something else holds it.
+enum Port80 {
+    /// nginx or Caddy, and the local port the panel answers Let's Encrypt on behind it.
+    Front(acme::Front, u16),
+    Other(String),
+}
+
+fn port80(plan: &Plan) -> Option<Port80> {
+    if plan.node() || plan.domain.is_empty() {
+        return None;
+    }
+    let who = system::port_owner(80, Proto::Tcp)?;
+    // The panel of the attempt before this one.
+    if who == "mikan" {
+        return None;
+    }
+    let Some(front) = acme::Front::from_process(&who) else { return Some(Port80::Other(who)) };
+    // A continued install keeps the port the attempt before it chose.
+    let earlier = plan
+        .resume
+        .then(|| EnvFile::load(Path::new(DIR).join(".env")).ok())
+        .flatten()
+        .and_then(|e| e.get("MIKAN_ACME_LISTEN").and_then(acme::listen_port));
+    Some(Port80::Front(front, earlier.unwrap_or_else(acme::free_port)))
 }
 
 /// Runs the install and reports through tx; the last event is Finished or Failed.
@@ -347,9 +383,18 @@ fn run(plan: &Plan, tx: &Sender<Event>) -> StepResult<()> {
         };
         let version = image_version(&image)?;
         note(tx, Step::Image, format!("mikan {version}"));
+        if !node {
+            note(tx, Step::Image, "PostgreSQL 18");
+            docker::pull_postgres(progress)?;
+        }
         Ok((image, version))
     })?;
 
+    let port80 = port80(plan);
+    let acme_port = match &port80 {
+        Some(Port80::Front(_, p)) => Some(*p),
+        _ => None,
+    };
     let api_port = step(tx, Step::Files, || {
         let api_port = match &plan.join {
             Some(key) => {
@@ -364,12 +409,28 @@ fn run(plan: &Plan, tx: &Sender<Event>) -> StepResult<()> {
             }
             None => None,
         };
-        write_files(plan, &image, &version, api_port)?;
+        // An uninstall keeps the database's volume; its password went with the .env, and a
+        // new one does not open it. The data are never removed for the admin.
+        if !node && !plan.resume && docker::volume_mountpoint(docker::PG_VOLUME).is_some() {
+            bail!(
+                "the Docker volume {v} holds the database of an earlier mikan, whose password was in the .env that is gone, so this install cannot open it. To keep those data, put the old .env and compose.yaml back in {DIR} (every mikan backup archive has them) and run the installer again; if they are not needed: docker volume rm {v}, then run the installer again",
+                v = docker::PG_VOLUME
+            );
+        }
+        write_files(plan, &image, &version, api_port, acme_port)?;
         note(tx, Step::Files, DIR);
         Ok(api_port)
     })?;
 
-    let creds = if node { None } else { Some(step(tx, Step::Bootstrap, || bootstrap(plan, tx))?) };
+    let creds = if node {
+        None
+    } else {
+        Some(step(tx, Step::Bootstrap, || {
+            docker::postgres_ready()?;
+            docker::database(&["migrate"])?;
+            bootstrap(plan, tx)
+        })?)
+    };
     // What the admin must not lose: the password is shown once, and it exists from here on.
     let kept = |(s, e): (Step, anyhow::Error)| match creds.as_ref().and_then(|c| c.password.as_ref().map(|p| (c, p))) {
         Some((c, p)) => (
@@ -382,7 +443,7 @@ fn run(plan: &Plan, tx: &Sender<Event>) -> StepResult<()> {
         None => (s, e),
     };
 
-    step(tx, Step::System, || {
+    let acme = step(tx, Step::System, || {
         let mut done = Vec::new();
         if plan.tune {
             done.push(match host::tune() {
@@ -410,8 +471,15 @@ fn run(plan: &Plan, tx: &Sender<Event>) -> StepResult<()> {
             Ok(()) => "daily update check".into(),
             Err(e) => format!("no update timer ({e})"),
         });
+        // Before the panel starts, so that its first try at the certificate gets through.
+        let acme = match &port80 {
+            Some(Port80::Front(front, port)) => Some(acme::setup(*front, &plan.domain, *port, plan.proxy_rule)),
+            Some(Port80::Other(who)) => Some(acme::Report::other(who)),
+            None => None,
+        };
+        done.extend(acme.as_ref().map(acme::Report::note));
         note(tx, Step::System, done.join(" · "));
-        Ok(())
+        Ok(acme)
     })
     .map_err(kept)?;
 
@@ -426,8 +494,8 @@ fn run(plan: &Plan, tx: &Sender<Event>) -> StepResult<()> {
     let _ = fs::remove_file(Path::new(DIR).join(UNFINISHED));
 
     let outcome = match creds {
-        Some(c) => Outcome { version, node_port: None, url: c.url, login: c.login, password: c.password.unwrap_or_default() },
-        None => Outcome { version, node_port: api_port, url: String::new(), login: String::new(), password: String::new() },
+        Some(c) => Outcome { version, node_port: None, url: c.url, login: c.login, password: c.password.unwrap_or_default(), acme },
+        None => Outcome { version, node_port: api_port, url: String::new(), login: String::new(), password: String::new(), acme },
     };
     let _ = tx.send(Event::Finished(outcome));
     Ok(())
@@ -531,9 +599,9 @@ pub fn node_port(image: &str, key: &str) -> Result<u16> {
     }
 }
 
-fn write_files(plan: &Plan, image: &str, version: &str, api_port: Option<u16>) -> Result<()> {
+fn write_files(plan: &Plan, image: &str, version: &str, api_port: Option<u16>, acme_port: Option<u16>) -> Result<()> {
     let root = Path::new(DIR);
-    write_files_in(root, plan, image, version, api_port)?;
+    write_files_in(root, plan, image, version, api_port, acme_port)?;
     // The containers run as 65532 and each mounts its own directory of data/, which a bind
     // mount does not give that owner; data/ itself stays root's (the compose file written
     // above mounts nothing else).
@@ -542,8 +610,9 @@ fn write_files(plan: &Plan, image: &str, version: &str, api_port: Option<u16>) -
 }
 
 /// The files of an install. A first install makes them; a continued one finds .env there
-/// and keeps what it chose, writing only what is missing or has changed.
-fn write_files_in(root: &Path, plan: &Plan, image: &str, version: &str, api_port: Option<u16>) -> Result<()> {
+/// and keeps what it chose, writing only what is missing or has changed. acme_port is
+/// where the panel answers Let's Encrypt when a web server holds port 80.
+fn write_files_in(root: &Path, plan: &Plan, image: &str, version: &str, api_port: Option<u16>, acme_port: Option<u16>) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let env_path = root.join(".env");
     if env_path.exists() && !(plan.resume && unfinished(root)) {
@@ -572,6 +641,10 @@ fn write_files_in(root: &Path, plan: &Plan, image: &str, version: &str, api_port
         }
         _ => {
             env.set("PANEL_PORT", &plan.port.to_string())?;
+            match acme_port {
+                Some(p) => env.set("MIKAN_ACME_LISTEN", &acme::listen(p))?,
+                None => env.remove("MIKAN_ACME_LISTEN"),
+            }
             false
         }
     };
@@ -580,7 +653,23 @@ fn write_files_in(root: &Path, plan: &Plan, image: &str, version: &str, api_port
     } else {
         write_private(&root.join("compose.yaml"), docker::compose_text(node).as_bytes())?;
     }
+    if !node {
+        postgres_env(&mut env)?;
+    }
     env.save()
+}
+
+/// Credentials persist across updates and resumed installs; never rotate a live database.
+pub fn postgres_env(env: &mut EnvFile) -> Result<()> {
+    if env.get("MIKAN_POSTGRES_PASSWORD").is_none() {
+        env.set("MIKAN_POSTGRES_PASSWORD", &token(48, ALNUM))?;
+    }
+    if env.get("MIKAN_DATABASE_URL").is_none() {
+        let password = env.get("MIKAN_POSTGRES_PASSWORD").context("postgres password missing")?;
+        let url = format!("postgresql://mikan:{password}@localhost/mikan?host=/run/postgresql");
+        env.set("MIKAN_DATABASE_URL", &url)?;
+    }
+    Ok(())
 }
 
 /// Waits for the panel to answer, or for a node's API port to listen.
@@ -605,22 +694,34 @@ pub fn wait_ready(node_port: Option<u16>, limit: Duration) -> Result<()> {
     }
 }
 
-/// What a finished install tells the admin, for the terminal.
-pub fn summary(o: &Outcome) -> String {
-    match o.node_port {
+/// What a finished install tells the admin, for the terminal: the link and the login whole,
+/// for copying from any terminal. The installer's last screen shows the password; without
+/// with_password it stays out of the terminal's scrollback.
+pub fn summary(o: &Outcome, with_password: bool) -> String {
+    let mut text = match o.node_port {
         Some(p) => format!(
             "mikan {} node is running and waits for its panel on port {p}.\nThe panel connects within 30 seconds: see its Nodes page.\nCommands on this server: mikan (menu), mikan status, mikan update",
             o.version
         ),
-        None if o.password.is_empty() => format!(
-            "mikan {} is running.\n\n  Panel     {}\n  Login     {}\n  Password  not known: the admin was made by the attempt before this one; set a new password with: mikan reset-password\n\nCommands on this server: mikan (menu), mikan status, mikan update",
-            o.version, o.url, o.login
-        ),
-        None => format!(
-            "mikan {} is running.\n\n  Panel     {}\n  Login     {}\n  Password  {}   ← shown once, keep it in a password manager\n\nCommands on this server: mikan (menu), mikan status, mikan update",
-            o.version, o.url, o.login, o.password
-        ),
+        None => {
+            let password = if o.password.is_empty() {
+                "not known: the admin was made by the attempt before this one; set a new password with: mikan reset-password".to_owned()
+            } else if with_password {
+                format!("{}   ← shown once, keep it in a password manager", o.password)
+            } else {
+                "shown on the installer's last screen only; a new one: mikan reset-password".to_owned()
+            };
+            format!(
+                "mikan {} is running.\n\n  Panel     {}\n  Login     {}\n  Password  {password}\n\nCommands on this server: mikan (menu), mikan status, mikan update",
+                o.version, o.url, o.login
+            )
+        }
+    };
+    if let Some(t) = o.acme.as_ref().and_then(acme::Report::text) {
+        text.push_str("\n\n");
+        text.push_str(&t);
     }
+    text
 }
 
 /// Whether an install stopped half way here: `mikan install` continues it.
@@ -711,7 +812,8 @@ fn plain(opts: Options, earlier: Option<EnvFile>) -> Result<()> {
                 if o.node_port.is_none() {
                     crate::sites::auto(crate::out);
                 }
-                crate::out(&format!("\n{}", summary(&o)));
+                // Plain mode has no screen to show the password on: the terminal is the place.
+                crate::out(&format!("\n{}", summary(&o, true)));
                 return Ok(());
             }
         }
@@ -741,6 +843,22 @@ mod tests {
         assert!(login.as_bytes()[0].is_ascii_lowercase() && login.len() == 12);
         let p = free_port();
         assert!((20000..=60000).contains(&p));
+    }
+
+    #[test]
+    fn postgres_credentials_survive_resumes_and_updates() {
+        let mut env = EnvFile::new("unused");
+        postgres_env(&mut env).unwrap();
+        let before = env.render();
+        let password = env.get("MIKAN_POSTGRES_PASSWORD").unwrap();
+        assert_eq!(password.len(), 48);
+        assert!(password.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_eq!(
+            env.get("MIKAN_DATABASE_URL"),
+            Some(format!("postgresql://mikan:{password}@localhost/mikan?host=/run/postgresql").as_str())
+        );
+        postgres_env(&mut env).unwrap();
+        assert_eq!(env.render(), before, "live credentials must never rotate");
     }
 
     #[test]
@@ -787,24 +905,28 @@ mod tests {
     fn an_install_that_stopped_is_continued_not_refused_and_not_redone() {
         let root = tmpdir("resume");
         let mut p = plan();
-        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan@sha256:aa", "0.4.4", None).unwrap();
+        // nginx holds port 80: the panel answers Let's Encrypt on a local port behind it
+        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan@sha256:aa", "0.4.4", None, Some(18080)).unwrap();
         assert!(unfinished(&root), "the marker is there from the first file");
         let env = EnvFile::load(root.join(".env")).unwrap();
         assert_eq!(env.get("PANEL_PORT"), Some("21355"));
+        assert_eq!(env.get("MIKAN_ACME_LISTEN"), Some("127.0.0.1:18080"));
+        assert!(docker::PANEL_COMPOSE.contains("MIKAN_ACME_LISTEN: \"${MIKAN_ACME_LISTEN:-:80}\""), "compose passes it on");
         assert_eq!(fs::read_to_string(root.join("compose.yaml")).unwrap(), docker::PANEL_COMPOSE);
         // a fresh install over it is refused
-        assert!(write_files_in(&root, &p, "x", "0.4.4", None).is_err(), "an install does not overwrite another");
+        assert!(write_files_in(&root, &p, "x", "0.4.4", None, None).is_err(), "an install does not overwrite another");
         // the continued one takes the port from .env, whatever it would have drawn
         p = Plan::from(&Options { port: Some(30000), ..Default::default() }).resumed(&env);
         assert!(p.resume);
         assert_eq!(p.port, 21355);
-        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan@sha256:bb", "0.4.5", None).unwrap();
+        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan@sha256:bb", "0.4.5", None, None).unwrap();
         let again = EnvFile::load(root.join(".env")).unwrap();
         assert_eq!((again.get("PANEL_PORT"), again.get("MIKAN_VERSION")), (Some("21355"), Some("0.4.5")));
+        assert_eq!(again.get("MIKAN_ACME_LISTEN"), None, "port 80 is free now: the panel takes it");
         // done: the last step removes the marker, and the server is an installed one
         fs::remove_file(root.join(UNFINISHED)).unwrap();
         assert!(!unfinished(&root));
-        assert!(write_files_in(&root, &p, "x", "0.4.4", None).is_err(), "an installed server is not continued");
+        assert!(write_files_in(&root, &p, "x", "0.4.4", None, None).is_err(), "an installed server is not continued");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -813,7 +935,7 @@ mod tests {
         let root = tmpdir("resume-node");
         let key = "mikan1.AbC_-9";
         let p = Plan::from(&Options { join: Some(key.into()), ..Default::default() });
-        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan", "0.4.4", Some(25305)).unwrap();
+        write_files_in(&root, &p, "ghcr.io/miroshka000/mikan", "0.4.4", Some(25305), None).unwrap();
         let env = EnvFile::load(root.join(".env")).unwrap();
         assert_eq!((env.get("MIKAN_MODE"), env.get("NODE_API_PORT"), env.get("MIKAN_NODE_JOIN")), (Some("node"), Some("25305"), Some(key)));
         assert_eq!(fs::read_to_string(root.join("compose.yaml")).unwrap(), docker::NODE_COMPOSE);
@@ -826,11 +948,25 @@ mod tests {
     // summary of a continued install says why there is none.
     #[test]
     fn the_summary_tells_a_lost_password_from_a_shown_one() {
-        let shown =
-            Outcome { version: "0.4.4".into(), node_port: None, url: "https://h:1/x/".into(), login: "l".into(), password: "p".into() };
-        assert!(summary(&shown).contains("Password  p"));
-        let lost = Outcome { password: String::new(), ..shown };
-        assert!(summary(&lost).contains("mikan reset-password") && !summary(&lost).contains("shown once"));
+        let shown = Outcome {
+            version: "0.4.4".into(),
+            node_port: None,
+            url: "https://h:1/x/".into(),
+            login: "l".into(),
+            password: "p4ssw0rd".into(),
+            acme: None,
+        };
+        assert!(summary(&shown, true).contains("Password  p4ssw0rd"));
+        // after the installer's screen the terminal gets the link and login, not the password
+        let after_tui = summary(&shown, false);
+        assert!(after_tui.contains("  Panel     https://h:1/x/\n  Login     l\n"), "no link and login after the screen");
+        assert!(!after_tui.contains("p4ssw0rd") && after_tui.contains("last screen only"));
+        let lost = Outcome { password: String::new(), ..shown.clone() };
+        assert!(summary(&lost, true).contains("mikan reset-password") && !summary(&lost, true).contains("shown once"));
+        // a rule for Let's Encrypt left to the admin comes last
+        let report = acme::Report::other("apache2");
+        let with_acme = summary(&Outcome { acme: Some(report.clone()), ..shown }, false);
+        assert!(with_acme.ends_with(&report.text().unwrap()), "the rule is not last");
     }
 
     #[test]

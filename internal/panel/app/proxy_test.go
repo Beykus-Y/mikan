@@ -76,14 +76,14 @@ func TestInboundsBehindAProxy(t *testing.T) {
 	xhttp := ids["vless-xhttp"]
 	before, _ := h.st.Q.GetInbound(ctx, xhttp)
 
-	// An address of its own turns the port move off in the same update; the target
-	// replacement stays the admin's call (the panel warns about it).
+	// An address of its own turns the port move and the site switch off in the same
+	// update: the proxy in front forwards to the port and may route by the site.
 	h.now = h.now.Add(time.Hour)
 	code, body, v := patch(xhttp, map[string]any{"listen": " 127.0.0.1 "})
-	if code != http.StatusOK || v.Listen != "127.0.0.1" || v.AutoPort || !v.AutoSNI || v.ClientSNI {
+	if code != http.StatusOK || v.Listen != "127.0.0.1" || v.AutoPort || v.AutoSNI || v.ClientSNI {
 		t.Fatalf("listen: %d %s", code, body)
 	}
-	if after, _ := h.st.Q.GetInbound(ctx, xhttp); after.Listen != "127.0.0.1" || after.AutoPort != 0 || after.UpdatedAt != before.UpdatedAt {
+	if after, _ := h.st.Q.GetInbound(ctx, xhttp); after.Listen != "127.0.0.1" || after.AutoPort != 0 || after.AutoSni != 0 || after.UpdatedAt != before.UpdatedAt {
 		t.Fatalf("stored: %+v (clients get nothing new: updated_at stays)", after)
 	}
 	for _, c := range []struct {
@@ -92,6 +92,7 @@ func TestInboundsBehindAProxy(t *testing.T) {
 		want, loc string
 	}{
 		{map[string]any{"auto_port": true}, http.StatusUnprocessableEntity, "auto_port_listen", "body.auto_port"},
+		{map[string]any{"auto_sni": true}, http.StatusUnprocessableEntity, "auto_sni_listen", "body.auto_sni"},
 		{map[string]any{"listen": "localhost"}, http.StatusUnprocessableEntity, "bad_listen", "body.listen"},
 		{map[string]any{"listen": "127.0.0.1:444"}, http.StatusUnprocessableEntity, "bad_listen", "body.listen"},
 		// REALITY clients send the target's name: not the client side's to change.

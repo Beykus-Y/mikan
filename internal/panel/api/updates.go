@@ -11,6 +11,7 @@ import (
 
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/updates"
+	"mikan/internal/release"
 )
 
 type UpdatesView struct {
@@ -22,15 +23,22 @@ type UpdatesView struct {
 	CheckedAt   int64               `json:"checked_at" doc:"Unix-время последней проверки; 0 — ещё не проверяли"`
 	Error       string              `json:"error" doc:"Почему последняя проверка не удалась; no_release — релизов ещё нет"`
 	Auto        bool                `json:"auto" doc:"Сервер сам ставит новые релизы раз в сутки, ночью"`
+	Channel     string              `json:"channel" enum:"stable,beta" doc:"Какие релизы ставить: stable — только релизы, beta — и пре-релизы (vX-rc.N)"`
+	Newest      string              `json:"newest" doc:"Новейший релиз канала, если обновление идёт к нему через latest или до него отсюда не добраться; иначе пусто"`
+	Unreachable bool                `json:"unreachable" doc:"Вышел newest, но с этой версии к нему не ведёт ни одно обновление"`
 	RequestedAt int64               `json:"requested_at" doc:"Когда нажали «Обновить»; 0 — заявки нет или сервер её уже взял"`
 	Host        *updates.HostStatus `json:"host,omitempty" doc:"Как прошло последнее обновление на сервере"`
+	NodesFollow bool                `json:"nodes_follow" doc:"Удалённые ноды следуют за панелью: после её обновления панель обновляет их до своей версии, по одной"`
 }
 
 type updatesOutput struct{ Body UpdatesView }
 
 type patchUpdatesInput struct {
 	Body struct {
-		Auto *bool `json:"auto,omitempty"`
+		Auto    *bool   `json:"auto,omitempty"`
+		Channel *string `json:"channel,omitempty" enum:"stable,beta"`
+		// NodesFollow turning on also lets the panel try again the nodes whose update failed.
+		NodesFollow *bool `json:"nodes_follow,omitempty"`
 	}
 }
 
@@ -40,7 +48,7 @@ var checking sync.Mutex
 func (h *handlers) registerUpdates() {
 	tags := []string{"settings"}
 	huma.Register(h.api, huma.Operation{OperationID: "get-updates", Method: http.MethodGet, Path: "/api/v1/updates", Summary: "Обновления", Tags: tags}, h.getUpdates)
-	huma.Register(h.api, huma.Operation{OperationID: "update-updates", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPatch, Path: "/api/v1/updates", Summary: "Включить или выключить автообновление", Tags: tags}, h.patchUpdates)
+	huma.Register(h.api, huma.Operation{OperationID: "update-updates", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPatch, Path: "/api/v1/updates", Summary: "Автообновление и канал релизов", Tags: tags}, h.patchUpdates)
 	huma.Register(h.api, huma.Operation{OperationID: "check-updates", Method: http.MethodPost, Path: "/api/v1/updates/check", Summary: "Проверить обновления сейчас", Tags: tags}, h.checkUpdates)
 	huma.Register(h.api, huma.Operation{OperationID: "request-update", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPost, Path: "/api/v1/updates/request", Summary: "Обновить сейчас: заявка серверу", Tags: tags, DefaultStatus: http.StatusAccepted}, h.requestUpdate)
 }
@@ -49,6 +57,12 @@ func (h *handlers) updatesView(ctx context.Context) (UpdatesView, error) {
 	v := UpdatesView{Current: h.d.Version, Notes: map[string]string{}}
 	var err error
 	if v.Auto, err = h.d.Settings.On(ctx, settings.AutoUpdate); err != nil {
+		return v, err
+	}
+	if v.Channel, err = h.d.Settings.UpdateChannel(ctx); err != nil {
+		return v, err
+	}
+	if v.NodesFollow, err = h.d.Settings.On(ctx, settings.NodesFollow); err != nil {
 		return v, err
 	}
 	u := h.d.Updates
@@ -63,6 +77,7 @@ func (h *handlers) updatesView(ctx context.Context) (UpdatesView, error) {
 		}
 	}
 	v.Available, v.Error = s.Available(), s.Error
+	v.Newest, v.Unreachable = s.Found.Newest, s.Found.Unreachable
 	if !s.CheckedAt.IsZero() {
 		v.CheckedAt = s.CheckedAt.Unix()
 	}
@@ -84,20 +99,72 @@ func (h *handlers) getUpdates(ctx context.Context, _ *struct{}) (*updatesOutput,
 }
 
 func (h *handlers) patchUpdates(ctx context.Context, in *patchUpdatesInput) (*updatesOutput, error) {
+	if in.Body.NodesFollow != nil {
+		on, err := h.d.Settings.On(ctx, settings.NodesFollow)
+		if err != nil {
+			return nil, err
+		}
+		if *in.Body.NodesFollow != on {
+			if h.d.NodeUpdates != nil {
+				err = h.d.NodeUpdates.SetFollowing(ctx, *in.Body.NodesFollow)
+			} else {
+				err = settings.Set(ctx, h.d.Settings, settings.KeyNodesFollow, *in.Body.NodesFollow)
+			}
+			if err != nil {
+				return nil, err
+			}
+			h.audit(ctx, sessionOf(ctx).AdminID, "updates.nodes_follow", "", "", map[string]any{"nodes_follow": *in.Body.NodesFollow})
+		}
+	}
+	if in.Body.Auto == nil && in.Body.Channel == nil {
+		return h.getUpdates(ctx, nil)
+	}
+	if h.d.Updates == nil {
+		return nil, huma.Error409Conflict("updates_unavailable")
+	}
+	if in.Body.Channel != nil && !release.ValidChannel(*in.Body.Channel) {
+		return nil, huma.Error422UnprocessableEntity("validation", &huma.ErrorDetail{Location: "body.channel", Message: "bad_channel"})
+	}
+	auto, err := h.d.Settings.On(ctx, settings.AutoUpdate)
+	if err != nil {
+		return nil, err
+	}
+	channel, err := h.d.Settings.UpdateChannel(ctx)
+	if err != nil {
+		return nil, err
+	}
+	was := channel
 	if in.Body.Auto != nil {
-		if h.d.Updates == nil {
+		auto = *in.Body.Auto
+	}
+	if in.Body.Channel != nil {
+		channel = *in.Body.Channel
+	}
+	// The host reads the policy file; the settings are what the admin chose.
+	if err := h.d.Updates.SetPolicy(updates.Policy{Auto: auto, Channel: channel}); err != nil {
+		if errors.Is(err, updates.ErrUnavailable) {
 			return nil, huma.Error409Conflict("updates_unavailable")
 		}
-		if err := h.d.Updates.SetAuto(*in.Body.Auto); err != nil {
-			if errors.Is(err, updates.ErrUnavailable) {
-				return nil, huma.Error409Conflict("updates_unavailable")
-			}
+		return nil, err
+	}
+	if in.Body.Auto != nil {
+		if err := settings.Set(ctx, h.d.Settings, settings.KeyAutoUpdate, auto); err != nil {
 			return nil, err
 		}
-		if err := settings.Set(ctx, h.d.Settings, settings.KeyAutoUpdate, *in.Body.Auto); err != nil {
+		h.audit(ctx, sessionOf(ctx).AdminID, "updates.auto", "", "", map[string]any{"auto": auto})
+	}
+	if channel != was {
+		if err := settings.Set(ctx, h.d.Settings, settings.KeyUpdateChannel, channel); err != nil {
 			return nil, err
 		}
-		h.audit(ctx, sessionOf(ctx).AdminID, "updates.auto", "", "", map[string]any{"auto": *in.Body.Auto})
+		h.audit(ctx, sessionOf(ctx).AdminID, "updates.channel", "", "", map[string]any{"channel": channel})
+		// What was found is of the other channel: look again, unless a check runs already.
+		if checking.TryLock() {
+			cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+			h.d.Updates.Check(cctx)
+			cancel()
+			checking.Unlock()
+		}
 	}
 	return h.getUpdates(ctx, nil)
 }

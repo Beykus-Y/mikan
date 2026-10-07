@@ -27,6 +27,9 @@ type Registry struct {
 	epoch   string
 	seq     int64
 	pending *nodeapi.Counters
+
+	torrentCfg atomic.Pointer[nodeapi.TorrentBlock] // nil: the torrent blocker is off
+	torrent    torrents
 }
 
 type slot struct {
@@ -37,6 +40,11 @@ type slot struct {
 	quotaOn   atomic.Bool
 	remaining atomic.Int64
 	blocked   atomic.Bool // !allowed; read on every connection (exhausted quotas are per bucket)
+	// The torrent blocker: the slot is let alone, or kept out until the panel's ban or
+	// the node's own short one ends (unix seconds).
+	torrentExempt atomic.Bool
+	policyBan     atomic.Int64
+	localBan      atomic.Int64
 
 	mu          sync.Mutex
 	allowed     bool
@@ -68,7 +76,8 @@ const activityKeep = time.Hour
 const seqAfterCrash = 100_000
 
 func NewRegistry(epoch string, seq int64, release time.Duration, now func() time.Time) *Registry {
-	return &Registry{byKey: map[string]*slot{}, byName: map[string]*slot{}, epoch: epoch, seq: seq, release: release, now: now}
+	return &Registry{byKey: map[string]*slot{}, byName: map[string]*slot{}, epoch: epoch, seq: seq, release: release, now: now,
+		torrent: newTorrents()}
 }
 
 func newSlot(name, uuid string) *slot {
@@ -139,7 +148,16 @@ func (r *Registry) SetPolicies(epoch string, list []nodeapi.Policy) {
 		s.otherIPs = nil
 		s.exhausted = false
 		s.quotaOn.Store(false)
+		s.torrentExempt.Store(ok && p.TorrentExempt)
+		now := r.now().Unix()
+		// A ban the panel held and no longer does was lifted there: the node's own short ban
+		// for the same catch goes with it.
+		if s.policyBan.Load() > now && (!ok || p.BannedUntil <= now) {
+			s.localBan.Store(0)
+		}
+		s.policyBan.Store(0)
 		if ok {
+			s.policyBan.Store(p.BannedUntil)
 			if len(p.Inbounds) > 0 {
 				s.inbounds = make(map[string]bool, len(p.Inbounds))
 				for _, in := range p.Inbounds {
@@ -189,7 +207,7 @@ func (r *Registry) SetPolicies(epoch string, list []nodeapi.Policy) {
 			}
 		}
 		s.blocked.Store(!s.allowed)
-		if !s.allowed {
+		if !s.allowed || s.banned(r.now()) {
 			toClose = append(toClose, s.connsLocked()...)
 		} else {
 			for c := range s.conns {
@@ -263,8 +281,11 @@ func (r *Registry) admitIn(user, inName, ip string, tcp bool) (*slot, *bucket) {
 	if s.shared {
 		return s, nil
 	}
-	pool := r.poolOfListener(inName)
 	now := r.now()
+	if s.banned(now) {
+		return nil, nil
+	}
+	pool := r.poolOfListener(inName)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.allowed || (s.inbounds != nil && !s.inbounds[inName]) {

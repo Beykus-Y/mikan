@@ -8,7 +8,9 @@ import (
 	"strconv"
 	"time"
 
+	"mikan/internal/nodeapi"
 	"mikan/internal/panel/presets"
+	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
 	"mikan/internal/proto"
 )
@@ -23,6 +25,9 @@ var (
 	ErrExitLong  = errors.New("exit_too_long") // the chain has more than maxChain hops
 	ErrExitOff   = errors.New("exit_off")      // the exit node is disabled
 	ErrNoPort    = errors.New("relay_no_port")
+
+	// ErrRelayChanged: the relay is not on the port a move of it was decided for.
+	ErrRelayChanged = errors.New("relay_changed")
 )
 
 // maxChain bounds a cascade: more hops than this only add delay.
@@ -63,9 +68,25 @@ func CheckExit(ctx context.Context, q *db.Queries, from, to int64) error {
 	return ErrExitLong
 }
 
-// EnsureRelay gives node its relay listener when it has none: a free TCP port, the
-// first free one of PortPool (installers open those in the firewall), else a high one.
-func EnsureRelay(ctx context.Context, q *db.Queries, node db.Node, now time.Time) (db.NodeRelay, error) {
+// RelayPort picks the port of a cascade relay: the first free one of PortPool (installers
+// open those in the firewall) that is not in skip, else a high one.
+func RelayPort(ports PortMap, skip map[string]bool) (int, bool) {
+	for _, p := range PortPool {
+		if !skip[strconv.Itoa(p)] && ports.Free(p, "tcp") {
+			return p, true
+		}
+	}
+	for range 64 {
+		if p := 30000 + rand.IntN(30000); !skip[strconv.Itoa(p)] && ports.Free(p, "tcp") {
+			return p, true
+		}
+	}
+	return 0, false
+}
+
+// EnsureRelay gives node its relay listener when it has none, on a free TCP port; host is
+// what the node's server reports as listening, nil when it did not.
+func EnsureRelay(ctx context.Context, q *db.Queries, node db.Node, now time.Time, host *nodeapi.HostPorts) (db.NodeRelay, error) {
 	if r, err := q.GetNodeRelay(ctx, node.ID); err == nil {
 		return r, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -75,19 +96,8 @@ func EnsureRelay(ctx context.Context, q *db.Queries, node db.Node, now time.Time
 	if err != nil {
 		return db.NodeRelay{}, err
 	}
-	port := 0
-	for _, p := range PortPool {
-		if ports.Free(p, "tcp") {
-			port = p
-			break
-		}
-	}
-	for i := 0; port == 0 && i < 64; i++ {
-		if p := 30000 + rand.IntN(30000); ports.Free(p, "tcp") {
-			port = p
-		}
-	}
-	if port == 0 {
+	port, ok := RelayPort(ports.WithHost(host), nil)
+	if !ok {
 		return db.NodeRelay{}, ErrNoPort
 	}
 	reality, err := presets.NewReality(presets.DefaultDest)
@@ -101,9 +111,30 @@ func EnsureRelay(ctx context.Context, q *db.Queries, node db.Node, now time.Time
 	return q.CreateNodeRelay(ctx, db.CreateNodeRelayParams{NodeID: node.ID, Port: strconv.Itoa(port), Config: proto.Marshal(t), CreatedAt: now.Unix()})
 }
 
+// MoveRelay moves node's relay from port from to port to, the way another program that
+// holds from calls for. It is ErrRelayChanged when the relay is no longer on from, and a
+// *PortInUseError when something of mikan's holds to. Sources of the relay follow with the
+// next sync of the nodes: they read the port from the row.
+func MoveRelay(ctx context.Context, st *store.Store, node db.Node, from, to string) error {
+	return st.Tx(ctx, func(q *db.Queries) error {
+		r, err := q.GetNodeRelay(ctx, node.ID)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && r.Port != from {
+			return ErrRelayChanged
+		}
+		if err != nil {
+			return err
+		}
+		if err := CheckPort(ctx, q, node, to, "tcp", PortHolder{Kind: PortRelay}); err != nil {
+			return err
+		}
+		return q.SetNodeRelayPort(ctx, db.SetNodeRelayPortParams{Port: to, NodeID: node.ID})
+	})
+}
+
 // UseExit lets node src leave through node exit: the chain is checked, exit gets its
-// relay and src a key there. It runs on the caller's transaction.
-func UseExit(ctx context.Context, q *db.Queries, src, exit int64, now time.Time) error {
+// relay and src a key there. It runs on the caller's transaction; host tells what listens
+// on exit's server, nil when nobody knows.
+func UseExit(ctx context.Context, q *db.Queries, src, exit int64, now time.Time, host HostLookup) error {
 	if err := CheckExit(ctx, q, src, exit); err != nil {
 		return err
 	}
@@ -111,7 +142,7 @@ func UseExit(ctx context.Context, q *db.Queries, src, exit int64, now time.Time)
 	if err != nil {
 		return err
 	}
-	if _, err := EnsureRelay(ctx, q, x, now); err != nil {
+	if _, err := EnsureRelay(ctx, q, x, now, host.of(exit)); err != nil {
 		return err
 	}
 	_, err = RelayUser(ctx, q, exit, src)

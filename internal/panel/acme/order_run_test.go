@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 	"mikan/internal/panel/tlscert"
 )
 
@@ -37,7 +37,7 @@ func manager(t *testing.T, dir string) (*Manager, *tlscert.Holder) {
 	t.Helper()
 	ctx := context.Background()
 	t.Setenv("MIKAN_ACME_DIRECTORY", dir)
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

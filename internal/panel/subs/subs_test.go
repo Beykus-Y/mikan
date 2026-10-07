@@ -415,3 +415,90 @@ func TestDefaultFingerprint(t *testing.T) {
 		}
 	}
 }
+
+// The servers go in the order of Profile.Nodes (the admin's order), whatever their ids and
+// the order of the inbounds are; the inbounds of one node keep their own.
+func TestNodeOrderFollowsTheProfile(t *testing.T) {
+	prof := profile(t, "aa11")
+	base := prof.Inbounds
+	prof.Inbounds = nil
+	hosts := map[int64]string{1: "nl.example.com", 2: "us.example.com", 3: "de.example.com"}
+	names := map[int64]string{1: "🇳🇱 Нидерланды", 2: "🇺🇸 США", 3: "🇩🇪 Германия"}
+	// Inbounds come by node id, as the database lists them.
+	for id := int64(1); id <= 3; id++ {
+		for _, in := range base[:2] {
+			in.ID, in.NodeID = id*100+in.ID, id
+			prof.Inbounds = append(prof.Inbounds, in)
+		}
+	}
+	nodes := func(order ...int64) []Node {
+		var out []Node
+		for _, id := range order {
+			out = append(out, Node{ID: id, Name: names[id], Endpoint: Endpoint{Host: hosts[id], PinSHA256: "aa11"}})
+		}
+		return out
+	}
+	for _, order := range [][]int64{{1, 2, 3}, {3, 1, 2}, {2, 3, 1}} {
+		prof.Nodes = nodes(order...)
+		var wantHosts, wantGroups []string
+		for _, id := range order {
+			wantHosts = append(wantHosts, hosts[id], hosts[id])
+			wantGroups = append(wantGroups, names[id])
+		}
+
+		links, err := URIs(prof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotHosts []string
+		for _, l := range strings.Split(links, "\n") {
+			u, err := url.Parse(l)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotHosts = append(gotHosts, u.Hostname())
+		}
+		if strings.Join(gotHosts, " ") != strings.Join(wantHosts, " ") {
+			t.Fatalf("links for %v: %v", order, gotHosts)
+		}
+
+		raw, err := Mihomo(prof, Groups{}, RoutingAll)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg struct {
+			Proxies []map[string]any `json:"proxies"`
+			Groups  []struct {
+				Name    string   `json:"name"`
+				Proxies []string `json:"proxies"`
+			} `json:"proxy-groups"`
+		}
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		var servers []string
+		for _, p := range cfg.Proxies {
+			servers = append(servers, p["server"].(string))
+		}
+		if strings.Join(servers, " ") != strings.Join(wantHosts, " ") {
+			t.Fatalf("proxies for %v: %v", order, servers)
+		}
+		// The main group lists the auto group and then the country groups in order.
+		if got := cfg.Groups[0].Proxies[1:4]; strings.Join(got, "|") != strings.Join(wantGroups, "|") {
+			t.Fatalf("country groups for %v: %v", order, cfg.Groups[0].Proxies)
+		}
+		var groups []string
+		for _, g := range cfg.Groups[2:5] {
+			groups = append(groups, g.Name)
+		}
+		if strings.Join(groups, "|") != strings.Join(wantGroups, "|") {
+			t.Fatalf("group list for %v: %v", order, groups)
+		}
+		// Within a node the inbounds keep their order.
+		for i := 0; i < len(servers); i += 2 {
+			if !strings.Contains(cfg.Proxies[i]["name"].(string), "VLESS XHTTP") {
+				t.Fatalf("first proxy of a node for %v: %v", order, cfg.Proxies[i]["name"])
+			}
+		}
+	}
+}

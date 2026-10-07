@@ -40,7 +40,18 @@ const workerStopTimeout = 20 * time.Second
 
 func Serve(ctx context.Context, cfg config.Config, version string, web fs.FS) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	st, err := store.Open(ctx, cfg.DataDir)
+	dsn, err := store.DatabaseURL()
+	if err != nil {
+		return err
+	}
+	// Held from before the store opens (it migrates) until the panel is down: database
+	// migrate and restore refuse to run under a live panel.
+	unlock, err := store.LockPanel(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	st, err := store.OpenPostgres(ctx, cfg.DataDir, dsn)
 	if err != nil {
 		return err
 	}
@@ -69,7 +80,7 @@ func Serve(ctx context.Context, cfg config.Config, version string, web fs.FS) er
 
 	opts := Options{Version: version, Web: web, TrustProxy: cfg.TrustProxy, Log: logger, Now: time.Now,
 		Autotune: autotune.DefaultOptions().Scaled(cfg.AutotuneScale), TelegramAPI: cfg.TelegramAPI,
-		DataDir: cfg.DataDir, Releases: updates.Fetch(release.LatestURL), DNS: dnscheck.New()}
+		DataDir: cfg.DataDir, Releases: updates.Fetch(release.IndexURL, release.LatestURL), DNS: dnscheck.New()}
 	nodesDir := filepath.Join(tlsDir, "nodes")
 	nodeCerts := tlscert.NewNodeStore(filepath.Join(tlsDir, "custom-nodes"), time.Now)
 	opts.NodeCerts = nodeCerts

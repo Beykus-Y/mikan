@@ -74,6 +74,18 @@ const session: Middleware = {
 export const api = createClient<paths>({ baseUrl: base.origin + basePath });
 api.use(session);
 
+export async function rawApi(path: string, init: RequestInit = {}): Promise<any> {
+  const headers = new Headers(init.headers);
+  if (init.method && init.method !== "GET" && init.method !== "HEAD" && csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  const response = await fetch(base.origin + basePath + path, { ...init, headers });
+  const body = await response.json().catch(() => ({}));
+  if (response.status === 401 && !path.endsWith("/auth/login")) {
+    window.dispatchEvent(new Event("mikan:unauthorized"));
+  }
+  if (!response.ok) throw new ApiError(response.status, body, Number(response.headers.get("Retry-After") ?? 0));
+  return body;
+}
+
 type Result<T> = { data?: T; error?: unknown; response: Response };
 
 export async function unwrap<T>(p: Promise<Result<T>>): Promise<T> {
@@ -97,7 +109,7 @@ export function errorText(e: unknown): string {
   if (e.status === 503) return t("errors.nodeDown");
   if (e.status === 403) return t("errors.forbidden");
   if (e.status === 404) return t("errors.notFound");
-  if (e.status === 409 || e.status === 422) return Object.values(e.fields)[0] || tMaybe(`errors.api.${e.detail}`) || t("errors.checkInput");
+  if (e.status === 400 || e.status === 409 || e.status === 422) return Object.values(e.fields)[0] || tMaybe(`errors.api.${e.detail}`) || t("errors.checkInput");
   if (e.status === 429) return t("errors.tooMany", { s: e.retryAfter || 60 });
   // A known code says more than "server error" (502 tg_unreachable, say).
   return (e.detail ? tMaybe(`errors.api.${e.detail}`) : undefined) ?? t("errors.server");

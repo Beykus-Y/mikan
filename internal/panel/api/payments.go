@@ -15,10 +15,12 @@ import (
 )
 
 type PaymentSettingsView struct {
-	Enabled            bool `json:"enabled" doc:"Продажа подписок: выключено — бот и Mini App ничего не продают, новые счета не создаются, уже открытые засчитываются"`
-	Stars              bool `json:"stars" doc:"Telegram Stars: нужен только запущенный бот"`
-	AllowNew           bool `json:"allow_new" doc:"Новые люди могут купить подписку в боте; иначе — только продление"`
-	RenewResetsTraffic bool `json:"renew_resets_traffic" doc:"Оплаченное продление обнуляет трафик и начинает новый период; иначе только добавляет срок"`
+	Enabled            bool   `json:"enabled" doc:"Продажа подписок: выключено — бот и Mini App ничего не продают, новые счета не создаются, уже открытые засчитываются"`
+	Stars              bool   `json:"stars" doc:"Telegram Stars: нужен только запущенный бот"`
+	AllowNew           bool   `json:"allow_new" doc:"Новые люди могут купить подписку в боте; иначе — только продление"`
+	RenewResetsTraffic bool   `json:"renew_resets_traffic" doc:"Оплаченное продление обнуляет трафик и начинает новый период; иначе только добавляет срок"`
+	TrialTariffID      *int64 `json:"trial_tariff_id" doc:"Тариф пробного периода: один раз на Telegram-аккаунт без подписки и оплат, кнопка в приветствии бота; null — пробного периода нет. Работает и при выключенной продаже"`
+	Trials             int64  `json:"trials" doc:"Сколько пробных подписок выдано"`
 	Available          struct {
 		Stars  bool     `json:"stars"`
 		Addons []string `json:"addons" doc:"Адаптеры маркетплейса, которые принимают оплату прямо сейчас"`
@@ -33,10 +35,11 @@ type paymentSettingsOutput struct{ Body PaymentSettingsView }
 
 type patchPaymentSettingsInput struct {
 	Body struct {
-		Enabled            *bool `json:"enabled,omitempty"`
-		Stars              *bool `json:"stars,omitempty"`
-		AllowNew           *bool `json:"allow_new,omitempty"`
-		RenewResetsTraffic *bool `json:"renew_resets_traffic,omitempty"`
+		Enabled            *bool  `json:"enabled,omitempty"`
+		Stars              *bool  `json:"stars,omitempty"`
+		AllowNew           *bool  `json:"allow_new,omitempty"`
+		RenewResetsTraffic *bool  `json:"renew_resets_traffic,omitempty"`
+		TrialTariffID      *int64 `json:"trial_tariff_id,omitempty" minimum:"0" doc:"Тариф пробного периода; 0 — выключить"`
 	}
 }
 
@@ -50,6 +53,7 @@ type PaymentView struct {
 	UserID     *int64     `json:"user_id,omitempty"`
 	UserName   string     `json:"user_name,omitempty"`
 	TariffName string     `json:"tariff_name"`
+	TermDays   *int64     `json:"term_days,omitempty" doc:"Купленный срок в днях (0 — бессрочно); нет у пакетов и у платежей до сроков в тарифах"`
 	Amount     int64      `json:"amount" doc:"Stars или копейки"`
 	Currency   string     `json:"currency" enum:"XTR,RUB"`
 	ExternalID string     `json:"external_id,omitempty" doc:"Номер платежа у провайдера"`
@@ -97,6 +101,12 @@ func (h *handlers) paymentSettings(ctx context.Context) (PaymentSettingsView, er
 		return PaymentSettingsView{}, err
 	}
 	v := PaymentSettingsView{Enabled: c.Enabled, Stars: c.Stars, AllowNew: c.AllowNew, RenewResetsTraffic: c.RenewResetsTraffic}
+	if t, ok := h.d.Billing.TrialTariff(ctx); ok {
+		v.TrialTariffID = &t.ID
+	}
+	if v.Trials, err = h.d.Store.Q.CountTrials(ctx); err != nil {
+		return v, err
+	}
 	av := h.d.Billing.Available(ctx)
 	v.Available.Stars, v.Available.Addons = av.Stars, av.Addons
 	if v.Available.Addons == nil {
@@ -135,11 +145,24 @@ func (h *handlers) updatePaymentSettings(ctx context.Context, in *patchPaymentSe
 			*dst = *v
 		}
 	}
+	if b.TrialTariffID != nil {
+		if id := *b.TrialTariffID; id != 0 {
+			t, err := h.d.Store.Q.GetTariff(ctx, id)
+			if err != nil || t.Archived != 0 {
+				return nil, huma.Error422UnprocessableEntity("validation", &huma.ErrorDetail{Location: "body.trial_tariff_id", Message: "tariff_not_found"})
+			}
+			// A tariff without a term would make the free trial a subscription with no end.
+			if t.DurationDays <= 0 {
+				return nil, huma.Error422UnprocessableEntity("validation", &huma.ErrorDetail{Location: "body.trial_tariff_id", Message: "trial_no_term"})
+			}
+		}
+		c.TrialTariffID = *b.TrialTariffID
+	}
 	if err := settings.Set(ctx, h.d.Settings, billing.KeyConfig, c); err != nil {
 		return nil, err
 	}
 	h.audit(ctx, sessionOf(ctx).AdminID, "payments.settings", "", "", map[string]any{"enabled": c.Enabled, "stars": c.Stars,
-		"allow_new": c.AllowNew, "renew_resets_traffic": c.RenewResetsTraffic})
+		"allow_new": c.AllowNew, "renew_resets_traffic": c.RenewResetsTraffic, "trial_tariff_id": c.TrialTariffID})
 	v, err := h.paymentSettings(ctx)
 	if err != nil {
 		return nil, err
@@ -157,7 +180,7 @@ func unixPtr(n sql.NullInt64) *time.Time {
 
 // paymentView is a payment without the names; the list's query brings those along.
 func paymentView(p db.Payment) PaymentView {
-	v := PaymentView{ID: p.ID, Provider: p.Provider, Kind: p.Kind, Status: p.Status, TgID: p.TgID, TariffName: p.TariffName, Amount: p.Amount,
+	v := PaymentView{ID: p.ID, Provider: p.Provider, Kind: p.Kind, Status: p.Status, TgID: p.TgID, TariffName: p.TariffName, TermDays: ptrInt(p.TermDays.Int64, p.TermDays.Valid), Amount: p.Amount,
 		Currency: p.Currency, ExternalID: p.ExternalID.String, Error: p.Error, CreatedAt: time.Unix(p.CreatedAt, 0).UTC(),
 		PaidAt: unixPtr(p.PaidAt), AppliedAt: unixPtr(p.AppliedAt), RefundedAt: unixPtr(p.RefundedAt)}
 	if p.UserID.Valid {
@@ -209,17 +232,21 @@ func (h *handlers) listPayments(ctx context.Context, in *listPaymentsInput) (*pa
 }
 
 func (h *handlers) refundPayment(ctx context.Context, in *userIDInput) (*paymentOutput, error) {
-	err := h.d.Billing.Refund(ctx, in.ID)
+	reverted, err := h.d.Billing.Refund(ctx, in.ID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, huma.Error404NotFound("not_found")
 	case errors.Is(err, billing.ErrNotRefunable):
 		return nil, huma.Error409Conflict("not_refundable")
+	case errors.Is(err, billing.ErrRefundNotApplied):
+		// The Stars are back with the buyer; the subscription is not yet taken back.
+		h.d.Log.Warn("refund returned by Telegram but not applied", "payment", in.ID, "err", err)
+		return nil, huma.Error502BadGateway("refund_not_applied")
 	case err != nil:
 		h.d.Log.Warn("refund", "payment", in.ID, "err", err)
 		return nil, huma.Error502BadGateway("refund_failed")
 	}
-	h.audit(ctx, sessionOf(ctx).AdminID, "payment.refund", "payment", "", map[string]any{"id": in.ID})
+	h.audit(ctx, sessionOf(ctx).AdminID, "payment.refund", "payment", "", map[string]any{"id": in.ID, "reverted": reverted})
 	p, err := h.d.Store.Q.GetPayment(ctx, in.ID)
 	if err != nil {
 		return nil, err

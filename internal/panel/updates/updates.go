@@ -1,8 +1,10 @@
 // Package updates keeps the panel aware of new releases and talks to the host updater
 // (the mikan command on the server) through files in the panel's data directory:
 //
-//	update/policy.json  the panel writes {"auto": true|false}; the daily timer on the host
-//	                    updates only when it is on
+//	update/policy.json  the panel writes {"auto": true|false, "channel": "stable|beta"}:
+//	                    the daily timer on the host updates only when auto is on, and
+//	                    takes pre-releases only on beta (it accepts nothing but these two
+//	                    exact words: the panel is not trusted with more)
 //	update/request      the panel writes it for the Update button; a systemd path unit
 //	                    runs `mikan update --requested`, which removes it first
 //	update/status.json  the host writes how the last update went:
@@ -29,8 +31,28 @@ import (
 	"mikan/internal/release"
 )
 
-// Source fetches the newest release's manifest, checked.
-type Source func(ctx context.Context) (release.Manifest, error)
+// Query is what a check asks for: the release a panel of version Current takes on Channel.
+type Query struct {
+	Current string
+	Channel string
+}
+
+// Found is what a check found.
+type Found struct {
+	// Manifest is the release to update to now; when nothing is newer, the newest one.
+	Manifest release.Manifest
+	// Newest is the newest release of the channel when the update goes through Manifest on
+	// the way to it, or when this version cannot reach it; "" otherwise.
+	Newest string
+	// Unreachable: Newest is out, but no release this version can update to leads there.
+	Unreachable bool
+	// Fallback says why the release index was not used, when the answer is GitHub's latest
+	// release instead; "" when it came from the index.
+	Fallback string
+}
+
+// Source finds the release for a query, checked.
+type Source func(ctx context.Context, q Query) (Found, error)
 
 var (
 	// ErrUnavailable: the panel runs without a data directory the host watches (tests,
@@ -40,18 +62,19 @@ var (
 	ErrNoRelease = errors.New("no_release")
 )
 
-// Fetch reads the manifest at url and its signature at url + ".sig" and checks them
-// against the release key.
-func Fetch(url string) Source {
+// Fetch looks in the signed release index at indexURL (its signature at indexURL + ".sig")
+// and fetches the manifest of the release it names; when the index cannot be had or
+// believed, it takes the manifest at latestURL, so a broken index never stops updates.
+// Every file is checked against the release key.
+func Fetch(indexURL, latestURL string) Source {
 	pub, err := release.Key(release.PublicKey)
 	if err != nil {
 		panic(err)
 	}
-	return fetch(url, pub)
+	return fetch(indexURL, latestURL, pub, &http.Client{Timeout: 30 * time.Second})
 }
 
-func fetch(url string, pub ed25519.PublicKey) Source {
-	client := &http.Client{Timeout: 30 * time.Second}
+func fetch(indexURL, latestURL string, pub ed25519.PublicKey, client *http.Client) Source {
 	get := func(ctx context.Context, u string, limit int64) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -70,25 +93,78 @@ func fetch(url string, pub ed25519.PublicKey) Source {
 		}
 		return io.ReadAll(io.LimitReader(resp.Body, limit))
 	}
-	once := func(ctx context.Context) (release.Manifest, error) {
-		data, err := get(ctx, url, 1<<20)
-		if err != nil {
-			return release.Manifest{}, err
+	// signed reads a file and its signature and parses them. The two are two requests: a
+	// release published between them leaves the new file with the old signature, and
+	// asking again gets a matching pair.
+	signed := func(ctx context.Context, u string, parse func(data []byte, sig string) error) error {
+		once := func() error {
+			data, err := get(ctx, u, 1<<20)
+			if err != nil {
+				return err
+			}
+			sig, err := get(ctx, u+".sig", 4096)
+			if err != nil {
+				return err
+			}
+			return parse(data, string(sig))
 		}
-		sig, err := get(ctx, url+".sig", 4096)
-		if err != nil {
-			return release.Manifest{}, err
-		}
-		return release.Parse(data, string(sig), pub)
-	}
-	return func(ctx context.Context) (release.Manifest, error) {
-		m, err := once(ctx)
-		// The manifest and its signature are two requests: a release published between them
-		// leaves the new manifest with the old signature. Asking again gets a matching pair.
+		err := once()
 		if errors.Is(err, release.ErrSignature) {
-			m, err = once(ctx)
+			err = once()
 		}
+		return err
+	}
+	manifest := func(ctx context.Context, u string) (m release.Manifest, err error) {
+		err = signed(ctx, u, func(data []byte, sig string) (err error) {
+			m, err = release.Parse(data, sig, pub)
+			return err
+		})
 		return m, err
+	}
+	fromIndex := func(ctx context.Context, q Query) (Found, error) {
+		var ix release.Index
+		err := signed(ctx, indexURL, func(data []byte, sig string) (err error) {
+			ix, err = release.ParseIndex(data, sig, pub)
+			return err
+		})
+		if err != nil {
+			return Found{}, fmt.Errorf("release index: %w", err)
+		}
+		c := release.Choose(ix.Releases, q.Current, q.Channel == release.Beta)
+		var f Found
+		e := c.Target
+		switch {
+		case c.Newest.Version == "":
+			return f, errors.New("release index: no release of the channel")
+		case e.Version == "":
+			// Nothing to update to: the newest release is what the page shows.
+			e = c.Newest
+			if release.Newer(e.Version, q.Current) {
+				f.Newest, f.Unreachable = e.Version, true
+			}
+		case c.Hop():
+			f.Newest = c.Newest.Version
+		}
+		m, err := manifest(ctx, e.Manifest)
+		if err != nil {
+			return Found{}, fmt.Errorf("release index: %s: %w", e.Version, err)
+		}
+		if m.Version != e.Version {
+			return Found{}, fmt.Errorf("release index: the manifest of %s is of %s", e.Version, m.Version)
+		}
+		f.Manifest = m
+		return f, nil
+	}
+	return func(ctx context.Context, q Query) (Found, error) {
+		f, err := fromIndex(ctx, q)
+		if err == nil {
+			return f, nil
+		}
+		m, lerr := manifest(ctx, latestURL)
+		if lerr != nil {
+			return Found{}, lerr
+		}
+		return Found{Manifest: m, Fallback: err.Error()}, nil
 	}
 }
 
@@ -100,14 +176,21 @@ type Checker struct {
 	now     func() time.Time
 
 	mu      sync.Mutex
-	latest  *release.Manifest
+	policy  Policy
+	found   *Found
 	checked time.Time
 	err     string
 }
 
+// Policy is what the host updater takes from the panel's settings.
+type Policy struct {
+	Auto    bool   `json:"auto"`
+	Channel string `json:"channel"`
+}
+
 // New makes a checker for the panel of version; dataDir "" or source nil turn parts off.
 func New(dataDir, version string, source Source, log *slog.Logger, now func() time.Time) *Checker {
-	c := &Checker{version: version, source: source, log: log, now: now}
+	c := &Checker{version: version, source: source, log: log, now: now, policy: Policy{Channel: release.Stable}}
 	if dataDir != "" {
 		c.dir = filepath.Join(dataDir, "update")
 	}
@@ -151,7 +234,10 @@ func (c *Checker) check(ctx context.Context) error {
 	if c.source == nil {
 		return nil
 	}
-	m, err := c.source(ctx)
+	c.mu.Lock()
+	q := Query{Current: c.version, Channel: c.policy.Channel}
+	c.mu.Unlock()
+	f, err := c.source(ctx, q)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.checked = c.now()
@@ -162,14 +248,23 @@ func (c *Checker) check(ctx context.Context) error {
 		}
 		return err
 	}
+	if c.log != nil {
+		if f.Fallback != "" {
+			c.log.Warn("update check: the latest release instead of the index", "release", f.Manifest.Version, "why", f.Fallback)
+		} else {
+			c.log.Info("update check", "source", "index", "channel", q.Channel, "release", f.Manifest.Version, "newest", f.Newest)
+		}
+	}
 	c.err = ""
-	c.latest = &m
+	c.found = &f
 	return nil
 }
 
 type State struct {
 	Current   string
+	Channel   string
 	Latest    *release.Manifest
+	Found     Found
 	CheckedAt time.Time
 	Error     string
 }
@@ -177,17 +272,33 @@ type State struct {
 func (c *Checker) State() State {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return State{Current: c.version, Latest: c.latest, CheckedAt: c.checked, Error: c.err}
+	s := State{Current: c.version, Channel: c.policy.Channel, CheckedAt: c.checked, Error: c.err}
+	if c.found != nil {
+		s.Found = *c.found
+		s.Latest = &s.Found.Manifest
+	}
+	return s
 }
 
-// Available says whether a newer release is out.
+// Available says whether a newer release is out that this panel can update to.
 func (s State) Available() bool {
-	return s.Latest != nil && release.Newer(s.Latest.Version, s.Current)
+	return s.Latest != nil && !s.Found.Unreachable && release.Newer(s.Latest.Version, s.Current)
 }
 
-// SetAuto tells the host whether its daily check may update.
-func (c *Checker) SetAuto(on bool) error {
-	data, _ := json.Marshal(map[string]bool{"auto": on})
+// SetPolicy tells the host whether its daily check may update and which channel it takes.
+// A channel other than the known ones is stable. A change of channel forgets what the
+// last check found on the other one.
+func (c *Checker) SetPolicy(p Policy) error {
+	if !release.ValidChannel(p.Channel) {
+		p.Channel = release.Stable
+	}
+	c.mu.Lock()
+	if c.policy.Channel != p.Channel {
+		c.found = nil
+	}
+	c.policy = p
+	c.mu.Unlock()
+	data, _ := json.Marshal(p)
 	return c.write("policy.json", data)
 }
 

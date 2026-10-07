@@ -4,8 +4,11 @@ package nodeapi
 
 import (
 	"encoding/json"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"mikan/internal/proto"
 	"mikan/internal/scan"
@@ -35,6 +38,8 @@ type DesiredState struct {
 	// Exits are the other nodes this one sends chosen inbounds through (a cascade).
 	Relay *Relay `json:"relay,omitempty"`
 	Exits []Exit `json:"exits,omitempty"`
+	// Torrent turns the torrent blocker on; nil: off. Nodes older than the blocker ignore it.
+	Torrent *TorrentBlock `json:"torrent,omitempty"`
 }
 
 type Inbound struct {
@@ -72,6 +77,11 @@ type Policy struct {
 	// Pools are the slot's quotas in traffic pools; a pool not listed has no limit.
 	// QuotaRemaining is then the quota of the inbounds outside every pool.
 	Pools []PoolQuota `json:"pools,omitempty"`
+	// TorrentExempt: the torrent blocker leaves the slot alone.
+	TorrentExempt bool `json:"torrent_exempt,omitempty"`
+	// BannedUntil (unix seconds) keeps the slot out until then: the torrent blocker
+	// caught it on some node of the panel. 0: no ban.
+	BannedUntil int64 `json:"banned_until,omitempty"`
 }
 
 type PoliciesRequest struct {
@@ -121,6 +131,90 @@ type Health struct {
 	Listeners []ListenerStatus `json:"listeners"`
 	Conns     int              `json:"conns"`
 	System    System           `json:"system"`
+	// Update is how the last update the panel asked for went, as the host's updater wrote
+	// it; nil while there is none. Nodes before 0.5.0.2 send nothing.
+	Update *UpdateStatus `json:"update,omitempty"`
+	// Host is what listens on the node's server, whoever runs it; nil when the node does not
+	// say (before 0.5.0.2, or it cannot read the kernel's tables).
+	Host *HostPorts `json:"host,omitempty"`
+}
+
+// HostPorts are the ports something listens on at the node's server: TCP sockets in the
+// listen state and bound UDP ports, sorted. The panel keeps its automatic picks off them,
+// as a port another program holds keeps a listener from starting.
+type HostPorts struct {
+	TCP []int `json:"tcp"`
+	UDP []int `json:"udp"`
+}
+
+// Listens says whether port is among the ones held over network (tcp or udp).
+func (h *HostPorts) Listens(network string, port int) bool {
+	if h == nil {
+		return false
+	}
+	list := h.TCP
+	if network == "udp" {
+		list = h.UDP
+	}
+	_, found := slices.BinarySearch(list, port)
+	return found
+}
+
+// The states of an update on the node's server.
+const (
+	UpdateRunning = "running"
+	UpdateOK      = "ok"
+	UpdateFailed  = "failed"
+)
+
+// UpdateRequest asks the node to be updated to a release (POST /v1/update). The node only
+// hands the version to the updater on its server, which updates to a signed release of that
+// version or refuses: no image or address comes from here.
+type UpdateRequest struct {
+	Version string `json:"version"`
+}
+
+// UpdateStatus is what the updater on the node's server wrote about its last update:
+// {"state", "version", "from", "error", "at"}, the same file the panel's own updater writes.
+type UpdateStatus struct {
+	State   string `json:"state" enum:"running,ok,failed"`
+	Version string `json:"version"`
+	From    string `json:"from"`
+	Error   string `json:"error,omitempty"`
+	At      string `json:"at" doc:"RFC 3339"`
+}
+
+// The most a status may say: the updater's words are short, and the panel keeps and shows
+// whatever a node sends, so a damaged file or a node of somebody else's making must not
+// fill its database and pages.
+const (
+	MaxUpdateField = 64
+	MaxUpdateError = 1000
+)
+
+// Clean returns the status with a known state and fields of a sane length; false when
+// the state is none of the three.
+func (u UpdateStatus) Clean() (UpdateStatus, bool) {
+	switch u.State {
+	case UpdateRunning, UpdateOK, UpdateFailed:
+	default:
+		return UpdateStatus{}, false
+	}
+	u.Version, u.From, u.At = clip(u.Version, MaxUpdateField), clip(u.From, MaxUpdateField), clip(u.At, MaxUpdateField)
+	u.Error = clip(u.Error, MaxUpdateError)
+	return u, true
+}
+
+// clip cuts s to at most n bytes without splitting a character.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[:n]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 type System struct {
@@ -136,6 +230,30 @@ type ListenerStatus struct {
 	Name  string `json:"name"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+	// Code names a failure the panel acts on: ListenerAddrInUse. Nodes before 0.5 send none;
+	// AddrInUse reads their Error instead.
+	Code string `json:"code,omitempty"`
+}
+
+// ListenerAddrInUse: the listener's address is already taken on the node's server.
+const ListenerAddrInUse = "addr_in_use"
+
+// AddrInUse says whether a listen error is "address already in use": the text Go gives
+// EADDRINUSE on Linux, the BSDs and macOS, and WSAEADDRINUSE on Windows.
+func AddrInUse(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "address already in use") || strings.Contains(msg, "only one usage of each socket address")
+}
+
+// Busy says whether the listener failed because something already listens on its port.
+func (l ListenerStatus) Busy() bool {
+	if l.OK {
+		return false
+	}
+	if l.Code != "" {
+		return l.Code == ListenerAddrInUse
+	}
+	return AddrInUse(l.Error)
 }
 
 // Activity tells the panel which inbounds each device reached lately. A device that
@@ -235,13 +353,17 @@ type Warp struct {
 
 // WarpStatus is the node's last look at the internet through WARP.
 type WarpStatus struct {
-	Configured bool      `json:"configured"`
-	OK         bool      `json:"ok"`
-	IP         string    `json:"ip,omitempty"`   // the address sites see
-	Warp       string    `json:"warp,omitempty"` // on | plus | off, as Cloudflare says
-	Colo       string    `json:"colo,omitempty"` // Cloudflare's data center
-	Error      string    `json:"error,omitempty"`
-	CheckedAt  time.Time `json:"checked_at"`
+	Configured bool   `json:"configured"`
+	OK         bool   `json:"ok"`
+	IP         string `json:"ip,omitempty"`   // the address sites see
+	Warp       string `json:"warp,omitempty"` // on | plus | off, as Cloudflare says
+	Colo       string `json:"colo,omitempty"` // Cloudflare's data center
+	// Error is a stable code: timeout | dns | tls | refused | not_loaded | bad_answer |
+	// https_timeout | failed. Detail says the same in words for the admin (no secrets).
+	// Older nodes send the code "unreachable" and no detail.
+	Error     string    `json:"error,omitempty"`
+	Detail    string    `json:"detail,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
 }
 
 // RelayListener names the relay's listener. It cannot clash with an inbound: their
@@ -277,4 +399,59 @@ type ProbeResult = WarpStatus
 type PoolQuota struct {
 	Pool      string `json:"pool"`
 	Remaining int64  `json:"remaining"` // bytes; -1 = unlimited
+}
+
+// TorrentBlock is the torrent blocker: the node looks at the first bytes a user sends
+// on each connection and UDP packet, and drops BitTorrent it recognises (the handshake,
+// DHT, uTP, tracker requests). Encrypted BitTorrent (MSE/PE) looks like noise and goes
+// through: the blocker is a deterrent, not a wall.
+type TorrentBlock struct {
+	// BanSeconds keeps a caught user out of the node for so long, every connection cut;
+	// 0: only what was caught is dropped.
+	BanSeconds int64 `json:"ban_seconds"`
+}
+
+// Kinds of BitTorrent traffic the node recognises.
+const (
+	TorrentHandshake = "handshake" // the peer wire protocol over TCP
+	TorrentTracker   = "tracker"   // an HTTP or UDP tracker announce
+	TorrentDHT       = "dht"
+	TorrentUTP       = "utp"
+)
+
+// TorrentHit is one catch of the torrent blocker. A slot is reported at most once a
+// minute; Count says how many catches the hit stands for.
+type TorrentHit struct {
+	Seq     int64  `json:"seq"`
+	Slot    string `json:"slot"`
+	IP      string `json:"ip"`
+	Inbound string `json:"inbound"`
+	Network string `json:"network" enum:"tcp,udp"`
+	Kind    string `json:"kind" enum:"handshake,tracker,dht,utp"`
+	Dest    string `json:"dest"`
+	At      int64  `json:"at"` // unix seconds
+	Count   int    `json:"count"`
+	// BannedUntil is when the node lets the slot in again (unix seconds); 0: no ban.
+	BannedUntil int64 `json:"banned_until,omitempty"`
+}
+
+// TorrentHits are the catches after a sequence number (GET /v1/torrents?after=N). The
+// node keeps the last few hundred in memory; Epoch changes when it restarts, and the
+// sequence starts over.
+type TorrentHits struct {
+	Epoch string       `json:"epoch"`
+	Hits  []TorrentHit `json:"hits"`
+}
+
+// SpeedTest is the node's own way to the internet (POST /v1/speedtest): latency, jitter
+// and loss of small UDP DNS queries, then download and upload against a speed test
+// server. A test that broke off keeps what it measured and says where in Error.
+type SpeedTest struct {
+	At       time.Time `json:"at"`
+	PingMs   float64   `json:"ping_ms" doc:"Медиана задержки, мс; -1 если ответов не было"`
+	JitterMs float64   `json:"jitter_ms" doc:"Средний разброс задержки, мс"`
+	LossPct  float64   `json:"loss_pct" doc:"Потери, %"`
+	DownBps  int64     `json:"down_bps" doc:"Загрузка, бит/с"`
+	UpBps    int64     `json:"up_bps" doc:"Отдача, бит/с"`
+	Error    string    `json:"error,omitempty"`
 }

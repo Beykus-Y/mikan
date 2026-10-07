@@ -14,6 +14,7 @@ import (
 	"mikan/internal/nodeapi"
 	"mikan/internal/panel/domain"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/torrent"
 )
 
 // TelegramLink is the Telegram account that manages a subscription in the bot.
@@ -25,6 +26,7 @@ type TelegramLink struct {
 
 type UserView struct {
 	Telegram      *TelegramLink `json:"telegram,omitempty" doc:"Только в карточке пользователя"`
+	Legacy        *LegacyLinks  `json:"legacy,omitempty" doc:"Старые ссылки подписки из панели, откуда импортирован пользователь. Только в карточке и не для ключа только на чтение: это тоже ссылка"`
 	ID            int64         `json:"id"`
 	Name          string        `json:"name"`
 	Contact       string        `json:"contact"`
@@ -47,7 +49,9 @@ type UserView struct {
 	SubURL        string        `json:"sub_url"`
 	Online        bool          `json:"online"`
 	OnlineIPs     []string      `json:"online_ips"`
+	BoundDevices  int64         `json:"bound_devices" doc:"Привязанные устройства: с привязкой это занятые места"`
 	OnlineAt      *time.Time    `json:"online_at"`
+	TorrentBan    *time.Time    `json:"torrent_ban" doc:"До какого времени действует бан блокировщика торрентов; null — бана нет"`
 	CreatedAt     time.Time     `json:"created_at"`
 }
 
@@ -72,6 +76,7 @@ func ptrTime(v int64, ok bool) *time.Time {
 type userEnv struct {
 	subBase string // "": no address yet, or the caller may not see links
 	online  map[string]nodeapi.Online
+	bans    map[int64]int64 // user → when the torrent ban ends; nil while the blocker is off
 }
 
 func (h *handlers) userEnv(ctx context.Context) userEnv {
@@ -81,6 +86,18 @@ func (h *handlers) userEnv(ctx context.Context) userEnv {
 		e.subBase = h.d.SubBase(ctx)
 	}
 	e.online = h.online()
+	// The list still shows without them: a ban is a note on a user, not the user.
+	if h.d.Settings == nil {
+		return e
+	}
+	if c, err := torrent.Load(ctx, h.d.Settings); err == nil && c.Enabled {
+		if rows, err := h.d.Store.Q.ActiveTorrentBans(ctx, h.d.Now().Unix()); err == nil {
+			e.bans = make(map[int64]int64, len(rows))
+			for _, r := range rows {
+				e.bans[r.UserID] = r.BannedUntil
+			}
+		}
+	}
 	return e
 }
 
@@ -92,7 +109,7 @@ func (h *handlers) online() map[string]nodeapi.Online {
 	return h.d.Online()
 }
 
-func (h *handlers) viewUser(u db.User, slots []string, grants domain.GrantsLeft, env userEnv) UserView {
+func (h *handlers) viewUser(u db.User, slots []string, bound int64, grants domain.GrantsLeft, env userEnv) UserView {
 	now := h.d.Now()
 	v := UserView{
 		ID: u.ID, Name: u.Name, Contact: u.Contact, Note: u.Note, Tags: domain.DecodeTags(u.Tags),
@@ -102,7 +119,7 @@ func (h *handlers) viewUser(u db.User, slots []string, grants domain.GrantsLeft,
 		ResetStrategy: u.ResetStrategy, ExpiresAt: ptrTime(u.ExpiresAt.Int64, u.ExpiresAt.Valid),
 		BillingDay: ptrInt(u.BillingDay.Int64, u.BillingDay.Valid),
 		Inbounds:   domain.DecodeInbounds(u.Inbounds), OnlineAt: ptrTime(u.OnlineAt.Int64, u.OnlineAt.Valid),
-		CreatedAt: time.Unix(u.CreatedAt, 0).UTC(), OnlineIPs: []string{},
+		CreatedAt: time.Unix(u.CreatedAt, 0).UTC(), OnlineIPs: []string{}, BoundDevices: bound,
 	}
 	if v.Inbounds == nil {
 		v.Inbounds = []int64{}
@@ -112,6 +129,9 @@ func (h *handlers) viewUser(u db.User, slots []string, grants domain.GrantsLeft,
 	}
 	if env.subBase != "" {
 		v.SubURL = env.subBase + "/" + u.SubToken
+	}
+	if until, ok := env.bans[u.ID]; ok {
+		v.TorrentBan = ptrTime(until, true)
 	}
 	v.OnlineIPs = env.liveIPs(slots)
 	v.Online = len(v.OnlineIPs) > 0
@@ -132,9 +152,22 @@ func (e userEnv) liveIPs(slots []string) []string {
 	return out
 }
 
-// allUserSlots maps every user to the names of all their slots: for a list.
+// allUserSlots maps every user to the names of all their slots.
 func (h *handlers) allUserSlots(ctx context.Context) (map[int64][]string, error) {
 	rows, err := h.d.Store.Q.ListSlotUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m := map[int64][]string{}
+	for _, r := range rows {
+		m[r.UserID] = append(m[r.UserID], r.SlotName)
+	}
+	return m, nil
+}
+
+// userSlots maps the users of ids to the names of all their slots: for a list's page.
+func (h *handlers) userSlots(ctx context.Context, ids []int64) (map[int64][]string, error) {
+	rows, err := h.d.Store.Q.UserSlotsOf(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -287,11 +320,10 @@ func mapDomainErr(err error) error {
 }
 
 func (h *handlers) listUsers(ctx context.Context, in *listUsersInput) (*listUsersOutput, error) {
+	// The filters stay in Go: the search lowercases as Go does (PostgreSQL's lower() follows
+	// the database's locale, and a C locale leaves Cyrillic as it is), and the states are
+	// domain.State. Only the page's users get their slots read.
 	users, err := h.d.Store.Q.ListUsers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	names, err := h.allUserSlots(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -332,9 +364,26 @@ func (h *handlers) listUsers(ctx context.Context, in *listUsersInput) (*listUser
 	end := min(in.Offset+in.Limit, len(matched))
 	out.Body.Items = []UserView{}
 	if in.Offset < len(matched) {
+		page := matched[in.Offset:end]
+		ids := make([]int64, len(page))
+		for i, u := range page {
+			ids[i] = u.ID
+		}
+		names, err := h.userSlots(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		counts, err := h.d.Store.Q.CountBoundDevicesOf(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		bound := make(map[int64]int64, len(counts))
+		for _, c := range counts {
+			bound[c.UserID] = c.N
+		}
 		env := h.userEnv(ctx)
-		for _, u := range matched[in.Offset:end] {
-			out.Body.Items = append(out.Body.Items, h.viewUser(u, names[u.ID], grants, env))
+		for _, u := range page {
+			out.Body.Items = append(out.Body.Items, h.viewUser(u, names[u.ID], bound[u.ID], grants, env))
 		}
 	}
 	return out, nil
@@ -348,11 +397,15 @@ func (h *handlers) userResult(ctx context.Context, u db.User, err error) (*userO
 	if err != nil {
 		return nil, err
 	}
+	bound, err := h.d.Store.Q.CountBoundDevices(ctx, u.ID)
+	if err != nil {
+		return nil, err
+	}
 	grants, err := domain.UserGrantsLeft(ctx, h.d.Store.Q, u.ID, h.d.Now())
 	if err != nil {
 		return nil, err
 	}
-	return &userOutput{Body: h.viewUser(u, slots, grants, h.userEnv(ctx))}, nil
+	return &userOutput{Body: h.viewUser(u, slots, bound, grants, h.userEnv(ctx))}, nil
 }
 
 func (h *handlers) createUser(ctx context.Context, in *createUserInput) (*userOutput, error) {
@@ -372,6 +425,10 @@ func (h *handlers) getUser(ctx context.Context, in *userIDInput) (*userOutput, e
 	if err == nil {
 		if l, lerr := h.d.Store.Q.TgLinkOfUser(ctx, u.ID); lerr == nil {
 			out.Body.Telegram = &TelegramLink{ID: l.TgID, Username: l.Username, Name: l.FirstName}
+		}
+		// An old link is a credential like the own one: not for a key that may only read.
+		if !hidesSecrets(ctx) {
+			out.Body.Legacy = h.legacyLinks(ctx, u.ID)
 		}
 	}
 	return out, err

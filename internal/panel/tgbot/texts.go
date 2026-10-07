@@ -12,13 +12,15 @@ import (
 type words struct {
 	welcome, main, renew, expiring, expired, traffic90, trafficEnd string // admin
 
-	back, yesUnbind, cancel, subscriptions, openPage, support          string
+	back, yesUnbind, cancel, subscriptions, openPage, support, promo   string
 	subTitle, devicesTitle, connectTitle, switchTitle                  string
 	stateActive, stateExpiring, stateLimited, stateExpired, stateOff   string
 	forever, termUntil, noLimit, trafficOf, trafficNoLimit, resets     string
 	devicesNone, devicesOff, devicesNote, confirmUnbind, unbound, wait string
 	connectText, linked, alreadyLinked, linkExpired, linkInvalid       string
 	linkLimit, noSub, sharedPlace, device, justNow                     string
+	// Taking a subscription off the Telegram account: it keeps working in the apps.
+	removeSub, confirmRemove, yesRemove, removed string
 	// A subscription already linked to another account is moved only if its owner agrees.
 	transferAsk, transferAllow, transferDeny, transferAsked, transferBusy, transferDone string
 	transferDenied, transferDeniedNew, transferStale, transferNotice                    string
@@ -32,10 +34,15 @@ type words struct {
 	// The shop.
 	buy, buyTitle, renewTitle, payHow, payStars, payCard, payCrypto, payAddon, payButton, invoice, payNew, payRenew string
 	notForSale, payUnavailable, tooManyInvoices, payStale, paidNew, paidRenew                                       string
+	trial, trialDone, trialUsed, trialOff, trialOpen, trialFail                                                     string
+	pickTerm, priceFrom                                                                                             string
 	poolOut                                                                                                         string // a traffic pool used up
 
 	// Traffic packages.
 	buyTraffic, trafficTitle, payPackage, packageGone, paidPackage, plusPackages string
+
+	// A refund takes back what the payment gave.
+	refundedNew, refundedRenew, refundedPackage, refundedGone string
 }
 
 var ru = words{
@@ -47,7 +54,7 @@ var ru = words{
 	traffic90:  "📦 Израсходовано 90% трафика подписки «{name}»: осталось {left}.",
 	trafficEnd: "📦 Трафик подписки «{name}» на этот период закончился. Обновится {reset}.",
 
-	back: "⬅️ Назад", yesUnbind: "✅ Да, отвязать", cancel: "↩️ Отмена", subscriptions: "🔁 Подписки", openPage: "🌐 Открыть страницу подписки", support: "💬 Поддержка",
+	back: "⬅️ Назад", promo: "🎟 Промокоды", yesUnbind: "✅ Да, отвязать", cancel: "↩️ Отмена", subscriptions: "🔁 Подписки", openPage: "🌐 Открыть страницу подписки", support: "💬 Поддержка",
 	subTitle: "Подписка «%s»", devicesTitle: "Устройства", connectTitle: "Подключить устройство", switchTitle: "Какую подписку показать?",
 	stateActive: "✅ Работает", stateExpiring: "⏳ Скоро закончится", stateLimited: "📦 Трафик на этот период закончился", stateExpired: "⛔️ Подписка закончилась", stateOff: "⏸ Доступ приостановлен",
 	forever: "бессрочно", termUntil: "до %s — осталось %s", noLimit: "без лимита", trafficOf: "%s из %s", trafficNoLimit: "%s, без лимита", resets: "🔄 Обновится: %s",
@@ -56,8 +63,12 @@ var ru = words{
 	devicesNote:       "Отвязанное устройство сразу отключается, а место освобождается. Отвязывать можно одно устройство в сутки.",
 	confirmUnbind:     "Отвязать «%s»? Оно сразу отключится.",
 	unbound:           "✅ «%s» отвязано.",
+	removeSub:         "🗑 Убрать из бота",
+	confirmRemove:     "Убрать подписку «%s» из этого Telegram?\n\nОна продолжит работать в приложениях, но уведомления о ней сюда приходить перестанут. Чтобы вернуть её, пришлите сюда ссылку на подписку.",
+	yesRemove:         "✅ Да, убрать",
+	removed:           "✅ Подписка «%s» убрана из бота.",
 	wait:              "⏳ Следующее устройство можно отвязать %s.",
-	connectText:       "1. Установите приложение: Happ (iPhone, Android), Koala Clash (Windows) или другое со страницы подписки.\n2. Добавьте в него ссылку:\n<code>%s</code>\n\nНа странице подписки — кнопки «Добавить» для всех приложений.",
+	connectText:       "1. Установите приложение: Happ (iPhone, Android), ClashFest (Android), Koala Clash (Windows), SlothClash (Windows, Mac, Linux) или другое со страницы подписки.\n2. Добавьте в него ссылку:\n<code>%s</code>\n\nНа странице подписки — кнопки «Добавить» для всех приложений.",
 	linked:            "✅ Подписка «%s» подключена.",
 	alreadyLinked:     "Подписка «%s» уже здесь.",
 	linkExpired:       "Ссылка устарела. Обновите страницу подписки и нажмите «Открыть в Telegram» ещё раз.",
@@ -86,9 +97,17 @@ var ru = words{
 	payNew:          "подписка будет готова",
 	payRenew:        "подписка продлится",
 	notForSale:      "Этот тариф больше не продаётся.",
+	pickTerm:        "На какой срок?",
+	priceFrom:       "от %s",
 	payUnavailable:  "Оплата сейчас недоступна. Попробуйте позже или напишите в поддержку.",
 	tooManyInvoices: "Слишком много счетов подряд. Попробуйте через час.",
 	payStale:        "Счёт устарел. Откройте меню бота и оплатите заново.",
+	trial:           "🎁 Попробовать бесплатно",
+	trialDone:       "🎁 Пробная подписка готова: %s.\n\nСсылка и инструкции в меню.",
+	trialUsed:       "Пробный период даётся один раз, и только тем, у кого ещё не было подписки.",
+	trialOff:        "Пробный период сейчас недоступен.",
+	trialOpen:       "📱 Открыть подписку",
+	trialFail:       "Не получилось выдать пробный период. Попробуйте позже или напишите в поддержку.",
 	paidNew:         "✅ Оплата получена — подписка «%s» готова (тариф «%s»).\n\nДобавьте ссылку в приложение:\n<code>%s</code>",
 	paidRenew:       "✅ Оплата получена — подписка «%s» продлена до %s.",
 	poolOut:         "закончился до сброса",
@@ -99,6 +118,11 @@ var ru = words{
 	packageGone:  "Этот пакет больше не продаётся.",
 	paidPackage:  "✅ Оплата получена — пакет «%s» начислен на подписку «%s».",
 	plusPackages: "%s + пакеты %s",
+
+	refundedNew:     "↩️ Платёж за тариф «%s» возвращён. Подписка «%s» отключена.",
+	refundedRenew:   "↩️ Платёж за продление «%s» возвращён. Срок подписки «%s» уменьшен. Окончание: %s.",
+	refundedPackage: "↩️ Платёж за пакет «%s» возвращён. Трафик пакета снят с подписки «%s».",
+	refundedGone:    "↩️ Платёж за «%s» возвращён.",
 }
 
 var en = words{
@@ -110,7 +134,7 @@ var en = words{
 	traffic90:  "📦 90% of the traffic of “{name}” is used: {left} left.",
 	trafficEnd: "📦 The traffic of “{name}” for this period is used up. It renews {reset}.",
 
-	back: "⬅️ Back", yesUnbind: "✅ Yes, unbind", cancel: "↩️ Cancel", subscriptions: "🔁 Subscriptions", openPage: "🌐 Open the subscription page", support: "💬 Support",
+	back: "⬅️ Back", promo: "🎟 Promo codes", yesUnbind: "✅ Yes, unbind", cancel: "↩️ Cancel", subscriptions: "🔁 Subscriptions", openPage: "🌐 Open the subscription page", support: "💬 Support",
 	subTitle: "Subscription “%s”", devicesTitle: "Devices", connectTitle: "Connect a device", switchTitle: "Which subscription to show?",
 	stateActive: "✅ Working", stateExpiring: "⏳ Ends soon", stateLimited: "📦 Traffic for this period is used up", stateExpired: "⛔️ The subscription has ended", stateOff: "⏸ Access is paused",
 	forever: "no end date", termUntil: "until %s — %s left", noLimit: "unlimited", trafficOf: "%s of %s", trafficNoLimit: "%s, unlimited", resets: "🔄 Renews: %s",
@@ -119,8 +143,12 @@ var en = words{
 	devicesNote:       "An unbound device is disconnected at once and its place frees up. You can unbind one device a day.",
 	confirmUnbind:     "Unbind “%s”? It disconnects at once.",
 	unbound:           "✅ “%s” is unbound.",
+	removeSub:         "🗑 Remove from the bot",
+	confirmRemove:     "Remove the subscription “%s” from this Telegram account?\n\nIt keeps working in the apps, but its notices stop coming here. To bring it back, send its subscription link here.",
+	yesRemove:         "✅ Yes, remove",
+	removed:           "✅ The subscription “%s” is removed from the bot.",
 	wait:              "⏳ You can unbind the next device %s.",
-	connectText:       "1. Install an app: Happ (iPhone, Android), Koala Clash (Windows) or another from the subscription page.\n2. Add this link to it:\n<code>%s</code>\n\nThe subscription page has “Add” buttons for every app.",
+	connectText:       "1. Install an app: Happ (iPhone, Android), ClashFest (Android), Koala Clash (Windows), SlothClash (Windows, Mac, Linux) or another from the subscription page.\n2. Add this link to it:\n<code>%s</code>\n\nThe subscription page has “Add” buttons for every app.",
 	linked:            "✅ Subscription “%s” is connected.",
 	alreadyLinked:     "Subscription “%s” is already here.",
 	linkExpired:       "The link has expired. Reload the subscription page and tap “Open in Telegram” again.",
@@ -149,9 +177,17 @@ var en = words{
 	payNew:          "subscription is ready",
 	payRenew:        "subscription is renewed",
 	notForSale:      "This plan is no longer sold.",
+	pickTerm:        "For how long?",
+	priceFrom:       "from %s",
 	payUnavailable:  "Payment is not available right now. Try later or message support.",
 	tooManyInvoices: "Too many invoices in a row. Try again in an hour.",
 	payStale:        "The invoice is out of date. Open the bot's menu and pay again.",
+	trial:           "🎁 Try it for free",
+	trialDone:       "🎁 Your trial subscription is ready: %s.\n\nThe link and instructions are in the menu.",
+	trialUsed:       "The trial is given once, and only to people who have not had a subscription.",
+	trialOff:        "The trial is not available now.",
+	trialOpen:       "📱 Open the subscription",
+	trialFail:       "Could not give the trial. Try later or message support.",
 	paidNew:         "✅ Payment received — subscription “%s” is ready (plan “%s”).\n\nAdd the link to your app:\n<code>%s</code>",
 	paidRenew:       "✅ Payment received — subscription “%s” is renewed until %s.",
 	poolOut:         "used up until the reset",
@@ -162,6 +198,11 @@ var en = words{
 	packageGone:  "This package is no longer sold.",
 	paidPackage:  "✅ Payment received — package “%s” is added to subscription “%s”.",
 	plusPackages: "%s + packages %s",
+
+	refundedNew:     "↩️ The payment for plan “%s” is refunded. Subscription “%s” is turned off.",
+	refundedRenew:   "↩️ The payment for the renewal “%s” is refunded. The term of subscription “%s” is shortened. Ends: %s.",
+	refundedPackage: "↩️ The payment for package “%s” is refunded. Its traffic is taken off subscription “%s”.",
+	refundedGone:    "↩️ The payment for “%s” is refunded.",
 }
 
 func wordsFor(lang string) *words {

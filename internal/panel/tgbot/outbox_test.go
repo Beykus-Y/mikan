@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,6 +102,40 @@ func TestOutboxRepliesFirst(t *testing.T) {
 	got := s.wait(t, 52)
 	if got[0].chat != 999 || got[1].chat != 500 {
 		t.Fatalf("reply, then the notice, then the broadcast: %d %d", got[0].chat, got[1].chat)
+	}
+}
+
+func TestChannelMessageMethodsUseChannelTarget(t *testing.T) {
+	type request struct {
+		method string
+		body   map[string]any
+	}
+	var calls []request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		calls = append(calls, request{method, body})
+		if method == "sendMessage" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"message_id": 17, "chat": map[string]any{"id": -100123, "type": "channel"}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "1:x", nil)
+	msg, err := c.SendTo(context.Background(), "@status_channel", "working", true)
+	if err != nil || msg.MessageID != 17 {
+		t.Fatalf("send channel message: %+v %v", msg, err)
+	}
+	if err := c.EditTo(context.Background(), "@status_channel", msg.MessageID, "recovered"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PinTo(context.Background(), "@status_channel", msg.MessageID); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || calls[0].body["chat_id"] != "@status_channel" || calls[1].body["chat_id"] != "@status_channel" || calls[2].body["chat_id"] != "@status_channel" || calls[2].body["disable_notification"] != true {
+		t.Fatalf("channel calls: %+v", calls)
 	}
 }
 

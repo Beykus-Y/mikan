@@ -117,7 +117,7 @@ func (s *Service) MoveBuiltin(ctx context.Context) error {
 			return err
 		}
 	}
-	res, err := s.d.Store.DB.ExecContext(ctx, `UPDATE payments SET provider = 'addon:' || provider WHERE provider IN (?, ?)`, legacyYooKassa, legacyCryptoBot)
+	res, err := s.d.Store.DB.ExecContext(ctx, `UPDATE payments SET provider = 'addon:' || provider WHERE provider IN ($1, $2)`, legacyYooKassa, legacyCryptoBot)
 	if err != nil {
 		return fmt.Errorf("billing: rename built-in payments: %w", err)
 	}

@@ -7,6 +7,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiError } from "../api/client";
 import { Atmosphere } from "../components/atmosphere";
+import { getTheme, setTheme } from "../components/theme";
 import { ErrorBoundary } from "../components/error-boundary";
 import { ToastProvider } from "../components/toast";
 import { initI18n } from "../i18n";
@@ -25,6 +26,9 @@ const queryClient = new QueryClient({
 
 const router = createAppRouter(queryClient);
 
+// Apply the saved theme before the first render so navigation never resets it.
+setTheme(getTheme());
+
 window.addEventListener("mikan:unauthorized", () => {
   if (router.state.location.pathname === "/login") return;
   queryClient.clear();
@@ -34,7 +38,7 @@ window.addEventListener("mikan:unauthorized", () => {
 // Dictionaries load before the first render: t() stays synchronous everywhere. Pages read
 // their texts at render time and subscribe to the language themselves (see page() in
 // router.tsx), so a switch redraws them without remounting anything.
-void initI18n(adminDicts).then(() =>
+void initI18n(adminDicts).then(() => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <ErrorBoundary>
@@ -49,5 +53,5 @@ void initI18n(adminDicts).then(() =>
         </QueryClientProvider>
       </ErrorBoundary>
     </StrictMode>,
-  ),
-);
+  );
+});

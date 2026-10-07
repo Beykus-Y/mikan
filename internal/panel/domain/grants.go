@@ -1,9 +1,11 @@
 package domain
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -95,55 +97,166 @@ func UserGrantsLeft(ctx context.Context, q *db.Queries, userID int64, now time.T
 	return out, nil
 }
 
-// CountUserTraffic adds a batch of the user's main traffic on q's transaction and takes
-// what goes past the base quota from the main grants.
-func CountUserTraffic(ctx context.Context, q *db.Queries, userID, up, down int64, now time.Time) error {
-	u, err := q.GetUser(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if err := q.AddUserTraffic(ctx, db.AddUserTrafficParams{Up: up, Down: down, ID: userID}); err != nil {
-		return err
-	}
-	return spendGrants(ctx, q, userID, sql.NullInt64{}, Overflow(u.TrafficLimit, u.UsedUp+u.UsedDown, up+down), now)
+// Bytes is an amount of traffic.
+type Bytes struct{ Up, Down int64 }
+
+// TrafficBatch is traffic to count: main traffic by user, pool traffic by user and pool.
+type TrafficBatch struct {
+	Main  map[int64]Bytes
+	Pools map[[2]int64]Bytes // {user, pool}
 }
 
-// CountPoolTraffic adds a batch of the user's traffic in a pool on q's transaction and
-// takes what goes past the pool's base quota from the pool's grants.
-func CountPoolTraffic(ctx context.Context, q *db.Queries, userID, poolID, up, down int64, now time.Time) error {
-	p, err := q.GetUserPool(ctx, db.GetUserPoolParams{UserID: userID, PoolID: poolID})
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if err := q.AddUserPoolTraffic(ctx, db.AddUserPoolTrafficParams{UserID: userID, PoolID: poolID, UsedUp: up, UsedDown: down}); err != nil {
-		return err
-	}
-	pool := sql.NullInt64{Int64: poolID, Valid: true}
-	return spendGrants(ctx, q, userID, pool, Overflow(p.TrafficLimit, p.UsedUp+p.UsedDown, up+down), now)
-}
-
-// spendGrants takes n bytes from the user's active grants for a target (pool NULL: the
-// main traffic) in the spending order. What no grant covers is not owed later: the node
-// let it through before it learned the quota was out.
-func spendGrants(ctx context.Context, q *db.Queries, userID int64, pool sql.NullInt64, n int64, now time.Time) error {
-	if n <= 0 {
-		return nil
-	}
-	gs, err := q.ListSpendableGrants(ctx, db.ListSpendableGrantsParams{UserID: userID, PoolID: pool, Now: now.Unix()})
-	if err != nil {
-		return err
-	}
-	for _, g := range gs {
-		if n == 0 {
-			break
+// CountTraffic counts a batch on q's transaction in a few set-based statements: the
+// users' counters, the pools', the statistics, and what went past a base quota taken
+// from the grants. Users and pools deleted meanwhile are skipped, the rest still counts.
+//
+// READ COMMITTED is enough: the users' rows are locked first, in id order, so batches
+// (and period resets, which lock the user first too) take turns per user instead of
+// aborting each other; every counter adds in place, and what the grants pay is worked out
+// from the counters the locked rows return and from the grants locked after them.
+func CountTraffic(ctx context.Context, q *db.Queries, b TrafficBatch, now time.Time) error {
+	var poolIDs []int64
+	seen := map[int64]bool{}
+	for k, t := range b.Pools {
+		if t != (Bytes{}) && !seen[k[1]] {
+			seen[k[1]] = true
+			poolIDs = append(poolIDs, k[1])
 		}
-		take := min(n, g.Remaining)
-		if err := q.SpendGrant(ctx, db.SpendGrantParams{Spent: take, ID: g.ID}); err != nil {
+	}
+	pools := map[int64]bool{}
+	if len(poolIDs) > 0 {
+		slices.Sort(poolIDs)
+		ids, err := q.LockTrafficPools(ctx, poolIDs)
+		if err != nil {
 			return err
 		}
-		n -= take
+		for _, id := range ids {
+			pools[id] = true
+		}
 	}
-	return nil
+	// What each user's row takes: main traffic and the traffic of pools that still exist.
+	type sums struct{ main, pool Bytes }
+	byUser := map[int64]*sums{}
+	of := func(id int64) *sums {
+		if byUser[id] == nil {
+			byUser[id] = &sums{}
+		}
+		return byUser[id]
+	}
+	for id, t := range b.Main {
+		if t != (Bytes{}) {
+			s := of(id)
+			s.main.Up, s.main.Down = s.main.Up+t.Up, s.main.Down+t.Down
+		}
+	}
+	for k, t := range b.Pools {
+		if t != (Bytes{}) && pools[k[1]] {
+			s := of(k[0])
+			s.pool.Up, s.pool.Down = s.pool.Up+t.Up, s.pool.Down+t.Down
+		}
+	}
+	if len(byUser) == 0 {
+		return nil
+	}
+	want := make([]int64, 0, len(byUser))
+	for id := range byUser {
+		want = append(want, id)
+	}
+	slices.Sort(want)
+	users, err := q.LockUsers(ctx, want)
+	if err != nil || len(users) == 0 {
+		return err
+	}
+	var p db.AddUsersTrafficParams
+	var stats db.AddTrafficHourlyBatchParams
+	for _, id := range users {
+		s := byUser[id]
+		p.Ids, p.Up, p.Down = append(p.Ids, id), append(p.Up, s.main.Up), append(p.Down, s.main.Down)
+		p.PoolUp, p.PoolDown = append(p.PoolUp, s.pool.Up), append(p.PoolDown, s.pool.Down)
+		stats.UserIds = append(stats.UserIds, id)
+		stats.Up, stats.Down = append(stats.Up, s.main.Up+s.pool.Up), append(stats.Down, s.main.Down+s.pool.Down)
+	}
+	counted, err := q.AddUsersTraffic(ctx, p)
+	if err != nil {
+		return err
+	}
+	// What went past a base quota, by user and target (pool 0: the main traffic).
+	over := map[[2]int64]int64{}
+	for _, r := range counted {
+		m := byUser[r.ID].main
+		if n := Overflow(r.TrafficLimit, r.Used-m.Up-m.Down, m.Up+m.Down); n > 0 {
+			over[[2]int64{r.ID, 0}] = n
+		}
+	}
+	locked := make(map[int64]bool, len(users))
+	for _, id := range users {
+		locked[id] = true
+	}
+	var pp db.AddUserPoolsTrafficParams
+	keys := make([][2]int64, 0, len(b.Pools))
+	for k, t := range b.Pools {
+		if t != (Bytes{}) && pools[k[1]] && locked[k[0]] {
+			keys = append(keys, k)
+		}
+	}
+	slices.SortFunc(keys, func(a, b [2]int64) int { return cmp.Or(cmp.Compare(a[0], b[0]), cmp.Compare(a[1], b[1])) })
+	for _, k := range keys {
+		t := b.Pools[k]
+		pp.UserIds, pp.PoolIds, pp.Up, pp.Down = append(pp.UserIds, k[0]), append(pp.PoolIds, k[1]), append(pp.Up, t.Up), append(pp.Down, t.Down)
+	}
+	if len(keys) > 0 {
+		rows, err := q.AddUserPoolsTraffic(ctx, pp)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			t := b.Pools[[2]int64{r.UserID, r.PoolID}]
+			if n := Overflow(r.TrafficLimit, r.Used-t.Up-t.Down, t.Up+t.Down); n > 0 {
+				over[[2]int64{r.UserID, r.PoolID}] = n
+			}
+		}
+	}
+	if err := spendGrants(ctx, q, over, now); err != nil {
+		return err
+	}
+	if err := q.AddTrafficHourlyBatch(ctx, db.AddTrafficHourlyBatchParams{UserIds: stats.UserIds, Hour: now.Unix() / 3600, Up: stats.Up, Down: stats.Down}); err != nil {
+		return err
+	}
+	return q.AddTrafficDailyBatch(ctx, db.AddTrafficDailyBatchParams{UserIds: stats.UserIds, Day: now.Unix() / 86400, Up: stats.Up, Down: stats.Down})
+}
+
+// spendGrants takes what went past the base quotas from the active grants of each target
+// in the spending order; only the users who went past one are read. What no grant covers
+// is not owed later: the node let it through before it learned the quota was out.
+func spendGrants(ctx context.Context, q *db.Queries, over map[[2]int64]int64, now time.Time) error {
+	if len(over) == 0 {
+		return nil
+	}
+	seen := map[int64]bool{}
+	var users []int64
+	for k := range over {
+		if !seen[k[0]] {
+			seen[k[0]] = true
+			users = append(users, k[0])
+		}
+	}
+	slices.Sort(users)
+	gs, err := q.LockSpendableGrants(ctx, db.LockSpendableGrantsParams{UserIds: users, Now: now.Unix()})
+	if err != nil {
+		return err
+	}
+	var spend db.SpendGrantsParams
+	for _, g := range gs {
+		k := [2]int64{g.UserID, g.PoolID}
+		if take := min(over[k], g.Remaining); take > 0 {
+			over[k] -= take
+			spend.Ids, spend.Spent = append(spend.Ids, g.ID), append(spend.Spent, take)
+		}
+	}
+	if len(spend.Ids) == 0 {
+		return nil
+	}
+	return q.SpendGrants(ctx, spend)
 }
 
 // StartPeriod begins a new traffic period on q's transaction: the main and pool counters
@@ -153,6 +266,32 @@ func StartPeriod(ctx context.Context, q *db.Queries, userID, start int64, now ti
 	if err := q.ResetUserTraffic(ctx, db.ResetUserTrafficParams{PeriodStart: start, UpdatedAt: now.Unix(), ID: userID}); err != nil {
 		return err
 	}
+	return endPeriod(ctx, q, userID, now)
+}
+
+// StartPeriodIfOlder is StartPeriod for the scheduled resets, decided on a row read
+// before: it begins the period only while the user's current one started before start,
+// so a period a payment began meanwhile is not reset again. It says whether it did.
+func StartPeriodIfOlder(ctx context.Context, q *db.Queries, userID, start int64, now time.Time) (bool, error) {
+	n, err := q.StartPeriodIfOlder(ctx, db.StartPeriodIfOlderParams{PeriodStart: start, UpdatedAt: now.Unix(), ID: userID})
+	if err != nil || n == 0 {
+		return false, err
+	}
+	return true, endPeriod(ctx, q, userID, now)
+}
+
+// startPeriods is StartPeriod now for many users at once.
+func startPeriods(ctx context.Context, q *db.Queries, ids []int64, now time.Time) error {
+	if err := q.ResetUsersTraffic(ctx, db.ResetUsersTrafficParams{Now: now.Unix(), Ids: ids}); err != nil {
+		return err
+	}
+	if err := q.ResetUsersPools(ctx, ids); err != nil {
+		return err
+	}
+	return q.EndUsersPeriodGrants(ctx, db.EndUsersPeriodGrantsParams{Now: now.Unix(), Ids: ids})
+}
+
+func endPeriod(ctx context.Context, q *db.Queries, userID int64, now time.Time) error {
 	if err := q.ResetUserPools(ctx, userID); err != nil {
 		return err
 	}

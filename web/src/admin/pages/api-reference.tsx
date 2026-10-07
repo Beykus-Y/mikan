@@ -155,6 +155,18 @@ function Intro() {
       <div className="api-h">{t("apiPage.example")}</div>
       <CodeBlock code={`curl -s -H "Authorization: Bearer $MIKAN_KEY" \\\n  "${base}/users?state=active&limit=10"`} label={t("apiPage.copyExample")} />
       <p className="mt-3 text-xs text-[var(--ink-500)]">{t("apiPage.downloadHint")}</p>
+      <div className="api-h">{t("apiPage.prometheus")}</div>
+      <p className="mb-2 text-xs text-[var(--ink-500)]">{t("apiPage.prometheusHint")}</p>
+      <CodeBlock
+        code={`- job_name: mikan
+  scheme: https
+  metrics_path: ${new URL(base).pathname}/metrics
+  authorization:
+    credentials: mk_…  # a read key
+  static_configs:
+    - targets: ["${new URL(base).host}"]`}
+        label={t("apiPage.copyExample")}
+      />
     </section>
   );
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/infraalerts"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store/db"
 	"mikan/internal/panel/tgbot"
@@ -22,19 +23,21 @@ import (
 // TelegramView is the bot as the admin panel shows it. The token itself never leaves
 // the panel.
 type TelegramView struct {
-	Enabled    bool               `json:"enabled"`
-	TokenSet   bool               `json:"token_set" doc:"Токен сохранён"`
-	TokenHint  string             `json:"token_hint,omitempty" doc:"ID бота из токена"`
-	Running    bool               `json:"running"`
-	Error      string             `json:"error,omitempty" doc:"token_invalid, token_revoked, unreachable или ответ Telegram"`
-	Bot        *TelegramBot       `json:"bot,omitempty"`
-	Config     tgbot.Config       `json:"config"`
-	Defaults   tgbot.Texts        `json:"defaults" doc:"Встроенные тексты на языке бота: пустое поле берёт их"`
-	MiniAppURL string             `json:"mini_app_url" doc:"Адрес Mini App; пусто — Telegram его не откроет: нет адреса или сертификат самоподписанный"`
-	Linked     int64              `json:"linked" doc:"Подписок, привязанных к Telegram"`
-	Accounts   int64              `json:"accounts" doc:"Аккаунтов Telegram с подписками"`
-	Broadcast  *TelegramBroadcast `json:"broadcast,omitempty" doc:"Последняя рассылка с запуска панели"`
-	Route      TelegramRoute      `json:"route" doc:"Как бот ходит в Telegram"`
+	Enabled        bool                     `json:"enabled"`
+	TokenSet       bool                     `json:"token_set" doc:"Токен сохранён"`
+	TokenHint      string                   `json:"token_hint,omitempty" doc:"ID бота из токена"`
+	Running        bool                     `json:"running"`
+	Error          string                   `json:"error,omitempty" doc:"token_invalid, token_revoked, unreachable или ответ Telegram"`
+	Bot            *TelegramBot             `json:"bot,omitempty"`
+	Config         tgbot.Config             `json:"config"`
+	Defaults       tgbot.Texts              `json:"defaults" doc:"Встроенные тексты на языке бота: пустое поле берёт их"`
+	MiniAppURL     string                   `json:"mini_app_url" doc:"Адрес Mini App; пусто — Telegram его не откроет: нет адреса или сертификат самоподписанный"`
+	Linked         int64                    `json:"linked" doc:"Подписок, привязанных к Telegram"`
+	Accounts       int64                    `json:"accounts" doc:"Аккаунтов Telegram с подписками"`
+	Broadcast      *TelegramBroadcast       `json:"broadcast,omitempty" doc:"Последняя рассылка с запуска панели"`
+	Route          TelegramRoute            `json:"route" doc:"Как бот ходит в Telegram"`
+	Infrastructure infraalerts.AlertsConfig `json:"infrastructure"`
+	AdminChatSet   bool                     `json:"admin_chat_set"`
 }
 
 type TelegramRoute struct {
@@ -61,10 +64,11 @@ type telegramOutput struct{ Body TelegramView }
 
 type patchTelegramInput struct {
 	Body struct {
-		Enabled *bool         `json:"enabled,omitempty"`
-		Token   *string       `json:"token,omitempty" maxLength:"100" doc:"Токен от @BotFather; пустая строка — удалить"`
-		Config  *tgbot.Config `json:"config,omitempty"`
-		Route   *struct {
+		Enabled        *bool                          `json:"enabled,omitempty"`
+		Token          *string                        `json:"token,omitempty" maxLength:"100" doc:"Токен от @BotFather; пустая строка — удалить"`
+		Config         *tgbot.Config                  `json:"config,omitempty"`
+		Infrastructure *infraalerts.AlertsConfigPatch `json:"infrastructure,omitempty"`
+		Route          *struct {
 			Mode   string  `json:"mode" enum:"direct,node,proxy"`
 			NodeID int64   `json:"node_id,omitempty" minimum:"0" doc:"Удалённая нода панели (mode=node)"`
 			Proxy  *string `json:"proxy,omitempty" maxLength:"512" doc:"socks5://user:pass@host:port, http://… или https://…; не передан — прежний (mode=proxy)"`
@@ -84,11 +88,47 @@ type broadcastOutput struct {
 	}
 }
 
+type infrastructureConnectOutput struct {
+	Body struct {
+		URL string `json:"url"`
+	}
+}
+
+func (h *handlers) connectInfrastructureAdmin(ctx context.Context, _ *struct{}) (*infrastructureConnectOutput, error) {
+	if h.d.Telegram == nil {
+		return nil, huma.Error503ServiceUnavailable("bot_unavailable")
+	}
+	url, err := h.d.Telegram.BeginInfrastructureAdminConnect(ctx)
+	if errors.Is(err, tgbot.ErrOff) {
+		return nil, huma.Error409Conflict("bot_off")
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := &infrastructureConnectOutput{}
+	out.Body.URL = url
+	h.audit(ctx, sessionOf(ctx).AdminID, "telegram.infrastructure_connect", "telegram", "", nil)
+	return out, nil
+}
+
+func (h *handlers) disconnectInfrastructureAdmin(ctx context.Context, _ *struct{}) (*struct{}, error) {
+	if h.d.Telegram == nil {
+		return nil, huma.Error503ServiceUnavailable("bot_unavailable")
+	}
+	if err := h.d.Telegram.DisconnectInfrastructureAdmin(ctx); err != nil {
+		return nil, err
+	}
+	h.audit(ctx, sessionOf(ctx).AdminID, "telegram.infrastructure_disconnect", "telegram", "", nil)
+	return nil, nil
+}
+
 func (h *handlers) registerTelegram() {
 	tags := []string{"telegram"}
 	huma.Register(h.api, huma.Operation{OperationID: "get-telegram", Method: http.MethodGet, Path: "/api/v1/telegram", Summary: "Telegram-бот", Tags: tags}, h.getTelegram)
 	huma.Register(h.api, huma.Operation{OperationID: "update-telegram", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPatch, Path: "/api/v1/telegram", Summary: "Настроить Telegram-бота", Tags: tags}, h.updateTelegram)
 	huma.Register(h.api, huma.Operation{OperationID: "telegram-broadcast", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPost, Path: "/api/v1/telegram/broadcast", Summary: "Разослать сообщение всем в боте", Tags: tags, DefaultStatus: http.StatusAccepted}, h.broadcast)
+	huma.Register(h.api, huma.Operation{OperationID: "telegram-infrastructure-connect", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPost, Path: "/api/v1/telegram/infrastructure/connect", Summary: "Подключить чат администратора для уведомлений", Tags: tags}, h.connectInfrastructureAdmin)
+	huma.Register(h.api, huma.Operation{OperationID: "telegram-infrastructure-disconnect", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodDelete, Path: "/api/v1/telegram/infrastructure/connect", Summary: "Отключить чат администратора для уведомлений", Tags: tags, DefaultStatus: http.StatusNoContent}, h.disconnectInfrastructureAdmin)
 	huma.Register(h.api, huma.Operation{OperationID: "unlink-telegram", Method: http.MethodDelete, Path: "/api/v1/users/{id}/telegram", Summary: "Отвязать подписку от Telegram", Tags: tags, DefaultStatus: http.StatusNoContent}, h.unlinkTelegram)
 }
 
@@ -127,6 +167,16 @@ func (h *handlers) telegramView(ctx context.Context) (TelegramView, error) {
 		v.Config = tgbot.Default(lang)
 	}
 	v.Defaults = tgbot.DefaultTexts(v.Config.Lang)
+	v.Infrastructure, _, err = settings.GetOver(ctx, h.d.Settings, infraalerts.KeyConfig, infraalerts.Default())
+	if err != nil {
+		return v, err
+	}
+	if h.d.Telegram != nil {
+		_, v.AdminChatSet, err = h.d.Telegram.InfrastructureAdminChat(ctx)
+		if err != nil {
+			return v, err
+		}
+	}
 	route := tgbot.Route{Mode: tgbot.RouteDirect}
 	if h.d.Telegram != nil {
 		if route, err = h.d.Telegram.LoadRoute(ctx); err != nil {
@@ -222,14 +272,39 @@ func (h *handlers) updateTelegram(ctx context.Context, in *patchTelegramInput) (
 		}
 		details["config"] = true
 	}
+	if b.Infrastructure != nil {
+		details["infrastructure"] = true
+	}
 	if b.Enabled != nil && *b.Enabled && token == "" {
 		return nil, tgFieldErr("enabled", "tg_no_token")
 	}
 
 	// One transaction: a token saved without the route that reaches it, or a route without
-	// the switch that turns the bot on, is a bot that does not start.
+	// the switch that turns the bot on, is a bot that does not start. The alerts' settings
+	// are merged into what the transaction reads, so two PATCHes at once do not undo each
+	// other's fields (a serialization conflict merges again).
 	err = h.d.Store.Tx(ctx, func(q *db.Queries) error {
 		set := settings.New(q)
+		var infrastructure *infraalerts.AlertsConfig
+		if b.Infrastructure != nil {
+			current, _, err := settings.GetOver(ctx, set, infraalerts.KeyConfig, infraalerts.Default())
+			if err != nil {
+				return err
+			}
+			merged := b.Infrastructure.Merge(current)
+			if err := merged.Validate(); err != nil {
+				return tgFieldErr("infrastructure", err.Error())
+			}
+			infrastructure = &merged
+		}
+		if b.Enabled != nil && *b.Enabled && b.Token == nil {
+			// The token checked above may have been removed meanwhile.
+			if cur, err := set.String(ctx, tgbot.KeyToken); err != nil {
+				return err
+			} else if cur == "" {
+				return tgFieldErr("enabled", "tg_no_token")
+			}
+		}
 		if b.Route != nil {
 			if err := settings.Set(ctx, set, tgbot.KeyRoute, route); err != nil {
 				return err
@@ -249,6 +324,11 @@ func (h *handlers) updateTelegram(ctx context.Context, in *patchTelegramInput) (
 		}
 		if b.Config != nil {
 			if err := settings.Set(ctx, set, tgbot.KeyConfig, *b.Config); err != nil {
+				return err
+			}
+		}
+		if infrastructure != nil {
+			if err := settings.Set(ctx, set, infraalerts.KeyConfig, *infrastructure); err != nil {
 				return err
 			}
 		}

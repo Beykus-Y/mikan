@@ -12,14 +12,14 @@ import (
 	"mikan/internal/panel/domain"
 	"mikan/internal/panel/presets"
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 )
 
 // The installer's SNI step: `targets scan --json` lists sites next to the server and the
 // current targets, `targets apply --all` points every REALITY inbound at the chosen one.
 func TestTargetsScanAndApply(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

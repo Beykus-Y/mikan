@@ -1,5 +1,5 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, unwrap, type Schemas, type User } from "./client";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, rawApi, unwrap, type Schemas, type User } from "./client";
 
 export const qk = {
   me: ["me"] as const,
@@ -28,7 +28,12 @@ export const qk = {
   pools: ["pools"] as const,
   userPools: (id: number) => ["users", "pools", id] as const,
   packages: ["packages"] as const,
+  promocodes: ["promocodes"] as const,
+  promocodeRedemptions: ["promocodes", "redemptions"] as const,
   userGrants: (id: number) => ["users", "grants", id] as const,
+  torrent: ["torrent"] as const,
+  torrentHits: (user: number) => ["torrent", "hits", user] as const,
+  speedTests: (node: number) => ["speedtests", node] as const,
 };
 
 export const meQuery = {
@@ -116,12 +121,33 @@ export function useNode() {
 }
 
 export function useNodes() {
-  return useQuery({ queryKey: qk.nodes, queryFn: ({ signal }) => unwrap(api.GET("/api/v1/nodes", { signal })), refetchInterval: 10_000 });
+  return useQuery({
+    queryKey: qk.nodes,
+    queryFn: ({ signal }) => unwrap(api.GET("/api/v1/nodes", { signal })),
+    // Closer while a node updates: it goes down and comes back on the new version.
+    refetchInterval: (q) => (q.state.data?.some((n) => n.update?.state === "running") ? 4_000 : 10_000),
+  });
 }
 
 /** Payment settings: also whether selling is on, which shows Payments in the menu. */
 export function usePaymentSettings() {
   return useQuery({ queryKey: qk.paymentSettings, queryFn: ({ signal }) => unwrap(api.GET("/api/v1/payments/settings", { signal })) });
+}
+
+export function useTorrent() {
+  return useQuery({ queryKey: qk.torrent, queryFn: ({ signal }) => unwrap(api.GET("/api/v1/torrent", { signal })) });
+}
+
+/** The torrent blocker's catches, newest first, a page at a time; user 0: everyone's. */
+export function useTorrentHits(user = 0, limit = 50) {
+  return useInfiniteQuery({
+    queryKey: [...qk.torrentHits(user), limit],
+    queryFn: ({ pageParam, signal }) =>
+      unwrap(api.GET("/api/v1/torrent/hits", { params: { query: { user_id: user || undefined, before: pageParam || undefined, limit } }, signal })),
+    initialPageParam: 0,
+    getNextPageParam: (last) => (last.length < limit ? undefined : last[last.length - 1]!.id),
+    refetchInterval: 30_000,
+  });
 }
 
 export function useSettings() {
@@ -177,4 +203,101 @@ export function usePackages() {
 
 export function useUserGrants(id: number) {
   return useQuery({ queryKey: qk.userGrants(id), queryFn: ({ signal }) => unwrap(api.GET("/api/v1/users/{id}/grants", { params: { path: { id } }, signal })) });
+}
+
+
+export type PromoCode = {
+  id: number;
+  code: string;
+  name: string;
+  description: string;
+  type: "days" | "traffic" | "percent" | "fixed";
+  value: number;
+  currency: string;
+  starts_at?: string;
+  ends_at?: string;
+  max_uses?: number;
+  used_count: number;
+  per_user_limit: number;
+  discount_ttl: number;
+  min_order: number;
+  max_discount: number;
+  tariff_ids: number[];
+  pool_id?: number;
+  first_purchase_only: boolean;
+  new_users_only: boolean;
+  enabled: boolean;
+  status: string;
+  created_at: string;
+  created_by?: number;
+};
+
+export type PromoRedemption = {
+  id: number;
+  promo_id: number;
+  user_id?: number;
+  tg_id: number;
+  payment_id?: number;
+  status: string;
+  redeemed_at: string;
+  expires_at?: string;
+  days: number;
+  bytes: number;
+  discount_amount: number;
+  original_amount: number;
+  final_amount: number;
+  currency: string;
+  code: string;
+};
+
+type PromoBody = {
+  code: string; name: string; description: string; type: PromoCode["type"]; value: number; currency: string;
+  starts_at?: number; ends_at?: number; max_uses?: number; per_user_limit: number; discount_ttl: number;
+  min_order: number; max_discount: number; tariff_ids: number[]; pool_id?: number; first_purchase_only: boolean; new_users_only: boolean; enabled: boolean;
+};
+
+type PromoList = { items: PromoCode[]; total: number };
+type PromoRedemptionList = { items: PromoRedemption[]; total: number };
+
+export function usePromocodes() {
+  return useQuery({
+    queryKey: qk.promocodes,
+    queryFn: ({ signal }) => rawJson<PromoList>("/api/v1/promocodes?limit=100", { signal }),
+  });
+}
+
+export function usePromoRedemptions() {
+  return useQuery({
+    queryKey: qk.promocodeRedemptions,
+    queryFn: ({ signal }) => rawJson<PromoRedemptionList>("/api/v1/promocodes/redemptions?limit=100", { signal }),
+  });
+}
+
+export function usePromoMutations() {
+  const queryClient = useQueryClient();
+  const refresh = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: qk.promocodes }),
+    queryClient.invalidateQueries({ queryKey: qk.promocodeRedemptions }),
+  ]);
+  const create = useMutation({
+    mutationFn: (body: PromoBody) => rawJson<PromoCode>("/api/v1/promocodes", { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }),
+    onSuccess: refresh,
+  });
+  const update = useMutation({
+    mutationFn: ({ id, body }: { id: number; body: PromoBody }) => rawJson<PromoCode>(`/api/v1/promocodes/${id}`, { method: "PUT", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }),
+    onSuccess: refresh,
+  });
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => rawJson<PromoCode>(`/api/v1/promocodes/${id}/enabled`, { method: "POST", body: JSON.stringify({ enabled }), headers: { "Content-Type": "application/json" } }),
+    onSuccess: refresh,
+  });
+  const remove = useMutation({
+    mutationFn: (id: number) => rawJson<Record<string, never>>(`/api/v1/promocodes/${id}`, { method: "DELETE" }),
+    onSuccess: refresh,
+  });
+  return { create, update, toggle, remove };
+}
+
+async function rawJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return rawApi(path, init) as Promise<T>;
 }

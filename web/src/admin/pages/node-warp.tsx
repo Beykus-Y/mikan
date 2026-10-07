@@ -11,7 +11,7 @@ import { useToast } from "../../components/toast";
 import { QueryBoundary } from "../../components/query";
 import { Button, Field, Pill, Segmented, Skeleton } from "../../components/ui";
 import { Switch } from "../../components/switch";
-import { t } from "../../i18n";
+import { t, tMaybe } from "../../i18n";
 import { useDraft } from "../../lib/draft";
 import { fieldErrors } from "../../lib/fields";
 import { ago } from "../../lib/format";
@@ -27,14 +27,22 @@ export function useWarp(nodeId: number | null, enabled = true) {
 }
 
 export function WarpDrawer({ node, onClose }: { node: { id: number; name: string } | null; onClose: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
   const warp = useWarp(node?.id ?? null);
+  // The button asks the node for a new look: a plain refetch would get its minute-old answer.
+  const check = useMutation({
+    mutationFn: () => unwrap(api.GET("/api/v1/nodes/{id}/warp", { params: { path: { id: node!.id }, query: { force: true } } })),
+    onSuccess: (w) => qc.setQueryData(qk.warp(node!.id), w),
+    onError: (e) => toast.error(errorText(e)),
+  });
   return (
     <Drawer open={!!node} onOpenChange={(v) => !v && onClose()} title={t("warp.title")} meta={node?.name}>
       <div className="pt-5">
         <QueryBoundary query={warp} pending={<Skeleton style={{ height: 240, borderRadius: 16 }} />}>
           {(w) =>
             w.configured ? (
-              <Configured key={node!.id} nodeId={node!.id} w={w} refetch={() => void warp.refetch()} checking={warp.isFetching} onClose={onClose} />
+              <Configured key={node!.id} nodeId={node!.id} w={w} onCheck={() => check.mutate()} checking={warp.isFetching || check.isPending} onClose={onClose} />
             ) : (
               <Setup key={node!.id} nodeId={node!.id} />
             )
@@ -112,7 +120,7 @@ function Setup({ nodeId }: { nodeId: number }) {
   );
 }
 
-function Configured({ nodeId, w, refetch, checking, onClose }: { nodeId: number; w: Warp; refetch: () => void; checking: boolean; onClose: () => void }) {
+function Configured({ nodeId, w, onCheck, checking, onClose }: { nodeId: number; w: Warp; onCheck: () => void; checking: boolean; onClose: () => void }) {
   const qc = useQueryClient();
   const toast = useToast();
   // The status check refetches `w`: the typed routes survive it.
@@ -150,6 +158,9 @@ function Configured({ nodeId, w, refetch, checking, onClose }: { nodeId: number;
   });
   const fields = fieldErrors(save.error);
   const s = w.status;
+  // The panel could not ask: that says nothing about WARP itself.
+  const nodeDown = s?.error === "node_unreachable";
+  const bad = w.enabled && s && !s.ok ? s : null;
   return (
     <>
       <div className="panel-soft mb-4 p-3" role="status">
@@ -158,7 +169,7 @@ function Configured({ nodeId, w, refetch, checking, onClose }: { nodeId: number;
             {t("warp.statusTitle")}
             {!w.enabled ? (
               <Pill tone="off">{t("warp.off")}</Pill>
-            ) : !s ? (
+            ) : !s || nodeDown ? (
               <Pill tone="off">{t("warp.unknown")}</Pill>
             ) : s.ok ? (
               <Pill tone="ok">{s.warp === "plus" ? "WARP+" : t("warp.works")}</Pill>
@@ -166,18 +177,31 @@ function Configured({ nodeId, w, refetch, checking, onClose }: { nodeId: number;
               <Pill tone="bad">{t("warp.down")}</Pill>
             )}
           </div>
-          <Button size="sm" variant="ghost" loading={checking} onClick={refetch} aria-label={t("warp.check")}>
+          <Button size="sm" variant="ghost" loading={checking} onClick={onCheck} aria-label={t("warp.check")}>
             <RefreshCw size={14} aria-hidden /> {t("warp.check")}
           </Button>
         </div>
-        {s && w.enabled ? (
+        {s && w.enabled && !nodeDown ? (
           <div className="mt-2 text-xs text-[var(--ink-500)]">
             {s.ok ? t("warp.exit", { ip: s.ip ?? "", colo: s.colo ?? "" }) : t("warp.downText")} · {ago(s.checked_at)}
           </div>
-        ) : w.enabled ? (
+        ) : w.enabled && !nodeDown ? (
           <div className="mt-2 text-xs text-[var(--ink-500)]">{t("warp.nodeUnreachable")}</div>
         ) : null}
+        {bad ? (
+          <div className="mt-2">
+            <p className="text-[13px] text-[var(--ink-700)]">
+              {tMaybe(`warp.why.${bad.error ?? "failed"}`, { endpoint: w.endpoint ?? "" }) ?? t("warp.whyUnknown", { code: bad.error ?? "" })}
+            </p>
+            {bad.detail ? <p className="mono mt-1 break-words text-xs text-[var(--ink-500)]">{bad.detail}</p> : null}
+          </div>
+        ) : null}
       </div>
+      {w.no_reserved && w.enabled && !s?.ok ? (
+        <div className="banner warn mb-4" role="status">
+          {t("warp.noReserved")}
+        </div>
+      ) : null}
 
       {save.error && !Object.keys(fields).length ? <div className="banner err mb-4">{errorText(save.error)}</div> : null}
       <div className="mb-4 flex items-start justify-between gap-3">

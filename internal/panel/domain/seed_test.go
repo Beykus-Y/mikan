@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 )
 
 // The installer bootstraps the panel with its language before the first start, so the
@@ -19,7 +19,7 @@ func TestSeedNamesTariffsInDefaultLang(t *testing.T) {
 		"en": {"Trial", "Standard", "Unlimited"},
 	} {
 		ctx := context.Background()
-		st, err := store.Open(ctx, t.TempDir())
+		st, err := storetest.Open(ctx, t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}

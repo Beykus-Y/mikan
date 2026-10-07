@@ -15,8 +15,8 @@ import (
 	"mikan/internal/nodeapi"
 	"mikan/internal/panel/auth"
 	"mikan/internal/panel/domain"
-	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 // What every user of an answer shares (the subscription address, who is online) is worked
@@ -24,7 +24,7 @@ import (
 // (six settings reads) and the whole online map 500 times each.
 func TestUserListReadsSharedStateOnce(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

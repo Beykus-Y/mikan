@@ -22,7 +22,7 @@ func (q *Queries) CountAdmins(ctx context.Context) (int64, error) {
 }
 
 const createAdmin = `-- name: CreateAdmin :one
-INSERT INTO admins (username, password_hash, created_at) VALUES (?, ?, ?)
+INSERT INTO admins (username, password_hash, created_at) VALUES ($1, $2, $3)
 RETURNING id, username, password_hash, totp_secret, recovery_codes, created_at, last_login_at
 `
 
@@ -49,7 +49,7 @@ func (q *Queries) CreateAdmin(ctx context.Context, arg CreateAdminParams) (Admin
 
 const createSession = `-- name: CreateSession :exec
 INSERT INTO sessions (id_hash, admin_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 `
 
 type CreateSessionParams struct {
@@ -78,7 +78,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) er
 }
 
 const deleteAdminSessions = `-- name: DeleteAdminSessions :exec
-DELETE FROM sessions WHERE admin_id = ?
+DELETE FROM sessions WHERE admin_id = $1
 `
 
 func (q *Queries) DeleteAdminSessions(ctx context.Context, adminID int64) error {
@@ -87,7 +87,7 @@ func (q *Queries) DeleteAdminSessions(ctx context.Context, adminID int64) error 
 }
 
 const deleteAdminSessionsExcept = `-- name: DeleteAdminSessionsExcept :exec
-DELETE FROM sessions WHERE admin_id = ? AND id_hash <> ?
+DELETE FROM sessions WHERE admin_id = $1 AND id_hash <> $2
 `
 
 type DeleteAdminSessionsExceptParams struct {
@@ -101,7 +101,7 @@ func (q *Queries) DeleteAdminSessionsExcept(ctx context.Context, arg DeleteAdmin
 }
 
 const deleteSession = `-- name: DeleteSession :exec
-DELETE FROM sessions WHERE id_hash = ?
+DELETE FROM sessions WHERE id_hash = $1
 `
 
 func (q *Queries) DeleteSession(ctx context.Context, idHash string) error {
@@ -110,7 +110,7 @@ func (q *Queries) DeleteSession(ctx context.Context, idHash string) error {
 }
 
 const deleteStaleSessions = `-- name: DeleteStaleSessions :exec
-DELETE FROM sessions WHERE expires_at < ?1 OR last_seen_at < ?2
+DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2
 `
 
 type DeleteStaleSessionsParams struct {
@@ -124,7 +124,7 @@ func (q *Queries) DeleteStaleSessions(ctx context.Context, arg DeleteStaleSessio
 }
 
 const getAdmin = `-- name: GetAdmin :one
-SELECT id, username, password_hash, totp_secret, recovery_codes, created_at, last_login_at FROM admins WHERE id = ?
+SELECT id, username, password_hash, totp_secret, recovery_codes, created_at, last_login_at FROM admins WHERE id = $1
 `
 
 func (q *Queries) GetAdmin(ctx context.Context, id int64) (Admin, error) {
@@ -143,7 +143,7 @@ func (q *Queries) GetAdmin(ctx context.Context, id int64) (Admin, error) {
 }
 
 const getAdminByUsername = `-- name: GetAdminByUsername :one
-SELECT id, username, password_hash, totp_secret, recovery_codes, created_at, last_login_at FROM admins WHERE username = ?
+SELECT id, username, password_hash, totp_secret, recovery_codes, created_at, last_login_at FROM admins WHERE username = $1
 `
 
 func (q *Queries) GetAdminByUsername(ctx context.Context, username string) (Admin, error) {
@@ -162,7 +162,7 @@ func (q *Queries) GetAdminByUsername(ctx context.Context, username string) (Admi
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id_hash, admin_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent FROM sessions WHERE id_hash = ?
+SELECT id_hash, admin_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent FROM sessions WHERE id_hash = $1
 `
 
 func (q *Queries) GetSession(ctx context.Context, idHash string) (Session, error) {
@@ -182,7 +182,7 @@ func (q *Queries) GetSession(ctx context.Context, idHash string) (Session, error
 }
 
 const getSetting = `-- name: GetSetting :one
-SELECT value FROM settings WHERE key = ?
+SELECT value FROM settings WHERE key = $1
 `
 
 func (q *Queries) GetSetting(ctx context.Context, key string) (string, error) {
@@ -194,7 +194,7 @@ func (q *Queries) GetSetting(ctx context.Context, key string) (string, error) {
 
 const insertAudit = `-- name: InsertAudit :exec
 INSERT INTO audit_log (ts, admin_id, action, target_type, target_id, ip, details)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type InsertAuditParams struct {
@@ -221,7 +221,7 @@ func (q *Queries) InsertAudit(ctx context.Context, arg InsertAuditParams) error 
 }
 
 const listAdminSessions = `-- name: ListAdminSessions :many
-SELECT id_hash, admin_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent FROM sessions WHERE admin_id = ? ORDER BY last_seen_at DESC
+SELECT id_hash, admin_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent FROM sessions WHERE admin_id = $1 ORDER BY last_seen_at DESC
 `
 
 func (q *Queries) ListAdminSessions(ctx context.Context, adminID int64) ([]Session, error) {
@@ -292,7 +292,7 @@ func (q *Queries) ListAdmins(ctx context.Context) ([]Admin, error) {
 }
 
 const listAudit = `-- name: ListAudit :many
-SELECT id, ts, admin_id, "action", target_type, target_id, ip, details FROM audit_log WHERE id < ?1 ORDER BY id DESC LIMIT ?2
+SELECT id, ts, admin_id, action, target_type, target_id, ip, details FROM audit_log WHERE id < $1 ORDER BY id DESC LIMIT CAST($2 AS BIGINT)
 `
 
 type ListAuditParams struct {
@@ -333,7 +333,7 @@ func (q *Queries) ListAudit(ctx context.Context, arg ListAuditParams) ([]AuditLo
 }
 
 const pruneAudit = `-- name: PruneAudit :execrows
-DELETE FROM audit_log WHERE ts < ?
+DELETE FROM audit_log WHERE ts < $1
 `
 
 func (q *Queries) PruneAudit(ctx context.Context, ts int64) (int64, error) {
@@ -345,7 +345,7 @@ func (q *Queries) PruneAudit(ctx context.Context, ts int64) (int64, error) {
 }
 
 const setAdminLastLogin = `-- name: SetAdminLastLogin :exec
-UPDATE admins SET last_login_at = ? WHERE id = ?
+UPDATE admins SET last_login_at = $1 WHERE id = $2
 `
 
 type SetAdminLastLoginParams struct {
@@ -359,7 +359,7 @@ func (q *Queries) SetAdminLastLogin(ctx context.Context, arg SetAdminLastLoginPa
 }
 
 const setAdminPassword = `-- name: SetAdminPassword :exec
-UPDATE admins SET password_hash = ? WHERE id = ?
+UPDATE admins SET password_hash = $1 WHERE id = $2
 `
 
 type SetAdminPasswordParams struct {
@@ -373,7 +373,7 @@ func (q *Queries) SetAdminPassword(ctx context.Context, arg SetAdminPasswordPara
 }
 
 const setAdminTOTP = `-- name: SetAdminTOTP :exec
-UPDATE admins SET totp_secret = ?, recovery_codes = ? WHERE id = ?
+UPDATE admins SET totp_secret = $1, recovery_codes = $2 WHERE id = $3
 `
 
 type SetAdminTOTPParams struct {
@@ -388,7 +388,7 @@ func (q *Queries) SetAdminTOTP(ctx context.Context, arg SetAdminTOTPParams) erro
 }
 
 const setSetting = `-- name: SetSetting :exec
-INSERT INTO settings (key, value) VALUES (?, ?)
+INSERT INTO settings (key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = excluded.value
 `
 
@@ -403,7 +403,7 @@ func (q *Queries) SetSetting(ctx context.Context, arg SetSettingParams) error {
 }
 
 const spendAdminRecoveryCodes = `-- name: SpendAdminRecoveryCodes :execrows
-UPDATE admins SET recovery_codes = ?1 WHERE id = ?2 AND recovery_codes = ?3
+UPDATE admins SET recovery_codes = $1 WHERE id = $2 AND recovery_codes = $3
 `
 
 type SpendAdminRecoveryCodesParams struct {
@@ -423,7 +423,7 @@ func (q *Queries) SpendAdminRecoveryCodes(ctx context.Context, arg SpendAdminRec
 }
 
 const touchSession = `-- name: TouchSession :exec
-UPDATE sessions SET last_seen_at = ? WHERE id_hash = ?
+UPDATE sessions SET last_seen_at = $1 WHERE id_hash = $2
 `
 
 type TouchSessionParams struct {

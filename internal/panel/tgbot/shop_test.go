@@ -130,6 +130,46 @@ func TestShopStars(t *testing.T) {
 	if links, _ := e.st.Q.ListTgLinksOf(e.ctx, buyer); len(links) != 1 {
 		t.Fatalf("a repeated payment made %d subscriptions", len(links))
 	}
+
+	// Telegram refunds the payment (the buyer asked it): the subscription is turned off and
+	// the buyer is told, once, however often the update comes.
+	refunded := Update{Message: &Message{MessageID: 100, From: &User{ID: buyer}, Chat: Chat{ID: buyer, Type: "private"},
+		RefundedPayment: &RefundedPayment{Currency: "XTR", TotalAmount: 50, InvoicePayload: payload, ChargeID: "tg-charge-1"}}}
+	told = ""
+	n = e.tg.count()
+	e.tg.push(refunded)
+	for _, c := range e.tg.until(t, n, func(cs []call) bool {
+		for _, c := range cs {
+			if c.method == "sendMessage" && strings.Contains(text(c), "Платёж за тариф «Месяц» возвращён") {
+				return true
+			}
+		}
+		return false
+	}) {
+		if c.method == "sendMessage" && strings.Contains(text(c), "возвращён") {
+			told = text(c)
+		}
+	}
+	if !strings.Contains(told, "отключена") {
+		t.Fatalf("buyer told %q", told)
+	}
+	links, _ = e.st.Q.ListTgLinksOf(e.ctx, buyer)
+	if u, err := e.st.Q.GetUser(e.ctx, links[0].ID); err != nil || u.Status != "disabled" {
+		t.Fatalf("the refunded subscription: %+v %v", u, err)
+	}
+	e.tg.push(refunded)
+	e.later()
+	n = e.tg.count()
+	e.say(buyer, "ещё")
+	again := 0
+	for _, c := range e.tg.wait(t, n, "sendMessage") {
+		if c.method == "sendMessage" && strings.Contains(text(c), "возвращён") {
+			again++
+		}
+	}
+	if again != 0 {
+		t.Fatalf("a repeated refund update told the buyer again")
+	}
 }
 
 func keys(m map[string]string) []string {

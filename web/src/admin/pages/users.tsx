@@ -4,7 +4,7 @@ import { CalendarPlus, ChevronRight, Plus, Power, RotateCcw, Search, Trash2, X }
 import { AnimatePresence, motion } from "motion/react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { errorText, type Tariff, type User } from "../../api/client";
-import { userActions, useTariffs, useUserMutation, useUsers } from "../../api/hooks";
+import { userActions, useSettings, useTariffs, useUserMutation, useUsers } from "../../api/hooks";
 import { Confirm } from "../../components/overlay";
 import { QueryBoundary } from "../../components/query";
 import { useToast } from "../../components/toast";
@@ -217,7 +217,9 @@ function Expiry({ u }: { u: User }) {
 // subscribes to the language itself.
 const UserRow = memo(function UserRow({ u, tariff, selected, onToggle, onOpen }: { u: User; tariff?: Tariff; selected: boolean; onToggle: (id: number) => void; onOpen: (id: number) => void }) {
   useLocale();
-  const devices = u.online_ips.length;
+  // With binding a place is a bound device, else an address online (see the drawer).
+  const binding = !!useSettings().data?.device_binding;
+  const devices = binding ? u.bound_devices : u.online_ips.length;
   // The row is clickable for the mouse; the keyboard and screen readers use the link in
   // the name cell and the checkbox, each a control of its own.
   return (

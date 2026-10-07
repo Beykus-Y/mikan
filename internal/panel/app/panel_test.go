@@ -21,6 +21,7 @@ import (
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 const (
@@ -42,7 +43,7 @@ type harness struct {
 func newHarness(t *testing.T, with ...func(*Options)) *harness {
 	t.Helper()
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,9 +63,12 @@ func newHarness(t *testing.T, with ...func(*Options)) *harness {
 	}
 	h := &harness{t: t, st: st, now: time.Now()}
 	web := fstest.MapFS{
-		"index.html":      {Data: []byte("<!doctype html><html><head><!-- mikan:base --></head><body></body></html>")},
-		"assets/app-1.js": {Data: []byte("console.log(1)")},
-		"sub.html":        {Data: []byte("<!doctype html><html><head><!-- mikan:base --></head><body>sub</body></html>")},
+		"index.html":           {Data: []byte("<!doctype html><html><head><!-- mikan:base --></head><body></body></html>")},
+		"assets/app-1.js":      {Data: []byte("console.log(1)")},
+		"sub.html":             {Data: []byte("<!doctype html><html><head><!-- mikan:base --></head><body>sub</body></html>")},
+		"favicon.png":          {Data: []byte("\x89PNG icon")},
+		"apple-touch-icon.png": {Data: []byte("\x89PNG touch")},
+		"secret.txt":           {Data: []byte("not for the subscription path")},
 	}
 	opts := Options{Version: "test", Web: web, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return h.now }, Resolve: testResolve}
 	for _, f := range with {
@@ -178,6 +182,22 @@ func TestAdminPathServesSPAWithBase(t *testing.T) {
 	resp, _ = h.do(http.MethodGet, "/"+adminPath+"/assets/missing.js", nil, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("missing asset: %d", resp.StatusCode)
+	}
+}
+
+// The icons reach the browser from the admin path and from the subscription page, which
+// otherwise serves only its assets.
+func TestIconsServedOnBothPages(t *testing.T) {
+	h := newHarness(t)
+	for _, base := range []string{"/" + adminPath, "/" + subPath} {
+		for _, f := range []string{"favicon.png", "apple-touch-icon.png"} {
+			if resp, body := h.do(http.MethodGet, base+"/"+f, nil, nil); resp.StatusCode != http.StatusOK || !strings.HasPrefix(string(body), "\x89PNG") {
+				t.Errorf("%s/%s: %d", base, f, resp.StatusCode)
+			}
+		}
+	}
+	if resp, _ := h.do(http.MethodGet, "/"+subPath+"/secret.txt", nil, nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("the subscription path served another file: %d", resp.StatusCode)
 	}
 }
 

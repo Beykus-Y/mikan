@@ -19,6 +19,7 @@ export function SubscriptionSection({ u, onReissue }: { u: User; onReissue: () =
     return (
       <Section title={t("userDrawer.subscription")}>
         <p className="text-[13px] text-[var(--ink-500)]">{t("userDrawer.noHost")}</p>
+        {u.legacy ? <LegacyLink legacy={u.legacy} /> : null}
       </Section>
     );
   }
@@ -44,7 +45,42 @@ export function SubscriptionSection({ u, onReissue }: { u: User; onReissue: () =
           </Button>
         </div>
       </div>
+      {u.legacy ? <LegacyLink legacy={u.legacy} /> : null}
     </Section>
+  );
+}
+
+type Legacy = NonNullable<User["legacy"]>;
+
+const SOURCES = { marzban: "Marzban", pasarguard: "PasarGuard", remnawave: "Remnawave" } as Record<string, string>;
+
+/** The link the user had in the panel they came from. Only Remnawave's can be shown whole:
+ * Marzban and PasarGuard sign a new token for every request, so the panel keeps none. */
+function LegacyLink({ legacy }: { legacy: Legacy }) {
+  const copyText = useCopy();
+  const source = SOURCES[legacy.source] ?? legacy.source;
+  const hint = !legacy.active
+    ? t("userDrawer.legacyOff")
+    : legacy.url
+      ? t("userDrawer.legacyUrl")
+      : legacy.source === "remnawave"
+        ? t("userDrawer.legacyNoHost")
+        : t("userDrawer.legacySigned");
+  return (
+    <div className="mt-5 border-t border-[var(--hairline)] pt-4">
+      <div className="mb-2 text-[13px] font-medium text-[var(--ink-700)]">{t("userDrawer.legacyTitle", { source })}</div>
+      {legacy.url ? (
+        <div className="link-field mb-2">
+          <span className="mono" title={legacy.url}>
+            {legacy.url}
+          </span>
+          <button type="button" className="icon-btn" onClick={() => copyText(legacy.url!, t("common.linkCopied"))} aria-label={t("common.copyLink")}>
+            <Copy size={18} />
+          </button>
+        </div>
+      ) : null}
+      <p className="text-xs text-[var(--ink-500)]">{hint}</p>
+    </div>
   );
 }
 

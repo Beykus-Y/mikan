@@ -17,7 +17,7 @@ import (
 
 	"mikan/internal/panel/domain"
 	"mikan/internal/panel/settings"
-	"mikan/internal/panel/store"
+	"mikan/internal/panel/store/storetest"
 	"mikan/internal/panel/tlscert"
 )
 
@@ -26,7 +26,7 @@ import (
 func TestCertCommand(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
-	st, err := store.Open(ctx, dataDir)
+	st, err := storetest.Open(ctx, dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}

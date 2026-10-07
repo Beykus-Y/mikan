@@ -16,7 +16,7 @@ import (
 
 // Callback data: m main, s subscription, d devices, dc:<id> confirm unbind, du:<id>
 // unbind, c connect, r renew, p:<button> the admin's page, w switch list, u:<user> show
-// that subscription.
+// that subscription, rm confirm removing it from the account, rd:<user> remove it.
 
 // screen renders what the chat sees for a press: text (HTML) and buttons.
 func (b *Bot) screen(ctx context.Context, cfg Config, chat int64, data, notice string) (string, *Keyboard) {
@@ -30,15 +30,17 @@ func (b *Bot) screen(ctx context.Context, cfg Config, chat int64, data, notice s
 		case "b":
 			return b.shopList(ctx, w, w.buyTitle, "tn", notice, home)
 		case "tn":
-			id, _ := strconv.ParseInt(arg, 10, 64)
-			return b.shopTariff(ctx, w, id, "pn", []Button{{Text: w.back, CallbackData: "b"}})
+			return b.shopTariff(ctx, w, arg, "tn", "pn", shopBack(w, "tn", arg, "b"))
 		case "pn":
 			id, _, _ := strings.Cut(arg, ":")
 			return b.shopInvoice(ctx, w, chat, 0, arg, []Button{{Text: w.back, CallbackData: "tn:" + id}})
 		}
 	}
+	if cmd == "tr" {
+		return b.takeTrial(ctx, w, chat)
+	}
 	if !ok {
-		return b.welcome(ctx, cfg, w, notice)
+		return b.welcome(ctx, cfg, w, chat, notice)
 	}
 	now := b.d.Now()
 	vars := b.vars(ctx, w, u, now)
@@ -51,8 +53,7 @@ func (b *Bot) screen(ctx context.Context, cfg Config, chat int64, data, notice s
 	}
 	switch cmd {
 	case "t":
-		id, _ := strconv.ParseInt(arg, 10, 64)
-		return b.shopTariff(ctx, w, id, "py", []Button{{Text: w.back, CallbackData: "r"}})
+		return b.shopTariff(ctx, w, arg, "t", "py", shopBack(w, "t", arg, "r"))
 	case "py":
 		id, _, _ := strings.Cut(arg, ":")
 		return b.shopInvoice(ctx, w, chat, u.ID, arg, []Button{{Text: w.back, CallbackData: "t:" + id}})
@@ -70,7 +71,13 @@ func (b *Bot) screen(ctx context.Context, cfg Config, chat int64, data, notice s
 		if offers := b.packageOffers(ctx, u.ID); len(offers) > 0 {
 			rows = append(rows, []Button{{Text: w.buyTraffic, CallbackData: "x"}})
 		}
+		rows = append(rows, []Button{{Text: w.removeSub, CallbackData: "rm"}})
 		return withNotice(strings.Join(lines, "\n")), &Keyboard{append(rows, back)}
+	case "rm":
+		// The id goes with the button: a tap after switching subscriptions removes the
+		// one that was asked about, not the one shown now.
+		return withNotice(html.EscapeString(fmt.Sprintf(w.confirmRemove, u.Name))), &Keyboard{[][]Button{
+			{{Text: w.yesRemove, CallbackData: "rd:" + strconv.FormatInt(u.ID, 10)}, {Text: w.cancel, CallbackData: "s"}}}}
 	case "x", "xk", "xp":
 		return b.trafficShop(ctx, w, chat, u, cmd, arg, notice)
 	case "d", "dc":
@@ -117,13 +124,16 @@ func (b *Bot) screen(ctx context.Context, cfg Config, chat int64, data, notice s
 	return withNotice(render(pick(cfg.Texts.Main, w.main), vars)), b.menu(ctx, cfg, w, len(list))
 }
 
-func (b *Bot) welcome(ctx context.Context, cfg Config, w *words, notice string) (string, *Keyboard) {
+func (b *Bot) welcome(ctx context.Context, cfg Config, w *words, chat int64, notice string) (string, *Keyboard) {
 	brand := b.brand(ctx)
 	text := render(pick(cfg.Texts.Welcome, w.welcome), map[string]string{"brand": brand})
 	if notice != "" {
 		text = html.EscapeString(notice) + "\n\n" + text
 	}
 	var rows [][]Button
+	if b.d.Billing != nil && b.d.Billing.TrialOpen(ctx, chat) {
+		rows = append(rows, []Button{{Text: w.trial, CallbackData: "tr"}})
+	}
 	if b.canBuyNew(ctx) {
 		rows = append(rows, []Button{{Text: w.buy, CallbackData: "b"}})
 	}
@@ -176,6 +186,9 @@ func (b *Bot) menu(ctx context.Context, cfg Config, w *words, subs int) *Keyboar
 		} else {
 			rows = append(rows, []Button{btn})
 		}
+	}
+	if url := b.miniAppURL(ctx, cfg); url != "" {
+		rows = append(rows, []Button{{Text: w.promo, WebApp: &WebApp{URL: url + "#promocodes"}}})
 	}
 	if subs > 1 {
 		rows = append(rows, []Button{{Text: fmt.Sprintf("%s (%d)", w.subscriptions, subs), CallbackData: "w"}})
@@ -288,6 +301,23 @@ func (b *Bot) act(ctx context.Context, chat int64, data string) (screen, notice 
 			if s.ID == id {
 				_ = b.d.Store.Q.SetTgCurrent(ctx, db.SetTgCurrentParams{Current: id, TgID: chat})
 			}
+		}
+		return "m", ""
+	case "rd":
+		// Only a subscription of this account, and only its link: the subscription itself
+		// stays as it is. The next one in the list is shown after it.
+		w := wordsFor(b.Config(ctx).Lang)
+		list, _, _ := b.subs(ctx, chat)
+		for _, s := range list {
+			if s.ID != id {
+				continue
+			}
+			if err := b.d.Store.Q.UnlinkTg(ctx, id); err != nil {
+				b.d.Log.Warn("telegram: remove a subscription", "user", id, "err", err)
+				return "s", ""
+			}
+			b.d.Log.Info("telegram: a subscription removed from its account", "user", id)
+			return "m", fmt.Sprintf(w.removed, s.Name)
 		}
 		return "m", ""
 	}

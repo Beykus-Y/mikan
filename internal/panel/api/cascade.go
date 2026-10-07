@@ -12,6 +12,7 @@ import (
 
 	"mikan/internal/nodeapi"
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/nodesync"
 	"mikan/internal/panel/store/db"
 )
 
@@ -35,13 +36,25 @@ type CascadeExit struct {
 	Probe    *ProbeView `json:"probe,omitempty" doc:"Проверка с этой ноды: какой IP видят сайты через цепочку"`
 }
 
+// The states of a relay's listener on the node (CascadeRelay.Listener).
+const (
+	relayUp      = "ok"
+	relayBusy    = "busy"    // another program holds the port
+	relayFailed  = "failed"  // it could not start, for another reason
+	relayUnknown = "unknown" // the node does not answer, or has not applied the relay yet
+)
+
+type CascadeRelay struct {
+	Port       string       `json:"port"`
+	Sources    []CascadeHop `json:"sources" doc:"Ноды, которые выходят через эту"`
+	Outbound   string       `json:"outbound" enum:"direct,warp,node" doc:"Куда эта нода выпускает их трафик"`
+	ExitNodeID *int64       `json:"exit_node_id,omitempty"`
+	Listener   string       `json:"listener" enum:"ok,busy,failed,unknown" doc:"Слушает ли нода порт служебного входа: busy, если порт занят другой программой"`
+	Error      string       `json:"error,omitempty" doc:"Почему служебный вход не запустился, как сказала нода"`
+}
+
 type CascadeView struct {
-	Relay *struct {
-		Port       string       `json:"port"`
-		Sources    []CascadeHop `json:"sources" doc:"Ноды, которые выходят через эту"`
-		Outbound   string       `json:"outbound" enum:"direct,warp,node" doc:"Куда эта нода выпускает их трафик"`
-		ExitNodeID *int64       `json:"exit_node_id,omitempty"`
-	} `json:"relay,omitempty" doc:"Служебный вход для других нод; есть, когда кто-то выходит через эту ноду"`
+	Relay *CascadeRelay `json:"relay,omitempty" doc:"Служебный вход для других нод; есть, когда кто-то выходит через эту ноду"`
 	Exits []CascadeExit `json:"exits" doc:"Ноды, через которые эта нода выпускает трафик"`
 }
 
@@ -77,6 +90,38 @@ func cascadeError(err error, field string) error {
 	return err
 }
 
+// relayListener is the state of the relay's listener in a health check, and the node's
+// words when it failed. A node that runs another port than the row's has not caught up
+// with a move yet: what it says is not about this port.
+func relayListener(hv nodesync.HealthView, port string) (state, why string) {
+	if !hv.OK || hv.Ports[nodeapi.RelayListener] != port {
+		return relayUnknown, ""
+	}
+	for _, l := range hv.Listeners {
+		switch {
+		case l.Name != nodeapi.RelayListener:
+		case l.OK:
+			return relayUp, ""
+		case l.Busy():
+			return relayBusy, l.Error
+		default:
+			return relayFailed, l.Error
+		}
+	}
+	return relayUnknown, ""
+}
+
+// hostOf is what a node last said listens on its server; nil when nobody knows.
+func (h *handlers) hostOf(id int64) *nodeapi.HostPorts {
+	if h.d.Nodes == nil {
+		return nil
+	}
+	if hv, ok := h.d.Nodes.Health(id); ok {
+		return hv.HostPorts()
+	}
+	return nil
+}
+
 func (h *handlers) getCascade(ctx context.Context, in *nodeIDInput) (*cascadeOutput, error) {
 	if _, err := h.getNode(ctx, in.ID); err != nil {
 		return nil, err
@@ -100,19 +145,19 @@ func (h *handlers) getCascade(ctx context.Context, in *nodeIDInput) (*cascadeOut
 		if err != nil {
 			return nil, err
 		}
-		v := &out.Body.Relay
-		*v = &struct {
-			Port       string       `json:"port"`
-			Sources    []CascadeHop `json:"sources" doc:"Ноды, которые выходят через эту"`
-			Outbound   string       `json:"outbound" enum:"direct,warp,node" doc:"Куда эта нода выпускает их трафик"`
-			ExitNodeID *int64       `json:"exit_node_id,omitempty"`
-		}{Port: r.Port, Sources: []CascadeHop{}, Outbound: r.Outbound}
+		v := &CascadeRelay{Port: r.Port, Sources: []CascadeHop{}, Outbound: r.Outbound, Listener: relayUnknown}
+		out.Body.Relay = v
 		for _, u := range users {
-			(*v).Sources = append((*v).Sources, CascadeHop{NodeID: u.SrcNodeID, Name: names[u.SrcNodeID]})
+			v.Sources = append(v.Sources, CascadeHop{NodeID: u.SrcNodeID, Name: names[u.SrcNodeID]})
 		}
 		if r.ExitNodeID.Valid {
 			id := r.ExitNodeID.Int64
-			(*v).Outbound, (*v).ExitNodeID = "node", &id
+			v.Outbound, v.ExitNodeID = "node", &id
+		}
+		if h.d.Nodes != nil {
+			if hv, ok := h.d.Nodes.Health(in.ID); ok {
+				v.Listener, v.Error = relayListener(hv, r.Port)
+			}
 		}
 	}
 	ins, err := q.ListInbounds(ctx)
@@ -160,7 +205,7 @@ func (h *handlers) patchCascade(ctx context.Context, in *cascadePatchInput) (*ca
 		if err != nil {
 			return err
 		}
-		if _, err := domain.EnsureRelay(ctx, q, n, h.d.Now()); err != nil {
+		if _, err := domain.EnsureRelay(ctx, q, n, h.d.Now(), h.hostOf(n.ID)); err != nil {
 			return err
 		}
 		outbound, exit := b.Outbound, sql.NullInt64{}
@@ -168,7 +213,7 @@ func (h *handlers) patchCascade(ctx context.Context, in *cascadePatchInput) (*ca
 			if b.ExitNodeID == 0 {
 				return domain.ErrNotFound
 			}
-			if err := domain.UseExit(ctx, q, in.ID, b.ExitNodeID, h.d.Now()); err != nil {
+			if err := domain.UseExit(ctx, q, in.ID, b.ExitNodeID, h.d.Now(), h.hostOf); err != nil {
 				return err
 			}
 			outbound, exit = "direct", sql.NullInt64{Int64: b.ExitNodeID, Valid: true}

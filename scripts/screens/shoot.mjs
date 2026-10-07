@@ -21,7 +21,7 @@ const SUB = "demosubs0000";
 const BASE = `https://127.0.0.1:2090/${ADMIN}/`;
 // The demo stack lives for a minute on 127.0.0.1; its admin password is thrown away.
 const PASS = crypto.randomBytes(18).toString("base64url");
-const env = { ...process.env, MIKAN_IMAGE: process.env.MIKAN_IMAGE || "mikan:dev" };
+const env = { ...process.env, MIKAN_IMAGE: process.env.MIKAN_IMAGE || "mikan:dev", MIKAN_TEST_POSTGRES_PASSWORD: crypto.randomBytes(32).toString("hex") };
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // the demo panel's certificate is self-signed
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const compose = (args, input) =>
@@ -30,10 +30,7 @@ const compose = (args, input) =>
 // Writes straight into the panel's database while the panel is stopped.
 function sql(text) {
   compose(["stop", "panel"]);
-  execFileSync("docker", ["run", "--rm", "-i", "-v", "mikan-screens_data:/data", "alpine:3", "sh", "-c", "apk add -q sqlite >/dev/null && sqlite3 /data/panel/mikan.db && chown 65532:65532 /data/panel/mikan.db*"], {
-    input: text,
-    stdio: ["pipe", "ignore", "inherit"],
-  });
+  compose(["exec", "-T", "postgres", "sh", "-c", 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql -h /run/postgresql -U mikan -d mikan -v ON_ERROR_STOP=1'], text);
   compose(["start", "panel"]);
 }
 
@@ -92,20 +89,20 @@ function seed(ids, now) {
       const local = (((h + 3) % 24) + 24) % 24; // Moscow time
       const curve = 0.25 + Math.max(0, Math.sin(((local - 9) / 24) * Math.PI * 2)) * 0.9 + (local >= 19 && local <= 23 ? 0.6 : 0);
       const down = Math.round(weight * curve * (0.12 + rnd(i, h) * 0.2) * GB);
-      lines.push(`INSERT OR REPLACE INTO traffic_hourly (user_id, hour, up, down) VALUES (${id}, ${h}, ${Math.round(down * 0.09)}, ${down});`);
+      lines.push(`INSERT INTO traffic_hourly (user_id, hour, up, down) VALUES (${id}, ${h}, ${Math.round(down * 0.09)}, ${down}) ON CONFLICT(user_id,hour) DO UPDATE SET up=excluded.up,down=excluded.down;`);
     }
     for (let d = day - 34; d <= day; d++) {
       const weekend = [5, 6].includes(new Date(d * 86400e3).getUTCDay()) ? 1.35 : 1;
       const down = Math.round(weight * weekend * (1.6 + rnd(i, d) * 2.4) * GB);
       if (d > day - 20) used += down;
-      lines.push(`INSERT OR REPLACE INTO traffic_daily (user_id, day, up, down) VALUES (${id}, ${d}, ${Math.round(down * 0.09)}, ${down});`);
+      lines.push(`INSERT INTO traffic_daily (user_id, day, up, down) VALUES (${id}, ${d}, ${Math.round(down * 0.09)}, ${down}) ON CONFLICT(user_id,day) DO UPDATE SET up=excluded.up,down=excluded.down;`);
     }
     const expires = i % 7 === 3 ? now + 2 * 86400 : i % 9 === 5 ? now + 5 * 86400 : now + (12 + Math.round(rnd(i, 9) * 18)) * 86400;
     lines.push(`UPDATE users SET used_down = ${used}, used_up = ${Math.round(used * 0.09)}, total_down = ${used * 3}, total_up = ${Math.round(used * 0.27)}, expires_at = ${expires} WHERE id = ${id};`);
   });
   lines.push(`UPDATE users SET status = 'disabled' WHERE id = ${ids[12]};`);
   lines.push(`UPDATE users SET used_down = traffic_limit WHERE id = ${ids[4]} AND traffic_limit IS NOT NULL;`);
-  lines.push(`INSERT OR REPLACE INTO settings (key, value) VALUES ('brand', '"mikan"');`);
+  lines.push(`INSERT INTO settings (key, value) VALUES ('brand', '"mikan"') ON CONFLICT(key) DO UPDATE SET value=excluded.value;`);
   lines.push("COMMIT;");
   return lines.join("\n");
 }
@@ -146,6 +143,7 @@ async function shoot(browser, lang, subURL) {
 }
 
 compose(["down", "-v", "--remove-orphans"]);
+compose(["up", "-d", "--wait", "postgres"]);
 compose(["run", "--rm", "--no-deps", "-T", "panel", "admin", "bootstrap", "--public-host", "vpn.example.com", "--port", "2053", "--admin-path", ADMIN, "--sub-path", SUB, "--username", "admin", "--password-stdin"], PASS + "\n");
 compose(["up", "-d"]);
 try {

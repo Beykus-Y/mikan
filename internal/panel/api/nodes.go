@@ -13,7 +13,9 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 
 	"mikan/internal/hostname"
+	"mikan/internal/nodeapi"
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/nodeupdate"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store/db"
 	"mikan/internal/panel/subs"
@@ -28,6 +30,7 @@ type NodeInfo struct {
 	Address     string     `json:"address" doc:"host:port API ноды; пусто у своей ноды"`
 	Host        string     `json:"host" doc:"Адрес для клиентов"`
 	Domain      string     `json:"domain"`
+	PublicName  string     `json:"public_name" doc:"Публичное имя для канала состояния; пустое — нода скрыта из списка"`
 	Enabled     bool       `json:"enabled"`
 	Inbounds    int        `json:"inbounds"`
 	Status      string     `json:"status" enum:"ok,error,unknown"`
@@ -40,6 +43,13 @@ type NodeInfo struct {
 	MemUsed     uint64     `json:"mem_used"`
 	MemTotal    uint64     `json:"mem_total"`
 	CheckedAt   *time.Time `json:"checked_at,omitempty"`
+	// Behind: the node runs an older version than the panel.
+	Behind bool `json:"behind" doc:"Нода старее панели"`
+	// CanUpdate: the panel can update the node itself (a remote node that answers and has
+	// the update endpoint, version 0.5.0.2 or later). An older node is updated once by hand.
+	CanUpdate bool `json:"can_update" doc:"Панель может обновить ноду сама: удалённая, отвечает, версия 0.5.0.2 или новее; старую обновляют один раз вручную командой mikan update на её сервере"`
+	// Update is how the last update of the node goes or went.
+	Update *nodeapi.UpdateStatus `json:"update,omitempty" doc:"Как идёт или прошло обновление ноды"`
 	// Certificate is the node's own one for its protocols on the node's TLS; nil: the
 	// node uses its self-signed certificate.
 	Certificate *NodeCertView `json:"certificate,omitempty"`
@@ -68,10 +78,11 @@ type createNodeInput struct {
 type patchNodeInput struct {
 	ID   int64 `path:"id" minimum:"1"`
 	Body struct {
-		Name    *string `json:"name,omitempty" maxLength:"200"`
-		Host    *string `json:"host,omitempty" maxLength:"253"`
-		Domain  *string `json:"domain,omitempty" maxLength:"253"`
-		Enabled *bool   `json:"enabled,omitempty"`
+		Name       *string `json:"name,omitempty" maxLength:"200"`
+		PublicName *string `json:"public_name,omitempty" maxLength:"80" doc:"Публичное имя ноды; пустое — не публиковать её в канале"`
+		Host       *string `json:"host,omitempty" maxLength:"253"`
+		Domain     *string `json:"domain,omitempty" maxLength:"253"`
+		Enabled    *bool   `json:"enabled,omitempty"`
 	}
 }
 
@@ -79,16 +90,62 @@ type nodeIDInput struct {
 	ID int64 `path:"id" minimum:"1"`
 }
 
+type orderNodesInput struct {
+	Body struct {
+		IDs []int64 `json:"ids" minItems:"1" maxItems:"1000" doc:"Все ноды панели, каждая один раз, в том порядке, в каком их серверы идут в подписках"`
+	}
+}
+
 func (h *handlers) registerNodes() {
 	huma.Register(h.api, huma.Operation{OperationID: "list-nodes", Method: http.MethodGet, Path: "/api/v1/nodes", Summary: "Ноды", Tags: []string{"node"}}, h.listNodes)
 	huma.Register(h.api, huma.Operation{OperationID: "create-node", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPost, Path: "/api/v1/nodes", Summary: "Добавить ноду", Tags: []string{"node"}, DefaultStatus: http.StatusCreated}, h.createNode)
 	huma.Register(h.api, huma.Operation{OperationID: "update-node", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPatch, Path: "/api/v1/nodes/{id}", Summary: "Изменить ноду", Tags: []string{"node"}}, h.updateNode)
 	huma.Register(h.api, huma.Operation{OperationID: "rekey-node", Metadata: sessionOnly, Extensions: sessionOnlyExt, Method: http.MethodPost, Path: "/api/v1/nodes/{id}/key", Summary: "Выпустить новый ключ ноды (старый перестаёт работать)", Tags: []string{"node"}}, h.rekeyNode)
+	huma.Register(h.api, huma.Operation{OperationID: "order-nodes", Method: http.MethodPut, Path: "/api/v1/nodes/order", Summary: "Порядок серверов в подписке", Tags: []string{"node"}, DefaultStatus: http.StatusNoContent}, h.orderNodes)
 	huma.Register(h.api, huma.Operation{OperationID: "delete-node", Method: http.MethodDelete, Path: "/api/v1/nodes/{id}", Summary: "Удалить ноду", Tags: []string{"node"}, DefaultStatus: http.StatusNoContent}, h.deleteNode)
 }
 
+// orderNodes sets the order of the servers in the subscriptions: the list must be every
+// node once, so a stale page of the admin cannot silently drop or duplicate one.
+func (h *handlers) orderNodes(ctx context.Context, in *orderNodesInput) (*struct{}, error) {
+	ids := in.Body.IDs
+	err := h.d.Store.Tx(ctx, func(q *db.Queries) error {
+		nodes, err := q.ListNodes(ctx)
+		if err != nil {
+			return err
+		}
+		have := make(map[int64]bool, len(nodes))
+		for _, n := range nodes {
+			have[n.ID] = true
+		}
+		seen := make(map[int64]bool, len(ids))
+		for _, id := range ids {
+			if !have[id] || seen[id] {
+				return huma.Error422UnprocessableEntity("validation", &huma.ErrorDetail{Location: "body.ids", Message: "node_order_mismatch", Value: id})
+			}
+			seen[id] = true
+		}
+		if len(ids) != len(nodes) {
+			return huma.Error422UnprocessableEntity("validation", &huma.ErrorDetail{Location: "body.ids", Message: "node_order_mismatch"})
+		}
+		for i, id := range ids {
+			if err := q.SetNodeSort(ctx, db.SetNodeSortParams{Sort: int64(i + 1), ID: id}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// The subscription's server list is built again from the new order.
+	h.nodesChanged()
+	h.audit(ctx, sessionOf(ctx).AdminID, "node.order", "node", "", map[string]any{"ids": ids})
+	return nil, nil
+}
+
 func (h *handlers) viewNode(ctx context.Context, n db.Node, inbounds []db.Inbound) NodeInfo {
-	v := NodeInfo{ID: n.ID, Name: n.Name, Local: n.Address == "", Address: n.Address, Host: domain.NodeHost(n), Domain: n.Domain,
+	v := NodeInfo{ID: n.ID, Name: n.Name, PublicName: n.PublicName, Local: n.Address == "", Address: n.Address, Host: domain.NodeHost(n), Domain: n.Domain,
 		Enabled: n.Enabled != 0, Inbounds: len(domain.NodeInbounds(inbounds, n.ID)), Status: "unknown"}
 	if v.Local {
 		// The panel's own node is reached at the panel's address.
@@ -118,6 +175,7 @@ func (h *handlers) viewNode(ctx context.Context, n db.Node, inbounds []db.Inboun
 			v.ListenersOK++
 		}
 	}
+	h.nodeUpdateView(ctx, &v, nodeupdate.Reported(hv.Health.Update))
 	return v
 }
 
@@ -233,6 +291,9 @@ func (h *handlers) updateNode(ctx context.Context, in *patchNodeInput) (*nodeInf
 		}
 		n.Name = name
 	}
+	if b.PublicName != nil {
+		n.PublicName = strings.TrimSpace(*b.PublicName)
+	}
 	if local && (b.Host != nil || b.Domain != nil) {
 		// The panel's own node follows the panel's address in the settings.
 		return nil, huma.Error422UnprocessableEntity("local_node")
@@ -267,14 +328,14 @@ func (h *handlers) updateNode(ctx context.Context, in *patchNodeInput) (*nodeInf
 			n.Enabled = 1
 		}
 	}
-	n, err = h.d.Store.Q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain,
+	n, err = h.d.Store.Q.UpdateNode(ctx, db.UpdateNodeParams{Name: n.Name, Address: n.Address, PublicHost: n.PublicHost, Domain: n.Domain, PublicName: n.PublicName,
 		Enabled: n.Enabled, UpdatedAt: h.d.Now().Unix(), ID: n.ID})
 	if err != nil {
 		return nil, err
 	}
 	h.nodesChanged()
 	h.d.Changes.SlotsChanged()
-	h.audit(ctx, sessionOf(ctx).AdminID, "node.update", "node", strconv.FormatInt(n.ID, 10), map[string]any{"name": n.Name, "enabled": n.Enabled != 0})
+	h.audit(ctx, sessionOf(ctx).AdminID, "node.update", "node", strconv.FormatInt(n.ID, 10), map[string]any{"name": n.Name, "public_name": n.PublicName, "enabled": n.Enabled != 0})
 	return h.nodeInfo(ctx, n.ID)
 }
 
@@ -407,8 +468,8 @@ func (h *handlers) deleteNode(ctx context.Context, in *nodeIDInput) (*struct{}, 
 		}
 		h.d.Nodes.NodesChanged()
 	}
-	// The row is gone, and with it the id may be given to the next node: it must not
-	// inherit this one's certificates and private keys from disk.
+	// The row is gone: its certificates and private keys go from disk too, and no node
+	// that gets this id later (see forgetNode) inherits them.
 	h.forgetNode(n.ID)
 	h.d.Changes.SlotsChanged()
 	h.audit(ctx, sessionOf(ctx).AdminID, "node.delete", "node", strconv.FormatInt(n.ID, 10), map[string]any{"name": n.Name})
@@ -424,8 +485,9 @@ func (h *handlers) nodesChanged() {
 }
 
 // forgetNode drops the certificates and keys the panel keeps for a node id: the admin's
-// own certificate and the node's self-signed pair. Node ids are reused (the table has no
-// AUTOINCREMENT), so a new node also clears what an id left behind.
+// own certificate and the node's self-signed pair. PostgreSQL does not hand an id out
+// twice, but files may outlive their row (a restored older backup winds the ids back, a
+// SQLite panel reused them), so a new node also clears what its id left behind.
 func (h *handlers) forgetNode(id int64) {
 	if h.d.ForgetNode == nil {
 		return

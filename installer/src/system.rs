@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,9 +68,33 @@ fn os_supported(os: &Os) -> bool {
 }
 
 pub fn memory_mb() -> Option<u64> {
-    let text = fs::read_to_string("/proc/meminfo").ok()?;
-    let kb: u64 = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse().ok()?;
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
+}
+
+/// Memory the kernel can hand out without swapping (MemAvailable), in MB.
+pub fn mem_available_mb() -> Option<u64> {
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?, "MemAvailable:")
+}
+
+fn parse_meminfo(text: &str, key: &str) -> Option<u64> {
+    let kb: u64 = text.lines().find_map(|l| l.strip_prefix(key))?.split_whitespace().next()?.parse().ok()?;
     Some(kb / 1024)
+}
+
+/// Bytes an unprivileged writer may still put on the filesystem of path (root has a little
+/// more: the reserve is not counted on).
+pub fn disk_free_bytes(path: &Path) -> Option<u64> {
+    let s = rustix::fs::statvfs(path).ok()?;
+    Some(s.f_bavail.saturating_mul(s.f_frsize))
+}
+
+/// The bytes of the files below path, links not followed; 0 for what is not there.
+pub fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path).map(|d| d.flatten().map(|e| tree_bytes(&e.path())).sum()).unwrap_or(0)
 }
 
 /// Free space for Docker's images, in MB.
@@ -286,27 +311,14 @@ pub fn checks_for(node: bool, resume: bool) -> Vec<Check> {
         Some(false) => Check::new("Clock", Level::Warn, "not synchronized: TLS and REALITY need the right time (timedatectl set-ntp true)"),
         None => Check::new("Clock", Level::Warn, "cannot tell: keep it synchronized, TLS and REALITY need the right time"),
     });
-    let taken: Vec<String> = if resume {
+    let taken: Vec<(u16, Proto, String)> = if resume {
         Vec::new()
     } else {
-        VPN_PORTS.iter().filter_map(|&(p, proto)| port_owner(p, proto).map(|who| format!("{p}/{} ({who})", proto.name()))).collect()
+        VPN_PORTS.iter().filter_map(|&(p, proto)| port_owner(p, proto).map(|who| (p, proto, who))).collect()
     };
-    out.push(if taken.is_empty() {
-        Check::new("Ports 443, 8443", Level::Ok, "free")
-    } else {
-        Check::new(
-            "Ports 443, 8443",
-            Level::Error,
-            format!("taken: {}. Stop what holds them (an old panel, a web server) and check again", taken.join(", ")),
-        )
-    });
+    out.push(vpn_ports_check(&taken));
     if !node && !resume {
-        out.push(match port_owner(80, Proto::Tcp) {
-            None => Check::new("Port 80", Level::Ok, "free for Let's Encrypt"),
-            Some(who) => {
-                Check::new("Port 80", Level::Warn, format!("taken ({who}): Let's Encrypt cannot issue a certificate for a domain"))
-            }
-        });
+        out.push(port80_check(port_owner(80, Proto::Tcp)));
     }
     out.push(match crate::docker::version() {
         Some(v) if crate::docker::compose_ok() => Check::new(DOCKER, Level::Ok, format!("{v} with compose")),
@@ -317,6 +329,27 @@ pub fn checks_for(node: bool, resume: bool) -> Vec<Check> {
         out.push(Check::new("Packages", Level::Warn, format!("busy, {who}: the installer waits for it")));
     }
     out
+}
+
+/// The protocols' usual ports. Taken ones do not stop the install: the panel moves an
+/// inbound whose port is in use to a free one.
+fn vpn_ports_check(taken: &[(u16, Proto, String)]) -> Check {
+    if taken.is_empty() {
+        return Check::new("Ports 443, 8443", Level::Ok, "free");
+    }
+    let list: Vec<String> = taken.iter().map(|(p, proto, who)| format!("{p}/{} taken ({who})", proto.name())).collect();
+    Check::new("Ports 443, 8443", Level::Warn, format!("{}: those protocols get other free ports", list.join(", ")))
+}
+
+/// Let's Encrypt checks a domain on port 80; nginx and Caddy can pass that on to the panel.
+fn port80_check(owner: Option<String>) -> Check {
+    match owner {
+        None => Check::new("Port 80", Level::Ok, "free for Let's Encrypt"),
+        Some(who) if crate::acme::Front::from_process(&who).is_some() => {
+            Check::new("Port 80", Level::Warn, format!("taken ({who}): with a domain, mikan offers to pass Let's Encrypt through it"))
+        }
+        Some(who) => Check::new("Port 80", Level::Warn, format!("taken ({who}): Let's Encrypt cannot issue a certificate for a domain")),
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +405,21 @@ mod tests {
         assert!(!proc_listening("", 443, Proto::Tcp));
     }
 
+    // nginx or caddy on 443 is no reason to stop: the panel moves those inbounds.
+    #[test]
+    fn taken_ports_warn_and_do_not_stop_the_install() {
+        assert_eq!(vpn_ports_check(&[]).level, Level::Ok);
+        let c = vpn_ports_check(&[(443, Proto::Tcp, "nginx".into()), (8443, Proto::Udp, "?".into())]);
+        assert_eq!(c.level, Level::Warn);
+        assert_eq!(c.detail, "443/tcp taken (nginx), 8443/udp taken (?): those protocols get other free ports");
+        assert_eq!(port80_check(None).level, Level::Ok);
+        for who in ["nginx", "caddy", "apache2"] {
+            assert_eq!(port80_check(Some(who.into())).level, Level::Warn, "{who}");
+        }
+        assert!(port80_check(Some("caddy".into())).detail.contains("pass Let's Encrypt through it"));
+        assert!(port80_check(Some("apache2".into())).detail.contains("cannot issue"));
+    }
+
     #[test]
     fn ss_and_df() {
         let ss = "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=812,fd=6),(\"nginx\",pid=811,fd=6))\n";
@@ -379,5 +427,23 @@ mod tests {
         assert_eq!(process_name("UNCONN 0 0 0.0.0.0:443 0.0.0.0:*"), None);
         let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 25623780 4830532 19720516 20% /\n";
         assert_eq!(parse_df(df), Some(19258));
+    }
+
+    #[test]
+    fn memory_disk_and_tree_sizes() {
+        let meminfo = "MemTotal:        2014468 kB\nMemFree:          120000 kB\nMemAvailable:     786432 kB\n";
+        assert_eq!(parse_meminfo(meminfo, "MemAvailable:"), Some(768));
+        assert_eq!(parse_meminfo("MemTotal: 1 kB\n", "MemAvailable:"), None);
+        let d = std::env::temp_dir().join(format!("system-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("a/b")).unwrap();
+        fs::write(d.join("a/one"), vec![0u8; 1000]).unwrap();
+        fs::write(d.join("a/b/two"), vec![0u8; 24]).unwrap();
+        std::os::unix::fs::symlink("/usr", d.join("a/link")).unwrap();
+        assert_eq!(tree_bytes(&d.join("a/one")), 1000);
+        assert!((1024..1024 + 64).contains(&tree_bytes(&d)), "a link is not followed: {}", tree_bytes(&d));
+        assert_eq!(tree_bytes(&d.join("missing")), 0);
+        assert!(disk_free_bytes(&d).is_some_and(|b| b > 0));
+        fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -3,8 +3,6 @@ package domain
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -52,28 +50,27 @@ func (p *Pool) Stats(ctx context.Context) (PoolStats, error) {
 	return s, nil
 }
 
+// Refill adds n free slots in one statement. READ COMMITTED is enough: the numbers come
+// from the slot counter's row, which concurrent refills take in turns.
 func (p *Pool) Refill(ctx context.Context, n int) error {
+	if n <= 0 {
+		return nil
+	}
 	now := p.now().Unix()
-	return p.st.Tx(ctx, func(q *db.Queries) error {
+	return p.st.TxRC(ctx, func(q *db.Queries) error {
 		// Names go on from the last number ever handed out: the largest id alone gives a
 		// name back once the slots at the top are purged, and the new slot would inherit the
 		// old one's counters on the nodes.
-		last, err := q.MaxSlotID(ctx)
+		last, err := q.ReserveSlotNumbers(ctx, int64(n))
 		if err != nil {
 			return err
 		}
-		given, err := q.SlotCounter(ctx)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
+		in := db.InsertSlotsParams{Names: make([]string, n), Uuids: make([]string, n), Secrets: make([]string, n), CreatedAt: now}
+		for i := range n {
+			in.Names[i] = fmt.Sprintf("s%06d", last-int64(n-1-i))
+			in.Uuids[i], in.Secrets[i] = newUUID(), secure.Token(32)
 		}
-		last = max(last, given)
-		for i := 1; i <= n; i++ {
-			err := q.InsertSlot(ctx, db.InsertSlotParams{Name: fmt.Sprintf("s%06d", last+int64(i)), Uuid: newUUID(), Secret: secure.Token(32), CreatedAt: now})
-			if err != nil {
-				return err
-			}
-		}
-		return q.SetSlotCounter(ctx, last+int64(n))
+		return q.InsertSlots(ctx, in)
 	})
 }
 

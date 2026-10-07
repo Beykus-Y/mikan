@@ -454,10 +454,10 @@ impl Menu {
             ),
             Act::Backup => ("Backup", job(|| backup::backup(&mut |_| {}).map(|f| format!("Saved {}", f.display())))),
             Act::Restore(f) => {
-                ("Restore", job(move || backup::restore(&f, &mut |_| {}).map(|()| format!("Restored from {}", f.display()))))
+                ("Restore", job(move || backup::restore(&f, false, &mut |_| {}).map(|()| format!("Restored from {}", f.display()))))
             }
             Act::Join => ("Join key", job(move || ops::join(&value, None).map(|()| "The node runs with the new key.".into()))),
-            Act::Uninstall => ("Uninstall", job(|| ops::uninstall().map(|()| "Done. Press Enter to leave.".into()))),
+            Act::Uninstall => ("Uninstall", job(|| ops::uninstall().map(|_| "Done. Press Enter to leave.".into()))),
         };
         self.job_title = title.to_owned();
         self.job_at = self.section();
@@ -754,7 +754,8 @@ impl Menu {
     }
 
     fn draw_update(&self, f: &mut Frame, area: Rect) {
-        let mut lines = vec![field("This server", self.version.clone())];
+        let w = area.width as usize;
+        let mut lines = field("This server", self.version.clone(), w);
         match self.latest.done() {
             None => lines.push(Line::from(vec![spinner(self.tick), dim(" reading the latest release…")])),
             Some(Err(e)) => {
@@ -763,7 +764,7 @@ impl Menu {
                 }
             }
             Some(Ok(m)) => {
-                lines.push(field("Latest", format!("{} ({})", m.version, m.published.get(..10).unwrap_or(&m.published))));
+                lines.extend(field("Latest", format!("{} ({})", m.version, m.published.get(..10).unwrap_or(&m.published)), w));
                 if release::newer(&m.version, &self.version) && self.updating.is_none() && self.upd_result.is_none() {
                     lines.push(Line::from(""));
                     if let Some(notes) = m.notes.get("en") {
@@ -786,7 +787,7 @@ impl Menu {
             format!("{}   switched in the panel's settings", if on { "on" } else { "off" })
         };
         lines.push(Line::from(""));
-        lines.push(field("Automatic", auto));
+        lines.extend(field("Automatic", auto, w));
         if self.updating.is_some() || self.upd_result.is_some() {
             lines.push(Line::from(""));
             for l in &self.upd_lines {
@@ -855,15 +856,16 @@ impl Menu {
     }
 
     fn draw_access(&self, f: &mut Frame, area: Rect) {
-        let mut lines = vec![match self.url.done() {
-            None => Line::from(vec![spinner(self.tick), dim(" reading the link…")]),
-            Some(Ok(t)) => field("Panel", t.lines().next().unwrap_or("").to_owned()),
-            Some(Err(e)) => Line::from(Span::styled(e.clone(), Style::new().fg(ERR))),
-        }];
+        let w = area.width as usize;
+        let mut lines = match self.url.done() {
+            None => vec![Line::from(vec![spinner(self.tick), dim(" reading the link…")])],
+            Some(Ok(t)) => field("Panel", t.lines().next().unwrap_or("").to_owned(), w),
+            Some(Err(e)) => wrap(e, w).into_iter().map(|l| Line::from(Span::styled(l, Style::new().fg(ERR)))).collect(),
+        };
         if let Some(Ok(t)) = self.url.done()
             && let Some(login) = t.lines().nth(1).and_then(|l| l.strip_prefix("Login: "))
         {
-            lines.push(field("Login", login.to_owned()));
+            lines.extend(field("Login", login.to_owned(), w));
         }
         lines.push(Line::from(""));
         lines.extend(self.actions(

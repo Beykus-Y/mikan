@@ -14,6 +14,7 @@ import { PoolsSection, TariffSection, TrafficSection } from "./user/traffic";
 import { ExpirySection } from "./user/expiry";
 import { NoteSection, ProtocolsSection, SubscriptionSection, TelegramSection } from "./user/access";
 import { DevicesSection } from "./user/devices";
+import { TorrentSection } from "./user/torrent";
 
 export function UserDrawer({ id, onClose }: { id?: number; onClose: () => void }) {
   const user = useUser(id);
@@ -111,6 +112,7 @@ function UserBody({ u, onDeleted }: { u: User; onDeleted: () => void }) {
       <SubscriptionSection u={u} onReissue={() => setConfirm("reissue")} />
       <TelegramSection u={u} />
       <DevicesSection u={u} />
+      <TorrentSection u={u} />
       <ProtocolsSection u={u} />
       <NoteSection u={u} />
 
@@ -118,7 +120,7 @@ function UserBody({ u, onDeleted }: { u: User; onDeleted: () => void }) {
         open={confirm === "reissue"}
         onOpenChange={(v) => !v && setConfirm(null)}
         title={t("userDrawer.reissueTitle")}
-        text={t("userDrawer.reissueText")}
+        text={u.legacy ? `${t("userDrawer.reissueText")} ${t("userDrawer.legacyReissue")}` : t("userDrawer.reissueText")}
         confirm={t("userDrawer.reissueConfirm")}
         loading={reissue.isPending}
         onConfirm={() =>

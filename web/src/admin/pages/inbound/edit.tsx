@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { RotateCcw, TriangleAlert } from "lucide-react";
+import { RotateCcw } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, errorText, unwrap, type Inbound, type Schemas } from "../../../api/client";
 import { qk, useNodes, usePools, usePresets, useSettings } from "../../../api/hooks";
@@ -150,7 +150,8 @@ export function EditDrawer({ inbound, onClose }: { inbound: Inbound | null; onCl
     if (poolId !== (inbound?.pool_id ?? 0)) body.pool_id = poolId;
     const autoPortNow = autoPort && !behindProxy;
     if (autoPortNow !== inbound?.auto_port) body.auto_port = autoPortNow;
-    if (autoSni !== inbound?.auto_sni) body.auto_sni = autoSni;
+    const autoSniNow = autoSni && !behindProxy;
+    if (autoSniNow !== inbound?.auto_sni) body.auto_sni = autoSniNow;
     if (outbound === "node" && !exitNode) {
       reject({ exit_node_id: t("inbounds.exitPick") });
       return;
@@ -476,7 +477,7 @@ export function EditDrawer({ inbound, onClose }: { inbound: Inbound | null; onCl
                     sub={t("inbounds.autoSniSub")}
                     on={autoSni}
                     globalOff={settings.data?.auto_sni === false}
-                    warn={behindProxy && autoSni ? t("inbounds.autoSniProxy") : undefined}
+                    locked={behindProxy ? t("inbounds.autoSniProxy") : undefined}
                     onChange={setAutoSni}
                   />
                 ) : null}
@@ -502,15 +503,14 @@ export function EditDrawer({ inbound, onClose }: { inbound: Inbound | null; onCl
   );
 }
 
-/** One switch of the automatic fixes; says so when the global switch is off, why it is
- * locked (shown off), or what to watch out for. */
+/** One switch of the automatic fixes; says so when the global switch is off or why it is
+ * locked (shown off). */
 function AutoSwitch({
   title,
   sub,
   on,
   globalOff,
   locked,
-  warn,
   onChange,
 }: {
   title: string;
@@ -518,7 +518,6 @@ function AutoSwitch({
   on: boolean;
   globalOff: boolean;
   locked?: string;
-  warn?: string;
   onChange: (v: boolean) => void;
 }) {
   const note = locked ?? (globalOff ? t("inbounds.autoOffGlobal") : sub);
@@ -527,11 +526,6 @@ function AutoSwitch({
       <div className="min-w-0">
         <div className="text-[13px] font-medium">{title}</div>
         <div className={locked || globalOff ? "mt-1 text-xs text-[var(--honey-600)]" : "mt-1 text-xs text-[var(--ink-500)]"}>{note}</div>
-        {warn ? (
-          <div className="mt-1 flex items-start gap-1 text-xs text-[var(--honey-600)]" role="note">
-            <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden /> {warn}
-          </div>
-        ) : null}
       </div>
       <Switch checked={locked ? false : on} label={title} onChange={onChange} disabled={!!locked} />
     </div>

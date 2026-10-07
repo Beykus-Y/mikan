@@ -3,11 +3,13 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"testing"
 	"time"
 
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
+	"mikan/internal/panel/store/storetest"
 )
 
 type changes struct{ policies, slots int }
@@ -18,7 +20,7 @@ func (c *changes) SlotsChanged()    { c.slots++ }
 func setup(t *testing.T, now *time.Time) (*store.Store, *Users, *changes) {
 	t.Helper()
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := storetest.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,5 +170,74 @@ func TestNextReset(t *testing.T) {
 	}
 	if _, ok := NextReset(db.User{ResetStrategy: "none"}, now); ok {
 		t.Fatal("none must not reset")
+	}
+}
+
+// The counts the database makes agree with State user by user, on the boundaries too.
+func TestCountStatesMatchesState(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	st, users, _ := setup(t, &now)
+	ctx := context.Background()
+	tariffs, _ := st.Q.ListTariffs(ctx)
+	set := func(id int64, change string, args ...any) {
+		t.Helper()
+		if _, err := st.DB.ExecContext(ctx, "UPDATE users SET "+change+" WHERE id = "+strconv.FormatInt(id, 10), args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grant := func(id int64, g GrantSpec, at time.Time) {
+		t.Helper()
+		u, _ := st.Q.GetUser(ctx, id)
+		if _, err := GrantTx(ctx, st.Q, u, g, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	week := int64(7 * 24 * 3600)
+	for i, change := range []func(id int64){
+		func(int64) {}, // active, the term a month away
+		func(id int64) { set(id, "status = 'disabled'") },
+		func(id int64) { set(id, "expires_at = $1", now.Unix()) },                       // expired at this very second
+		func(id int64) { set(id, "expires_at = $1", now.Unix()+week) },                  // expiring: exactly a week left
+		func(id int64) { set(id, "expires_at = $1", now.Unix()+week+1) },                // active: a second more
+		func(id int64) { set(id, "expires_at = NULL") },                                 // active: no end
+		func(id int64) { set(id, "traffic_limit = 100, used_up = 60, used_down = 40") }, // limited
+		func(id int64) { // past the base with a main grant: not limited
+			set(id, "traffic_limit = 100, used_up = 100")
+			grant(id, GrantSpec{Bytes: 10, Lifetime: LifetimeUsed, Source: SourceAdmin}, now)
+		},
+		func(id int64) { // its grant expired: limited
+			set(id, "traffic_limit = 100, used_up = 100")
+			grant(id, GrantSpec{Bytes: 10, Lifetime: LifetimeDays, Days: 1, Source: SourceAdmin}, now.Add(-48*time.Hour))
+		},
+	} {
+		u, err := users.Create(ctx, CreateInput{Name: "u" + strconv.Itoa(i), TariffID: tariffs[1].ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(u.ID)
+	}
+	all, _ := st.Q.ListUsers(ctx)
+	grants, _ := LoadGrantsLeft(ctx, st.Q, now)
+	want := db.CountUserStatesRow{Total: int64(len(all))}
+	for _, u := range all {
+		switch State(u, grants.Main(u.ID), now) {
+		case StateActive:
+			want.Active++
+		case StateExpiring:
+			want.Expiring++
+		case StateLimited:
+			want.Limited++
+		case StateExpired:
+			want.Expired++
+		case StateDisabled:
+			want.Disabled++
+		}
+	}
+	got, err := CountStates(ctx, st.Q, now)
+	if err != nil || got != want {
+		t.Fatalf("counts %+v (%v), State says %+v", got, err, want)
+	}
+	if want.Active != 4 || want.Expiring != 1 || want.Limited != 2 || want.Expired != 1 || want.Disabled != 1 {
+		t.Fatalf("the cases do not cover every state: %+v", want)
 	}
 }

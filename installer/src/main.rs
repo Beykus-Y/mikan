@@ -2,6 +2,7 @@
 //! server's shell. Without a command it opens the installer on a fresh server and the
 //! menu on an installed one; every menu action is a command too.
 
+mod acme;
 mod addon;
 mod backup;
 mod clock;
@@ -96,8 +97,12 @@ enum Cmd {
         /// Do not ask
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Save only the files before replacing them, not the current database: for a
+        /// PostgreSQL too broken to dump. Its current data are lost if the restore fails
+        #[arg(long)]
+        no_db_snapshot: bool,
     },
-    /// Update to the latest release; goes back when the new version does not start
+    /// Update to the latest release, backing up and migrating the database safely
     Update(update::UpdateArgs),
     /// Payment adapters of the marketplace: list, install, remove
     #[command(subcommand)]
@@ -183,9 +188,14 @@ fn main() -> ExitCode {
         },
         Some(Cmd::Inbound { args }) => ops::inbound(&args),
         Some(Cmd::Backup) => backup::backup(&mut out).map(|f| out(&format!("Backup: {}", f.display()))),
-        Some(Cmd::Restore { file, yes }) => {
-            if yes || ops::confirm(&format!("Replace the current data with {}?", file.display())) {
-                backup::restore(&file, &mut out).map(|()| out(&format!("Restored from {}.", file.display())))
+        Some(Cmd::Restore { file, yes, no_db_snapshot }) => {
+            let question = if no_db_snapshot {
+                format!("Replace the current data with {}? The current database is NOT saved first.", file.display())
+            } else {
+                format!("Replace the current data with {}?", file.display())
+            };
+            if yes || ops::confirm(&question) {
+                backup::restore(&file, no_db_snapshot, &mut out).map(|()| out(&format!("Restored from {}.", file.display())))
             } else {
                 Ok(())
             }
@@ -197,7 +207,17 @@ fn main() -> ExitCode {
         Some(Cmd::Restart) => ops::restart(),
         Some(Cmd::Uninstall { yes }) => {
             if yes || ops::confirm("Stop mikan and remove the mikan command? The data stays in /opt/mikan.") {
-                ops::uninstall().map(|()| out(&format!("Done. The data and backups stay in {DIR}; remove them with: rm -rf {DIR}")))
+                ops::uninstall().map(|panel| {
+                    if panel {
+                        out(&format!(
+                            "Done. The data and backups stay in {DIR}, the database in the Docker volume {}; remove them with: rm -rf {DIR} && docker volume rm {}",
+                            docker::PG_VOLUME,
+                            docker::PG_VOLUME
+                        ))
+                    } else {
+                        out(&format!("Done. The data and backups stay in {DIR}; remove them with: rm -rf {DIR}"))
+                    }
+                })
             } else {
                 Ok(())
             }

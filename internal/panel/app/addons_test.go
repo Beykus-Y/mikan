@@ -151,7 +151,7 @@ func TestAddonsMarketplace(t *testing.T) {
 		t.Fatal("the secret came back")
 	}
 	var audit string
-	must(h.st.DB.QueryRow("SELECT group_concat(action || ' ' || details, ';') FROM audit_log WHERE action LIKE 'addon.%'").Scan(&audit))
+	must(h.st.DB.QueryRow("SELECT string_agg(action || ' ' || details, ';' ORDER BY id) FROM audit_log WHERE action LIKE 'addon.%'").Scan(&audit))
 	if strings.Contains(audit, secret) || !strings.Contains(audit, "addon.settings") || !strings.Contains(audit, "secret_key") {
 		t.Fatalf("audit: %s", audit)
 	}

@@ -49,6 +49,7 @@ type UserPoolView struct {
 	UsedDown     int64  `json:"used_down"`
 	Extra        int64  `json:"extra" doc:"Байты, оставшиеся в пакетах трафика пула: тратятся после лимита"`
 	Exhausted    bool   `json:"exhausted" doc:"Лимит пула и его пакеты исчерпаны: подключения пула не работают до сброса"`
+	Excluded     bool   `json:"excluded" doc:"Пул закрыт для пользователя: его подключений нет в подписке, ноды их не пускают"`
 }
 
 type userPoolsOutput struct{ Body []UserPoolView }
@@ -56,6 +57,7 @@ type userPoolsOutput struct{ Body []UserPoolView }
 type PoolLimit struct {
 	PoolID       int64  `json:"pool_id" minimum:"1"`
 	TrafficLimit *int64 `json:"traffic_limit" minimum:"1" doc:"Байты; null — без лимита"`
+	Excluded     bool   `json:"excluded,omitempty" doc:"Пул закрыт: его подключений нет в подписке, ноды их не пускают, пакеты трафика пула не продаются; traffic_limit тогда не важен"`
 }
 
 type userPoolsInput struct {
@@ -171,6 +173,16 @@ func (h *handlers) deletePool(ctx context.Context, in *userIDInput) (*struct{}, 
 		if len(details) > 0 {
 			return huma.Error409Conflict("pool_in_use", details...)
 		}
+		promos, err := q.CountEnabledPromoCodesForPool(ctx, sql.NullInt64{Int64: in.ID, Valid: true})
+		if err != nil {
+			return err
+		}
+		if promos > 0 {
+			return huma.Error409Conflict("pool_in_use", &huma.ErrorDetail{Location: "path.id", Message: "pool_has_active_promocodes", Value: promos})
+		}
+		if err := q.ClearDisabledPromoPools(ctx, sql.NullInt64{Int64: in.ID, Valid: true}); err != nil {
+			return err
+		}
 		n, err := q.DeleteTrafficPool(ctx, in.ID)
 		if err != nil {
 			return err
@@ -216,7 +228,7 @@ func (h *handlers) userPools(ctx context.Context, in *userIDInput) (*userPoolsOu
 	for _, p := range ps {
 		r := mine[p.ID]
 		v := UserPoolView{PoolID: p.ID, Name: p.Name, TrafficLimit: ptrInt(r.TrafficLimit.Int64, r.TrafficLimit.Valid), UsedUp: r.UsedUp, UsedDown: r.UsedDown,
-			Extra: grants.Pool(in.ID, p.ID)}
+			Extra: grants.Pool(in.ID, p.ID), Excluded: r.Excluded}
 		v.Exhausted = domain.PoolExhausted(r, v.Extra)
 		out.Body = append(out.Body, v)
 	}
@@ -237,10 +249,10 @@ func (h *handlers) setUserPools(ctx context.Context, in *userPoolsInput) (*userP
 				return err
 			}
 			limit := sql.NullInt64{}
-			if p.TrafficLimit != nil {
+			if p.TrafficLimit != nil && !p.Excluded {
 				limit = sql.NullInt64{Int64: *p.TrafficLimit, Valid: true}
 			}
-			if err := q.SetUserPoolLimit(ctx, db.SetUserPoolLimitParams{UserID: in.ID, PoolID: p.PoolID, TrafficLimit: limit}); err != nil {
+			if err := q.SetUserPoolLimit(ctx, db.SetUserPoolLimitParams{UserID: in.ID, PoolID: p.PoolID, TrafficLimit: limit, Excluded: p.Excluded}); err != nil {
 				return err
 			}
 		}
@@ -255,7 +267,10 @@ func (h *handlers) setUserPools(ctx context.Context, in *userPoolsInput) (*userP
 }
 
 // setTariffPools replaces a tariff's pool limits on q's transaction. The list is checked
-// whole (a pool twice, an unknown pool) before the old limits go.
+// whole (a pool twice, an unknown pool) before the old limits go. A pool closed or opened
+// again reaches the tariff's users at once, unlike the limits, which come with a purchase
+// or a change of tariff: closing the expensive server to a cheap tariff is meant now. Only
+// the pools whose state changed are touched, so what the admin set on a user stays.
 func setTariffPools(ctx context.Context, q *db.Queries, tariffID int64, limits []PoolLimit) error {
 	seen := make(map[int64]bool, len(limits))
 	for _, p := range limits {
@@ -269,15 +284,50 @@ func setTariffPools(ctx context.Context, q *db.Queries, tariffID int64, limits [
 			return err
 		}
 	}
+	before, err := q.ListTariffPools(ctx, tariffID)
+	if err != nil {
+		return err
+	}
+	wasShut := map[int64]bool{}
+	for _, p := range before {
+		wasShut[p.PoolID] = p.Excluded
+	}
 	if err := q.ClearTariffPools(ctx, tariffID); err != nil {
 		return err
 	}
+	isShut := map[int64]bool{}
 	for _, p := range limits {
-		if p.TrafficLimit == nil {
+		var limit int64
+		switch {
+		case p.Excluded: // the limit does not matter
+		case p.TrafficLimit == nil:
 			continue // unlimited: no row
+		default:
+			limit = *p.TrafficLimit
 		}
-		if err := q.AddTariffPool(ctx, db.AddTariffPoolParams{TariffID: tariffID, PoolID: p.PoolID, TrafficLimit: *p.TrafficLimit}); err != nil {
+		if err := q.AddTariffPool(ctx, db.AddTariffPoolParams{TariffID: tariffID, PoolID: p.PoolID, TrafficLimit: limit, Excluded: p.Excluded}); err != nil {
 			return err
+		}
+		isShut[p.PoolID] = p.Excluded
+	}
+	for _, p := range limits {
+		if p.Excluded == wasShut[p.PoolID] {
+			continue
+		}
+		var limit sql.NullInt64
+		if !p.Excluded && p.TrafficLimit != nil {
+			limit = sql.NullInt64{Int64: *p.TrafficLimit, Valid: true}
+		}
+		if err := q.SetTariffUsersPool(ctx, db.SetTariffUsersPoolParams{TariffID: tariffID, PoolID: p.PoolID, TrafficLimit: limit, Excluded: p.Excluded}); err != nil {
+			return err
+		}
+	}
+	// A pool closed before and left out of the list now is open, without a limit.
+	for id, shut := range wasShut {
+		if _, listed := isShut[id]; shut && !listed {
+			if err := q.SetTariffUsersPool(ctx, db.SetTariffUsersPoolParams{TariffID: tariffID, PoolID: id}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -288,6 +338,10 @@ func tariffPoolsOf(all []db.TariffPool, tariffID int64) []PoolLimit {
 	out := []PoolLimit{}
 	for _, p := range all {
 		if p.TariffID == tariffID {
+			if p.Excluded {
+				out = append(out, PoolLimit{PoolID: p.PoolID, Excluded: true})
+				continue
+			}
 			l := p.TrafficLimit
 			out = append(out, PoolLimit{PoolID: p.PoolID, TrafficLimit: &l})
 		}

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/danielgtaylor/huma/v2"
 
@@ -22,24 +24,33 @@ import (
 )
 
 type SettingsView struct {
-	Brand        string   `json:"brand"`
-	SupportURL   string   `json:"support_url"`
-	PublicHost   string   `json:"public_host"`
-	Domain       string   `json:"domain"`
-	PanelPort    int      `json:"panel_port"`
-	SubPort      int      `json:"sub_port" doc:"Отдельный порт подписок; 0 — порт панели. Порт панели отдаёт подписки в любом случае"`
-	SubPortError string   `json:"sub_port_error,omitempty" doc:"sub_port_busy — сохранённый порт занят на сервере, подписки пока идут через порт панели"`
-	QuietHourUTC int      `json:"quiet_hour_utc" doc:"Час (UTC), когда пополняется пул слотов: переподключение QUIC-клиентов"`
-	AdminURL     string   `json:"admin_url"`
-	SubBaseURL   string   `json:"sub_base_url"`
-	SubGroupMain string   `json:"sub_group_main" doc:"Главная группа в Clash-приложениях"`
-	SubGroupAuto string   `json:"sub_group_auto" doc:"Группа автовыбора самого быстрого подключения"`
-	SubRules     string   `json:"sub_rules" doc:"Свои правила Clash: по строке TYPE,VALUE,TARGET[,no-resolve]; # — комментарий"`
-	RuleTargets  []string `json:"rule_targets" doc:"Куда правило может направить трафик: DIRECT, REJECT, REJECT-DROP, PROXY и группы"`
-	SubRouting   string   `json:"sub_routing" enum:"ru_direct,all" doc:"Маршруты в Clash-приложениях: ru_direct — российские сайты и IP напрямую по геобазам mihomo, all — всё через VPN"`
-	Fingerprint  string   `json:"client_fingerprint" doc:"Отпечаток TLS (uTLS) у клиентов, если у подключения не задан свой: chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized или своё значение"`
-	AutoPort     bool     `json:"auto_port" doc:"Переносить подключение на другой порт, если клиенты перестали до него доходить"`
-	AutoSNI      bool     `json:"auto_sni" doc:"Менять сайт маскировки REALITY, если он перестал подходить"`
+	Brand        string      `json:"brand"`
+	SupportURL   string      `json:"support_url"`
+	SubTitle     string      `json:"sub_title" doc:"Название подписки в приложениях (заголовок profile-title); пусто — бренд. Переменные: {brand} — бренд, {name} — имя пользователя, {date} — дата окончания (ДД.ММ.ГГГГ, МСК), {days} — дней осталось, {used} — израсходовано, {left} — осталось трафика, {total} — всего; без срока или лимита — ∞"`
+	Announce     string      `json:"sub_announce" doc:"Объявление над профилем в приложениях (заголовок announce): Happ и v2RayTun показывают его под названием подписки; пусто — нет. Те же переменные, что в sub_title"`
+	AnnounceURL  string      `json:"sub_announce_url" doc:"Куда ведёт нажатие на объявление"`
+	AppBranding  bool        `json:"app_branding" doc:"Брендинг в приложениях, читающих операторские заголовки (ClashFest, SlothClash): название, логотип, цвет, ссылки"`
+	BrandAccent  string      `json:"brand_accent" doc:"Цвет бренда #RRGGBB; пусто — цвет приложения"`
+	BrandLogoURL string      `json:"brand_logo_url" doc:"Логотип: https, PNG, WebP или JPEG до 512 КБ; пусто — значок приложения"`
+	PageTheme    string      `json:"subscription_theme" enum:"mikan,midnight,ocean,sakura,forest"`
+	PageLogo     string      `json:"subscription_logo" doc:"HTTPS URL изображения или эмодзи для страницы подписки"`
+	PageModules  PageModules `json:"subscription_modules"`
+	PublicHost   string      `json:"public_host"`
+	Domain       string      `json:"domain"`
+	PanelPort    int         `json:"panel_port"`
+	SubPort      int         `json:"sub_port" doc:"Отдельный порт подписок; 0 — порт панели. Порт панели отдаёт подписки в любом случае"`
+	SubPortError string      `json:"sub_port_error,omitempty" doc:"sub_port_busy — сохранённый порт занят на сервере, подписки пока идут через порт панели"`
+	QuietHourUTC int         `json:"quiet_hour_utc" doc:"Час (UTC), когда пополняется пул слотов: переподключение QUIC-клиентов"`
+	AdminURL     string      `json:"admin_url"`
+	SubBaseURL   string      `json:"sub_base_url"`
+	SubGroupMain string      `json:"sub_group_main" doc:"Главная группа в Clash-приложениях"`
+	SubGroupAuto string      `json:"sub_group_auto" doc:"Группа автовыбора самого быстрого подключения"`
+	SubRules     string      `json:"sub_rules" doc:"Свои правила Clash: по строке TYPE,VALUE,TARGET[,no-resolve]; # — комментарий"`
+	RuleTargets  []string    `json:"rule_targets" doc:"Куда правило может направить трафик: DIRECT, REJECT, REJECT-DROP, PROXY и группы"`
+	SubRouting   string      `json:"sub_routing" enum:"ru_direct,all" doc:"Маршруты в Clash-приложениях: ru_direct — российские сайты и IP напрямую по геобазам mihomo, all — всё через VPN"`
+	Fingerprint  string      `json:"client_fingerprint" doc:"Отпечаток TLS (uTLS) у клиентов, если у подключения не задан свой: chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized или своё значение"`
+	AutoPort     bool        `json:"auto_port" doc:"Переносить подключение на другой порт, если клиенты перестали до него доходить"`
+	AutoSNI      bool        `json:"auto_sni" doc:"Менять сайт маскировки REALITY, если он перестал подходить"`
 	// Devices: see domain.Devices.
 	DeviceBinding bool        `json:"device_binding" doc:"Привязывать подписку к устройствам: у каждого устройства свои ключи"`
 	RequireHWID   bool        `json:"device_require_hwid" doc:"Не выдавать подписку приложениям без ID устройства (иначе они вместе занимают одно место)"`
@@ -47,26 +58,37 @@ type SettingsView struct {
 	Certificate   acme.Status `json:"certificate"`
 }
 
+type PageModules = []settings.SubscriptionModule
+
 type settingsOutput struct{ Body SettingsView }
 
 type patchSettingsInput struct {
 	Body struct {
-		Brand         *string `json:"brand,omitempty" maxLength:"40"`
-		SupportURL    *string `json:"support_url,omitempty" maxLength:"200" doc:"https://… или tg://…"`
-		PublicHost    *string `json:"public_host,omitempty" maxLength:"253"`
-		Domain        *string `json:"domain,omitempty" maxLength:"253"`
-		QuietHourUTC  *int    `json:"quiet_hour_utc,omitempty" minimum:"0" maximum:"23"`
-		SubGroupMain  *string `json:"sub_group_main,omitempty" maxLength:"200"`
-		SubGroupAuto  *string `json:"sub_group_auto,omitempty" maxLength:"200"`
-		SubRouting    *string `json:"sub_routing,omitempty" enum:"ru_direct,all"`
-		SubRules      *string `json:"sub_rules,omitempty" maxLength:"65536" doc:"Свои правила Clash, до 500 строк; ошибка указывает номер строки"`
-		Fingerprint   *string `json:"client_fingerprint,omitempty" pattern:"^[a-z0-9_]{1,32}$" doc:"Из списка или своё: латиница в нижнем регистре, цифры и _, до 32 символов"`
-		AutoPort      *bool   `json:"auto_port,omitempty"`
-		AutoSNI       *bool   `json:"auto_sni,omitempty"`
-		DeviceBinding *bool   `json:"device_binding,omitempty"`
-		RequireHWID   *bool   `json:"device_require_hwid,omitempty"`
-		DefaultLang   *string `json:"default_lang,omitempty" enum:"auto,ru,en"`
-		SubPort       *int    `json:"sub_port,omitempty" minimum:"0" maximum:"65535" doc:"Отдельный порт подписок на сервере панели; 0 — убрать. Ссылки переезжают на него, старые продолжают работать"`
+		Brand         *string      `json:"brand,omitempty" maxLength:"40"`
+		SupportURL    *string      `json:"support_url,omitempty" maxLength:"200" doc:"https://… или tg://…"`
+		SubTitle      *string      `json:"sub_title,omitempty" maxLength:"200" doc:"Переменные — см. SettingsView.sub_title"`
+		Announce      *string      `json:"sub_announce,omitempty" maxLength:"200"`
+		AnnounceURL   *string      `json:"sub_announce_url,omitempty" maxLength:"200" doc:"https://… или tg://…"`
+		AppBranding   *bool        `json:"app_branding,omitempty"`
+		BrandAccent   *string      `json:"brand_accent,omitempty" maxLength:"7" doc:"#RRGGBB или пусто"`
+		BrandLogoURL  *string      `json:"brand_logo_url,omitempty" maxLength:"500" doc:"https://… или пусто"`
+		PageTheme     *string      `json:"subscription_theme,omitempty" enum:"mikan,midnight,ocean,sakura,forest"`
+		PageLogo      *string      `json:"subscription_logo,omitempty" maxLength:"500" doc:"HTTPS URL изображения, эмодзи или пусто"`
+		PageModules   *PageModules `json:"subscription_modules,omitempty"`
+		PublicHost    *string      `json:"public_host,omitempty" maxLength:"253"`
+		Domain        *string      `json:"domain,omitempty" maxLength:"253"`
+		QuietHourUTC  *int         `json:"quiet_hour_utc,omitempty" minimum:"0" maximum:"23"`
+		SubGroupMain  *string      `json:"sub_group_main,omitempty" maxLength:"200"`
+		SubGroupAuto  *string      `json:"sub_group_auto,omitempty" maxLength:"200"`
+		SubRouting    *string      `json:"sub_routing,omitempty" enum:"ru_direct,all"`
+		SubRules      *string      `json:"sub_rules,omitempty" maxLength:"65536" doc:"Свои правила Clash, до 500 строк; ошибка указывает номер строки"`
+		Fingerprint   *string      `json:"client_fingerprint,omitempty" pattern:"^[a-z0-9_]{1,32}$" doc:"Из списка или своё: латиница в нижнем регистре, цифры и _, до 32 символов"`
+		AutoPort      *bool        `json:"auto_port,omitempty"`
+		AutoSNI       *bool        `json:"auto_sni,omitempty"`
+		DeviceBinding *bool        `json:"device_binding,omitempty"`
+		RequireHWID   *bool        `json:"device_require_hwid,omitempty"`
+		DefaultLang   *string      `json:"default_lang,omitempty" enum:"auto,ru,en"`
+		SubPort       *int         `json:"sub_port,omitempty" minimum:"0" maximum:"65535" doc:"Отдельный порт подписок на сервере панели; 0 — убрать. Ссылки переезжают на него, старые продолжают работать"`
 	}
 }
 
@@ -102,6 +124,19 @@ func (h *handlers) readSettings(ctx context.Context) (SettingsView, error) {
 	}
 	get(settings.KeyBrand, &v.Brand)
 	get(settings.KeySupportURL, &v.SupportURL)
+	get(settings.KeySubTitle, &v.SubTitle)
+	get(settings.KeyAnnounce, &v.Announce)
+	get(settings.KeyAnnounceURL, &v.AnnounceURL)
+	get(settings.KeyBrandAccent, &v.BrandAccent)
+	get(settings.KeyBrandLogo, &v.BrandLogoURL)
+	get(settings.KeySubPageTheme, &v.PageTheme)
+	get(settings.KeySubPageLogo, &v.PageLogo)
+	if v.PageTheme == "" {
+		v.PageTheme = "mikan"
+	}
+	if v.PageModules, _, err = settings.GetOver(ctx, h.d.Settings, settings.KeySubPageModules, settings.DefaultSubscriptionModules); err != nil {
+		return v, err
+	}
 	get(settings.KeyPublicHost, &v.PublicHost)
 	get(settings.KeyDomain, &v.Domain)
 	get(settings.KeyGroupMain, &v.SubGroupMain)
@@ -149,6 +184,9 @@ func (h *handlers) readSettings(ctx context.Context) (SettingsView, error) {
 	if v.RequireHWID, err = h.d.Settings.On(ctx, settings.RequireHWID); err != nil {
 		return v, err
 	}
+	if v.AppBranding, err = h.d.Settings.On(ctx, settings.AppBranding); err != nil {
+		return v, err
+	}
 	if v.Brand == "" {
 		v.Brand = "VPN"
 	}
@@ -189,7 +227,11 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 	// Where clients are sent, and what they are told to trust: a leaked API key must not
 	// move subscriptions to another server or add rules to every client.
 	for field, touched := range map[string]bool{"public_host": b.PublicHost != nil, "domain": b.Domain != nil, "sub_port": b.SubPort != nil,
-		"sub_rules": b.SubRules != nil, "support_url": b.SupportURL != nil} {
+		"sub_rules": b.SubRules != nil, "support_url": b.SupportURL != nil,
+		// What every subscriber's app shows: text, links and the logo it downloads.
+		"sub_title": b.SubTitle != nil, "sub_announce": b.Announce != nil, "sub_announce_url": b.AnnounceURL != nil, "app_branding": b.AppBranding != nil,
+		"brand_accent": b.BrandAccent != nil, "brand_logo_url": b.BrandLogoURL != nil,
+		"subscription_theme": b.PageTheme != nil, "subscription_logo": b.PageLogo != nil, "subscription_modules": b.PageModules != nil} {
 		if touched {
 			if err := requireSession(ctx, field); err != nil {
 				return nil, err
@@ -205,6 +247,33 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 	}
 	if b.SupportURL != nil && *b.SupportURL != "" && !strings.HasPrefix(*b.SupportURL, "https://") && !strings.HasPrefix(*b.SupportURL, "tg://") {
 		details = append(details, &huma.ErrorDetail{Location: "body.support_url", Message: "support_url_invalid"})
+	}
+	if b.AnnounceURL != nil && *b.AnnounceURL != "" && !subs.ValidLink(strings.TrimSpace(*b.AnnounceURL), true) {
+		details = append(details, &huma.ErrorDetail{Location: "body.sub_announce_url", Message: "support_url_invalid"})
+	}
+	// A {word} that is no variable stays as text: an old announcement may hold one.
+	for field, v := range map[string]*string{"sub_title": b.SubTitle, "sub_announce": b.Announce} {
+		if v == nil {
+			continue
+		}
+		if strings.ContainsAny(*v, "\r\n") {
+			details = append(details, &huma.ErrorDetail{Location: "body." + field, Message: "one_line"})
+		}
+	}
+	if b.BrandAccent != nil && *b.BrandAccent != "" && !subs.ValidAccent(strings.TrimSpace(*b.BrandAccent)) {
+		details = append(details, &huma.ErrorDetail{Location: "body.brand_accent", Message: "color_invalid"})
+	}
+	if b.BrandLogoURL != nil && *b.BrandLogoURL != "" && !subs.ValidLink(strings.TrimSpace(*b.BrandLogoURL), false) {
+		details = append(details, &huma.ErrorDetail{Location: "body.brand_logo_url", Message: "url_invalid"})
+	}
+	if b.PageTheme != nil && !validSubscriptionTheme(strings.TrimSpace(*b.PageTheme)) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_theme", Message: "theme_invalid"})
+	}
+	if b.PageLogo != nil && *b.PageLogo != "" && !validSubscriptionLogo(strings.TrimSpace(*b.PageLogo)) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_logo", Message: "logo_invalid"})
+	}
+	if b.PageModules != nil && !validSubscriptionModules(*b.PageModules) {
+		details = append(details, &huma.ErrorDetail{Location: "body.subscription_modules", Message: "modules_invalid"})
 	}
 	if b.SubGroupMain != nil || b.SubGroupAuto != nil || b.SubRules != nil {
 		cur, err := h.groups(ctx)
@@ -295,8 +364,9 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 		}
 	}
 	// Every setting of the request is written in one transaction: a failure in the middle
-	// leaves the settings as they were, not half changed.
-	err := h.d.Store.Tx(ctx, func(q *db.Queries) error {
+	// leaves the settings as they were, not half changed. The values are written as given,
+	// read from nothing: READ COMMITTED.
+	err := h.d.Store.TxRC(ctx, func(q *db.Queries) error {
 		set := settings.New(q)
 		if b.SubPort != nil {
 			if err := settings.Set(ctx, set, settings.KeySubPort, *b.SubPort); err != nil {
@@ -309,11 +379,18 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 			}
 		}
 		for key, v := range map[string]*string{settings.KeyBrand: b.Brand, settings.KeySupportURL: b.SupportURL, settings.KeyPublicHost: b.PublicHost, settings.KeyDomain: b.Domain,
+			settings.KeySubTitle: b.SubTitle, settings.KeyAnnounce: b.Announce, settings.KeyAnnounceURL: b.AnnounceURL, settings.KeyBrandAccent: b.BrandAccent, settings.KeyBrandLogo: b.BrandLogoURL,
+			settings.KeySubPageTheme: b.PageTheme, settings.KeySubPageLogo: b.PageLogo,
 			settings.KeyGroupMain: b.SubGroupMain, settings.KeyGroupAuto: b.SubGroupAuto, settings.KeyRouting: b.SubRouting, settings.KeyFingerprint: b.Fingerprint, settings.KeyDefaultLang: b.DefaultLang} {
 			if v == nil {
 				continue
 			}
 			if err := settings.Set(ctx, set, key, strings.TrimSpace(*v)); err != nil {
+				return err
+			}
+		}
+		if b.PageModules != nil {
+			if err := settings.Set(ctx, set, settings.KeySubPageModules, *b.PageModules); err != nil {
 				return err
 			}
 		}
@@ -323,7 +400,7 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 			}
 		}
 		for key, v := range map[string]*bool{settings.KeyAutoPort: b.AutoPort, settings.KeyAutoSNI: b.AutoSNI,
-			settings.KeyDeviceBinding: b.DeviceBinding, settings.KeyRequireHWID: b.RequireHWID} {
+			settings.KeyDeviceBinding: b.DeviceBinding, settings.KeyRequireHWID: b.RequireHWID, settings.KeyAppBranding: b.AppBranding} {
 			if v != nil {
 				if err := settings.Set(ctx, set, key, *v); err != nil {
 					return err
@@ -354,6 +431,55 @@ func (h *handlers) updateSettings(ctx context.Context, in *patchSettingsInput) (
 		return nil, err
 	}
 	return &settingsOutput{Body: v}, nil
+}
+
+func validSubscriptionTheme(v string) bool {
+	switch v {
+	case "mikan", "midnight", "ocean", "sakura", "forest":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSubscriptionLogo(v string) bool {
+	if subs.ValidLink(v, false) {
+		return true
+	}
+	// Permit one emoji grapheme (including a skin tone, variation selector or ZWJ
+	// sequence), but no arbitrary text or markup.
+	if utf8.RuneCountInString(v) == 0 || utf8.RuneCountInString(v) > 8 {
+		return false
+	}
+	base := false
+	for _, r := range v {
+		if unicode.Is(unicode.S, r) {
+			base = true
+			continue
+		}
+		if unicode.Is(unicode.M, r) || r == '\u200d' || r == '\ufe0f' || (r >= '\U0001f3fb' && r <= '\U0001f3ff') {
+			continue
+		}
+		return false
+	}
+	return base
+}
+
+func validSubscriptionModules(v []settings.SubscriptionModule) bool {
+	if len(v) != len(settings.DefaultSubscriptionModules) {
+		return false
+	}
+	want := make(map[string]bool, len(settings.DefaultSubscriptionModules))
+	for _, m := range settings.DefaultSubscriptionModules {
+		want[m.ID] = true
+	}
+	for _, m := range v {
+		if !want[m.ID] {
+			return false
+		}
+		delete(want, m.ID)
+	}
+	return len(want) == 0
 }
 
 // subPortReserved can never serve subscriptions: SSH, and 80 that Let's Encrypt needs.

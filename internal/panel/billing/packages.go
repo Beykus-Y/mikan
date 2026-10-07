@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/promo"
 	"mikan/internal/panel/secure"
 	"mikan/internal/panel/store/db"
 )
@@ -78,11 +79,20 @@ type PackageRequest struct {
 	UserID    int64
 	PackageID int64
 	Provider  string
+	PromoCode string
 }
 
 // PackageInvoice opens a payment for a package. Only the subscription's owner buys for it;
 // an open invoice for the same purchase made in the last minutes is returned again.
 func (s *Service) PackageInvoice(ctx context.Context, req PackageRequest) (db.Payment, error) {
+	if strings.TrimSpace(req.PromoCode) != "" && s.d.Promo == nil {
+		return db.Payment{}, promo.ErrUnavailable
+	}
+	if strings.TrimSpace(req.PromoCode) != "" {
+		if err := s.validatePromoProvider(ctx, req.Provider); err != nil {
+			return db.Payment{}, err
+		}
+	}
 	q := s.d.Store.Q
 	if link, err := q.GetTgLink(ctx, req.UserID); err != nil || link.TgID != req.TgID {
 		return db.Payment{}, ErrNotYours
@@ -101,35 +111,80 @@ func (s *Service) PackageInvoice(ctx context.Context, req PackageRequest) (db.Pa
 		return db.Payment{}, ErrNotForSale
 	}
 	p := offer.Package
+	user, err := q.GetUser(ctx, req.UserID)
+	if err != nil {
+		return db.Payment{}, err
+	}
+	// Checked again on the user's own rows: a pool closed on the tariff sells nothing.
+	userPools, err := q.ListUserPools(ctx, req.UserID)
+	if err != nil {
+		return db.Payment{}, err
+	}
+	if domain.PackagePoolClosed(userPools, p) {
+		return db.Payment{}, ErrNotForSale
+	}
 	amount, currency, ok := av.price(req.Provider, p.PriceStars, p.PriceRub)
 	if !ok {
 		return db.Payment{}, ErrProviderOff
 	}
+	unlock, err := s.lockBuyer(ctx, req.TgID)
+	if err != nil {
+		return db.Payment{}, err
+	}
+	defer unlock()
 	now := s.d.Now()
 	userID := sql.NullInt64{Int64: req.UserID, Valid: true}
 	packageID := sql.NullInt64{Int64: p.ID, Valid: true}
-	if open, err := q.FindOpenPackagePayment(ctx, db.FindOpenPackagePaymentParams{TgID: req.TgID, PackageID: packageID, Provider: req.Provider,
-		UserID: userID, Since: now.Add(-invoiceReuse).Unix()}); err == nil && open.Amount == amount {
-		return open, nil
-	}
-	if n, err := s.recentInvoices(ctx, req.TgID, now); err != nil {
-		return db.Payment{}, err
-	} else if n >= maxPerHour {
-		return db.Payment{}, ErrTooMany
-	}
-	pay, err := q.CreatePackagePayment(ctx, db.CreatePackagePaymentParams{Provider: req.Provider, Payload: secure.Token(32), TgID: req.TgID,
-		UserID: userID, PackageID: packageID, TariffName: p.Name, Amount: amount, Currency: currency, CreatedAt: now.Unix()})
+	pay, open, err := s.newPayment(ctx, req.TgID, now,
+		func(q *db.Queries) ([]db.Payment, error) {
+			return q.FindOpenPackagePayments(ctx, db.FindOpenPackagePaymentsParams{TgID: req.TgID, PackageID: packageID, Provider: req.Provider, UserID: userID, Since: now.Add(-invoiceReuse).Unix()})
+		},
+		func(q *db.Queries, existing db.Payment) (bool, error) {
+			return s.matchesOpenPayment(ctx, q, existing, amount, req.PromoCode)
+		},
+		func(q *db.Queries) (db.Payment, error) {
+			created, err := q.CreatePackagePayment(ctx, db.CreatePackagePaymentParams{Provider: req.Provider, Payload: secure.Token(32), TgID: req.TgID, UserID: userID, PackageID: packageID, TariffName: p.Name, Amount: amount, Currency: currency, CreatedAt: now.Unix()})
+			if err != nil {
+				return db.Payment{}, err
+			}
+			if s.d.Promo != nil && strings.TrimSpace(req.PromoCode) != "" {
+				if !user.TariffID.Valid {
+					return db.Payment{}, promo.ErrTariff
+				}
+				d, err := s.d.Promo.ReserveDiscount(ctx, q, req.TgID, req.UserID, user.TariffID.Int64, amount, currency, req.PromoCode, created.ID)
+				if err != nil {
+					return db.Payment{}, err
+				}
+				if _, err := q.SetPaymentAmount(ctx, db.SetPaymentAmountParams{Amount: d.Final, ID: created.ID}); err != nil {
+					return db.Payment{}, err
+				}
+				created.Amount = d.Final
+			}
+			return created, nil
+		})
 	if err != nil {
 		return db.Payment{}, err
+	}
+	if open {
+		return pay, nil
 	}
 	lang, _ := s.d.Settings.Lang(ctx)
 	return s.openPayment(ctx, pay, p.Name, DescribePackage(p, offer.Pool, lang))
 }
 
-// packageOnSale: the package of a payment can still be bought (Telegram's pre-checkout).
+// packageOnSale: the package of a payment can still be bought (Telegram's pre-checkout):
+// on sale, and its pool not closed for the subscription since the invoice.
 func (s *Service) packageOnSale(ctx context.Context, pay db.Payment) error {
-	p, err := s.d.Store.Q.GetTrafficPackage(ctx, pay.PackageID.Int64)
+	q := s.d.Store.Q
+	p, err := q.GetTrafficPackage(ctx, pay.PackageID.Int64)
 	if err != nil || !pay.PackageID.Valid || p.Archived != 0 || p.OnSale == 0 {
+		return ErrNotForSale
+	}
+	pools, err := q.ListUserPools(ctx, pay.UserID.Int64)
+	if err != nil {
+		return err
+	}
+	if domain.PackagePoolClosed(pools, p) {
 		return ErrNotForSale
 	}
 	return nil
@@ -137,6 +192,9 @@ func (s *Service) packageOnSale(ctx context.Context, pay db.Payment) error {
 
 // applyPackage gives the paid package to the payment's subscription on q's transaction.
 // A package archived or taken off sale since the invoice still applies: it is paid for.
+// So does one for a pool closed on the tariff since then (the provider took the money, and
+// refusing it here would lose it): the grant waits in the pool until the pool is opened
+// again or the grant expires, and the warning tells the operator to refund or reopen.
 func (s *Service) applyPackage(ctx context.Context, q *db.Queries, pay db.Payment) (db.User, error) {
 	if !pay.UserID.Valid {
 		return db.User{}, errUserGone
@@ -157,6 +215,9 @@ func (s *Service) applyPackage(ctx context.Context, q *db.Queries, pay db.Paymen
 	}
 	if err != nil {
 		return u, err
+	}
+	if pools, err := q.ListUserPools(ctx, u.ID); err == nil && domain.PackagePoolClosed(pools, p) {
+		s.d.Log.Warn("billing: a paid package is for a pool closed for the subscription", "payment", pay.ID, "user", u.ID, "package", p.ID, "pool", p.PoolID.Int64)
 	}
 	_, err = domain.GrantTx(ctx, q, u, domain.GrantOf(p, pay.ID), s.d.Now())
 	return u, err

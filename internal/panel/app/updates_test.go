@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"mikan/internal/panel/updates"
 	"mikan/internal/release"
 )
 
@@ -18,11 +20,23 @@ import (
 func TestUpdatesForTheHost(t *testing.T) {
 	dir := t.TempDir()
 	latest := "0.0.1"
+	var (
+		mu       sync.Mutex
+		channels []string
+	)
+	lastChannel := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return channels[len(channels)-1]
+	}
 	h := newHarness(t, func(o *Options) {
 		o.DataDir = dir
-		o.Releases = func(context.Context) (release.Manifest, error) {
-			return release.Manifest{Version: latest, Published: time.Unix(1_800_000_000, 0), Image: "ghcr.io/miroshka000/mikan",
-				Digest: "sha256:" + strings.Repeat("a", 64), Notes: map[string]string{"en": "- faster", "ru": "- быстрее"}}, nil
+		o.Releases = func(_ context.Context, q updates.Query) (updates.Found, error) {
+			mu.Lock()
+			channels = append(channels, q.Channel)
+			mu.Unlock()
+			return updates.Found{Manifest: release.Manifest{Version: latest, Published: time.Unix(1_800_000_000, 0), Image: "ghcr.io/miroshka000/mikan",
+				Digest: "sha256:" + strings.Repeat("a", 64), Notes: map[string]string{"en": "- faster", "ru": "- быстрее"}}}, nil
 		}
 	})
 	if resp, _ := h.login(password, ""); resp.StatusCode != http.StatusOK {
@@ -35,6 +49,7 @@ func TestUpdatesForTheHost(t *testing.T) {
 		Latest      string            `json:"latest"`
 		Available   bool              `json:"available"`
 		Auto        bool              `json:"auto"`
+		Channel     string            `json:"channel"`
 		Notes       map[string]string `json:"notes"`
 		RequestedAt int64             `json:"requested_at"`
 		Host        *struct {
@@ -49,7 +64,7 @@ func TestUpdatesForTheHost(t *testing.T) {
 		}
 		return v
 	}
-	if v := read(h.do(http.MethodGet, api, nil, nil)); v.Current != "test" || v.Latest != "" || v.Available || v.Auto {
+	if v := read(h.do(http.MethodGet, api, nil, nil)); v.Current != "test" || v.Latest != "" || v.Available || v.Auto || v.Channel != "stable" {
 		t.Fatalf("before a check: %+v", v)
 	}
 	// A development build ("test") is older than any release.
@@ -59,8 +74,21 @@ func TestUpdatesForTheHost(t *testing.T) {
 	if v := read(h.do(http.MethodPatch, api, map[string]any{"auto": true}, csrf)); !v.Auto {
 		t.Fatalf("auto: %+v", v)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "update", "policy.json")); string(b) != `{"auto":true}` {
+	if b, _ := os.ReadFile(filepath.Join(dir, "update", "policy.json")); string(b) != `{"auto":true,"channel":"stable"}` {
 		t.Fatalf("the host reads the switch from policy.json: %s", b)
+	}
+	// The channel goes to the host beside the switch, and the panel looks again on it.
+	if v := read(h.do(http.MethodPatch, api, map[string]any{"channel": "beta"}, csrf)); !v.Auto || v.Channel != "beta" || lastChannel() != "beta" {
+		t.Fatalf("channel: %+v, checked on %q", v, lastChannel())
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "update", "policy.json")); string(b) != `{"auto":true,"channel":"beta"}` {
+		t.Fatalf("the host reads the channel from policy.json: %s", b)
+	}
+	if resp, body := h.do(http.MethodPatch, api, map[string]any{"channel": "nightly"}, csrf); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("an unknown channel: %d %s", resp.StatusCode, body)
+	}
+	if v := read(h.do(http.MethodPatch, api, map[string]any{"channel": "stable"}, csrf)); v.Channel != "stable" || !v.Available {
+		t.Fatalf("back to stable: %+v", v)
 	}
 	if v := read(h.do(http.MethodPost, api+"/request", nil, csrf)); v.RequestedAt == 0 {
 		t.Fatalf("request: %+v", v)

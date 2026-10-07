@@ -102,6 +102,9 @@ func TestFullKeyCannotTakeOverThePanel(t *testing.T) {
 	for field, body := range map[string]map[string]any{
 		"public_host": {"public_host": "attacker.example"}, "domain": {"domain": "attacker.example"}, "sub_port": {"sub_port": 8443},
 		"sub_rules": {"sub_rules": "DOMAIN,evil.example,DIRECT"}, "support_url": {"support_url": "https://evil.example"},
+		// What every subscriber's app shows.
+		"sub_announce": {"sub_announce": "Pay here"}, "sub_announce_url": {"sub_announce_url": "https://evil.example"},
+		"app_branding": {"app_branding": true}, "brand_accent": {"brand_accent": "#000000"}, "brand_logo_url": {"brand_logo_url": "https://evil.example/l.png"},
 	} {
 		resp, out := k.asKey(k.full, http.MethodPatch, "/settings", body)
 		if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(out), "session_only") || !strings.Contains(string(out), field) {

@@ -110,6 +110,7 @@ func TestNewStateIsTriedAtOnceAfterAFailure(t *testing.T) {
 	if _, err := domain.NewInbounds(st, nil, time.Now).Create(ctx, domain.NewInbound{NodeID: LocalNode, Preset: "trojan_reality"}); err != nil {
 		t.Fatal(err)
 	}
+	s.m.SlotsChanged() // what the API does after the change
 	s.applyState(ctx)
 	if n.applyCalls != 2 {
 		t.Fatalf("an admin's change waits for nobody: %d calls", n.applyCalls)
@@ -313,7 +314,7 @@ func TestInvalidInboundStaysOutOfTheNodesState(t *testing.T) {
 }
 
 // Old traffic by the hour and quiet devices are deleted once an hour, not at every tick
-// of the upkeep: the delete scans a big table while it holds the one writer.
+// of the upkeep: the delete scans a big table.
 func TestOldRowsArePrunedHourly(t *testing.T) {
 	s, _, st, users, now := setup(t)
 	ctx := context.Background()

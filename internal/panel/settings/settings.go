@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"mikan/internal/panel/store/db"
+	"mikan/internal/release"
 )
 
 const (
@@ -42,12 +43,55 @@ const (
 	// KeyAutoUpdate lets the host updater install new releases on its own, once a day;
 	// off by default (internal/panel/updates).
 	KeyAutoUpdate = "auto_update"
+	// KeyUpdateChannel is which releases the panel and the host updater take: "stable"
+	// (unset) or "beta", the pre-releases too (release.Stable, release.Beta).
+	KeyUpdateChannel = "update_channel"
+	// KeyNodesFollow lets the panel update its remote nodes to its own version, one at a
+	// time, after it updated itself; on unless switched off (internal/panel/nodeupdate).
+	KeyNodesFollow = "nodes_follow_panel"
 	// Branding and support: the bot's and the subscription page's name and the support link.
 	KeyBrand      = "brand"
 	KeySupportURL = "support_url"
+	// The announcement apps show over the profile (the announce and announce-url headers),
+	// for maintenance or news; empty: none.
+	KeyAnnounce    = "sub_announce"
+	KeyAnnounceURL = "sub_announce_url"
+	// KeySubTitle is the profile's name in the apps (subs.Config.Title); empty: the brand.
+	KeySubTitle = "sub_title"
+	// App branding: the brand, logo and accent colour go to the apps that read operator
+	// headers (subs.OperatorHeaders); off by default.
+	KeyAppBranding = "app_branding"
+	KeyBrandAccent = "brand_accent"   // #RRGGBB, empty: the app's own
+	KeyBrandLogo   = "brand_logo_url" // https, empty: the app's own
+	// Subscription-page branding is separate from operator branding sent to VPN apps.
+	KeySubPageTheme   = "subscription_theme"
+	KeySubPageLogo    = "subscription_logo" // https image URL or a single emoji
+	KeySubPageModules = "subscription_modules"
+	// KeyLegacySubPath is the path of the subscription links of the panel users were
+	// imported from: "sub" for Marzban and PasarGuard, "api/sub" for Remnawave. The old
+	// tokens lead to the users (legacy_sub_tokens); empty: off.
+	KeyLegacySubPath = "legacy_sub_path"
+	// KeyLegacySubKind and KeyLegacySubSecret check the links Marzban or PasarGuard signed
+	// (panelimport.Verifier): the panel's kind and the secret from its jwt table. The
+	// secret is never shown back.
+	KeyLegacySubKind   = "legacy_sub_kind"
+	KeyLegacySubSecret = "legacy_sub_secret"
 	// KeyQuietHour is the UTC hour the slot pool is refilled, which reconnects QUIC clients.
 	KeyQuietHour = "quiet_hour_utc"
 )
+
+// SubscriptionModule controls one content section on the public subscription page.
+type SubscriptionModule struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
+}
+
+var DefaultSubscriptionModules = []SubscriptionModule{
+	{ID: "status", Enabled: true}, {ID: "usage", Enabled: true}, {ID: "pools", Enabled: true},
+	{ID: "devices", Enabled: true}, {ID: "apps", Enabled: true}, {ID: "instructions", Enabled: true},
+	{ID: "link", Enabled: true}, {ID: "promo", Enabled: true}, {ID: "shop", Enabled: true},
+	{ID: "packages", Enabled: true}, {ID: "telegram", Enabled: true}, {ID: "support", Enabled: true},
+}
 
 // Switch is an on/off setting with its default: read it with On, so the default lives
 // here and nowhere else.
@@ -63,6 +107,8 @@ var (
 	DeviceBinding = Switch{KeyDeviceBinding, true}
 	RequireHWID   = Switch{KeyRequireHWID, false}
 	AutoUpdate    = Switch{KeyAutoUpdate, false}
+	NodesFollow   = Switch{KeyNodesFollow, true}
+	AppBranding   = Switch{KeyAppBranding, false}
 )
 
 // ValidLang says whether s is a language of the panel.
@@ -147,9 +193,20 @@ func (s *Settings) Lang(ctx context.Context) (string, error) {
 	return v, nil
 }
 
+// UpdateChannel is the channel of updates: release.Beta when chosen, release.Stable otherwise.
+func (s *Settings) UpdateChannel(ctx context.Context) (string, error) {
+	v, err := s.String(ctx, KeyUpdateChannel)
+	if err != nil || !release.ValidChannel(v) {
+		return release.Stable, err
+	}
+	return v, nil
+}
+
 type Paths struct {
 	Admin string
 	Sub   string
+	// Legacy is the old panel's subscription path, one to three segments; "" when unset.
+	Legacy string
 }
 
 func (s *Settings) Paths(ctx context.Context) (Paths, error) {
@@ -161,7 +218,11 @@ func (s *Settings) Paths(ctx context.Context) (Paths, error) {
 	if err != nil {
 		return Paths{}, err
 	}
-	return Paths{Admin: a, Sub: sub}, nil
+	legacy, err := s.String(ctx, KeyLegacySubPath)
+	if err != nil {
+		return Paths{}, err
+	}
+	return Paths{Admin: a, Sub: sub, Legacy: legacy}, nil
 }
 
 // Endpoint is how clients reach the panel: host is an IP or a domain.

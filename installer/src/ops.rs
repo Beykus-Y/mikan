@@ -171,9 +171,22 @@ pub fn status() -> Result<()> {
     } else {
         crate::out("The panel does not answer: mikan logs panel");
     }
-    match release::latest() {
-        Ok(m) if release::newer(&m.version, &version) => crate::out(&format!("mikan {} is out: mikan update", m.version)),
-        Ok(_) => crate::out("This is the latest release."),
+    match release::find(Some(&version), crate::update::channel(&install)) {
+        Ok(found) => {
+            // Where the answer came from is worth a line only when it is not the index.
+            if let Some(why) = &found.fallback {
+                crate::out(&format!("The release index is unavailable ({why}): the latest release on GitHub answers instead."));
+            }
+            let m = &found.manifest;
+            match &found.newest {
+                Some(newest) if found.unreachable => {
+                    crate::out(&format!("mikan {newest} is out, but this version cannot update to it directly."))
+                }
+                Some(newest) => crate::out(&format!("mikan {newest} is out: mikan update (through mikan {} first)", m.version)),
+                None if release::newer(&m.version, &version) => crate::out(&format!("mikan {} is out: mikan update", m.version)),
+                None => crate::out("This is the latest release."),
+            }
+        }
         Err(e) => crate::out(&format!("Cannot check for updates: {e:#}")),
     }
     Ok(())
@@ -251,9 +264,10 @@ pub fn join(key: &str, panel_ip: Option<IpAddr>) -> Result<()> {
     Ok(())
 }
 
-/// Stops mikan and removes what it put on the host; the data stays.
-pub fn uninstall() -> Result<()> {
-    Install::load()?;
+/// Stops mikan and removes what it put on the host; the data stays, a panel's database in
+/// its volume too. True for a panel.
+pub fn uninstall() -> Result<bool> {
+    let panel = !Install::load()?.node;
     let _lock = lock::acquire(lock::Wait::Block, &mut crate::out)?;
     docker::compose_run(&["down"])?;
     addon::down();
@@ -262,5 +276,5 @@ pub fn uninstall() -> Result<()> {
         let _ = Command::new("sysctl").arg("--system").stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
     let _ = fs::remove_file(host::BIN);
-    Ok(())
+    Ok(panel)
 }

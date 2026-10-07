@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Cloud, Copy, KeyRound, Pencil, Plus, ShieldCheck, Trash2, Waypoints } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpCircle, Cloud, Copy, Gauge, KeyRound, LoaderCircle, Pencil, Plus, ShieldCheck, Trash2, Waypoints } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, errorText, unwrap, type Schemas } from "../../api/client";
 import { qk, useNodes } from "../../api/hooks";
@@ -13,6 +13,7 @@ import { t, tMaybe } from "../../i18n";
 import { useCopy } from "../../lib/copy";
 import { bytes, num } from "../../lib/format";
 import { CascadeDrawer } from "./node-cascade";
+import { SpeedDrawer } from "./node-speed";
 import { WarpDrawer } from "./node-warp";
 
 type Node = Schemas["NodeInfo"];
@@ -22,8 +23,16 @@ export function nodeLabel(n: Pick<Node, "name" | "local">): string {
   return n.name || (n.local ? t("nodes.localName") : "—");
 }
 
+/** What a server before 0.5.0.2 runs once by hand: from then on the panel updates it. */
+const OLD_NODE_COMMAND = "mikan update";
+
+/** The panel can update this node itself and it is behind. */
+const updatable = (n: Node) => !n.local && n.behind && n.can_update;
+const updating = (n: Node) => n.update?.state === "running";
+
 export function NodesPage() {
   const nodes = useNodes();
+  const toUpdate = (nodes.data ?? []).filter(updatable);
   const qc = useQueryClient();
   const toast = useToast();
   const [adding, setAdding] = useState(false);
@@ -32,8 +41,10 @@ export function NodesPage() {
   const [removing, setRemoving] = useState<Node | null>(null);
   const [joined, setJoined] = useState<Joined | null>(null);
   const [warpOf, setWarpOf] = useState<Node | null>(null);
+  const [speedOf, setSpeedOf] = useState<Node | null>(null);
   const [cascadeOf, setCascadeOf] = useState<Node | null>(null);
   const [certOf, setCertOf] = useState<Node | null>(null);
+  const [updateOf, setUpdateOf] = useState<Node | "all" | null>(null);
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: qk.nodes });
     void qc.invalidateQueries({ queryKey: qk.inbounds });
@@ -47,6 +58,51 @@ export function NodesPage() {
     onSettled: refresh,
     onError: (e) => toast.error(errorText(e)),
   });
+  // The node's server does the update (a backup, the signed release, a restart): this only asks.
+  const update = useMutation({
+    mutationFn: async (id: number | "all") => {
+      if (id === "all") await unwrap(api.POST("/api/v1/nodes/update-all"));
+      else await unwrap(api.POST("/api/v1/nodes/{id}/update", { params: { path: { id } } }));
+    },
+    onSuccess: () => {
+      toast.ok(t("nodes.updateAsked"));
+      setUpdateOf(null);
+    },
+    onSettled: refresh,
+    onError: (e) => {
+      toast.error(errorText(e));
+      setUpdateOf(null);
+    },
+  });
+  // The order of the servers in the subscriptions. The page shows the new order at once;
+  // when the panel refuses, the old one comes back.
+  const order = useMutation({
+    mutationFn: ({ ids }: { ids: number[]; moved: number }) => unwrap(api.PUT("/api/v1/nodes/order", { body: { ids } })),
+    onMutate: async ({ ids }) => {
+      await qc.cancelQueries({ queryKey: qk.nodes });
+      const prev = qc.getQueryData<Node[]>(qk.nodes);
+      if (prev) {
+        const byId = new Map(prev.map((n) => [n.id, n]));
+        qc.setQueryData<Node[]>(
+          qk.nodes,
+          ids.flatMap((id) => byId.get(id) ?? []),
+        );
+      }
+      return { prev };
+    },
+    onError: (e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(qk.nodes, ctx.prev);
+      toast.error(errorText(e));
+    },
+    onSettled: () => void qc.invalidateQueries({ queryKey: qk.nodes }),
+  });
+  const move = (list: Node[], idx: number, by: -1 | 1) => {
+    const ids = list.map((n) => n.id);
+    const to = idx + by;
+    if (order.isPending || to < 0 || to >= ids.length) return;
+    [ids[idx], ids[to]] = [ids[to]!, ids[idx]!];
+    order.mutate({ ids, moved: list[idx]!.id });
+  };
   const remove = useMutation({
     mutationFn: (id: number) => unwrap(api.DELETE("/api/v1/nodes/{id}", { params: { path: { id } } })),
     onSuccess: () => {
@@ -65,10 +121,18 @@ export function NodesPage() {
         title={t("nav.nodes")}
         sub={t("nodes.subtitle")}
         actions={
-          <Button variant="primary" onClick={() => setAdding(true)}>
-            <Plus size={18} aria-hidden />
-            <span className="max-[760px]:hidden">{t("nodes.add")}</span>
-          </Button>
+          <>
+            {toUpdate.length > 1 ? (
+              <Button loading={update.isPending && update.variables === "all"} disabled={update.isPending || toUpdate.some(updating)} onClick={() => setUpdateOf("all")}>
+                <ArrowUpCircle size={18} aria-hidden />
+                <span className="max-[760px]:hidden">{t("nodes.updateAll", { n: toUpdate.length })}</span>
+              </Button>
+            ) : null}
+            <Button variant="primary" onClick={() => setAdding(true)}>
+              <Plus size={18} aria-hidden />
+              <span className="max-[760px]:hidden">{t("nodes.add")}</span>
+            </Button>
+          </>
         }
       />
       <QueryBoundary
@@ -95,8 +159,11 @@ export function NodesPage() {
                   <span>{t("nodes.nameLocalHint")}</span>
                 </div>
               ) : null}
+              {list.length > 1 ? (
+                <p className="text-[13px] text-[var(--ink-500)] lg:col-span-2">{t("nodes.orderHint")}</p>
+              ) : null}
               {list.map((n, idx) => (
-                <NodeCard key={n.id} n={n} idx={idx} onEdit={() => setEditing(n)} onWarp={() => setWarpOf(n)} onCascade={() => setCascadeOf(n)} onCert={() => setCertOf(n)} onRekey={() => setRekeying(n)} onRemove={() => setRemoving(n)} />
+                <NodeCard key={n.id} n={n} idx={idx} total={list.length} sorting={order.isPending} moving={order.isPending && order.variables.moved === n.id} onMove={(by) => move(list, idx, by)} updating={update.isPending && update.variables === n.id} busy={update.isPending} onUpdate={() => setUpdateOf(n)} onEdit={() => setEditing(n)} onWarp={() => setWarpOf(n)} onSpeed={() => setSpeedOf(n)} onCascade={() => setCascadeOf(n)} onCert={() => setCertOf(n)} onRekey={() => setRekeying(n)} onRemove={() => setRemoving(n)} />
               ))}
             </div>
           )
@@ -113,6 +180,7 @@ export function NodesPage() {
       <EditNodeDrawer node={editing} onClose={() => setEditing(null)} />
       <KeyDrawer joined={joined} onClose={() => setJoined(null)} />
       <WarpDrawer node={warpOf ? { id: warpOf.id, name: nodeLabel(warpOf) } : null} onClose={() => setWarpOf(null)} />
+      <SpeedDrawer node={speedOf ? { id: speedOf.id, name: nodeLabel(speedOf) } : null} onClose={() => setSpeedOf(null)} />
       <CascadeDrawer node={cascadeOf ? { id: cascadeOf.id, name: nodeLabel(cascadeOf) } : null} onClose={() => setCascadeOf(null)} />
       <CertDrawer
         open={!!certOf}
@@ -125,6 +193,15 @@ export function NodesPage() {
         clear={() => unwrap(api.DELETE("/api/v1/nodes/{id}/certificate", { params: { path: { id: certOf!.id } } })).then(() => qc.invalidateQueries({ queryKey: qk.nodes }))}
         clearLabel={t("cert.nodeClear")}
         clearText={t("cert.nodeClearText")}
+      />
+      <Confirm
+        open={!!updateOf && !update.isPending}
+        onOpenChange={(v) => !v && setUpdateOf(null)}
+        title={updateOf === "all" ? t("nodes.updateAllTitle", { n: toUpdate.length }) : t("nodes.updateTitle", { name: updateOf ? nodeLabel(updateOf) : "" })}
+        text={updateOf === "all" ? t("nodes.updateAllText") : t("nodes.updateText")}
+        confirm={t("nodes.update")}
+        loading={update.isPending}
+        onConfirm={() => updateOf && update.mutate(updateOf === "all" ? "all" : updateOf.id)}
       />
       <Confirm
         open={!!rekeying}
@@ -152,8 +229,16 @@ export function NodesPage() {
 function NodeCard({
   n,
   idx,
+  total,
+  sorting,
+  moving,
+  onMove,
+  updating: asking,
+  busy,
+  onUpdate,
   onEdit,
   onWarp,
+  onSpeed,
   onCascade,
   onCert,
   onRekey,
@@ -161,8 +246,21 @@ function NodeCard({
 }: {
   n: Node;
   idx: number;
+  /** How many nodes there are: with one there is nothing to order. */
+  total: number;
+  /** The new order is on its way to the panel: no second move now. */
+  sorting: boolean;
+  /** This node is the one being moved. */
+  moving: boolean;
+  onMove: (by: -1 | 1) => void;
+  /** The request for this node is on its way to the panel. */
+  updating: boolean;
+  /** Some node's request is: no second one now. */
+  busy: boolean;
+  onUpdate: () => void;
   onEdit: () => void;
   onWarp: () => void;
+  onSpeed: () => void;
   onCascade: () => void;
   onCert: () => void;
   onRekey: () => void;
@@ -180,7 +278,22 @@ function NodeCard({
             <span>{n.local ? t("nodes.kindLocal") : t("nodes.kindRemote")}</span>
           </div>
         </div>
-        <NodeStatus n={n} />
+        <div className="flex shrink-0 items-center gap-1">
+          <NodeStatus n={n} />
+          {total > 1 ? (
+            <>
+              <span className="num w-6 text-center text-xs text-[var(--ink-500)]" role="img" aria-label={t("nodes.position", { n: idx + 1, total })}>
+                {moving ? <LoaderCircle size={14} className="spin inline" aria-hidden /> : idx + 1}
+              </span>
+              <button type="button" className="icon-btn" disabled={sorting || idx === 0} aria-busy={moving || undefined} aria-label={t("nodes.moveUp", { name: nodeLabel(n) })} title={t("nodes.moveUp", { name: nodeLabel(n) })} onClick={() => onMove(-1)}>
+                <ArrowUp size={18} aria-hidden />
+              </button>
+              <button type="button" className="icon-btn" disabled={sorting || idx === total - 1} aria-busy={moving || undefined} aria-label={t("nodes.moveDown", { name: nodeLabel(n) })} title={t("nodes.moveDown", { name: nodeLabel(n) })} onClick={() => onMove(1)}>
+                <ArrowDown size={18} aria-hidden />
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
       {n.status === "error" && n.enabled ? (
         <p className="mt-3 text-[13px] text-[var(--berry-600)]" role="alert">
@@ -231,7 +344,10 @@ function NodeCard({
         {n.version ? (
           <div className="col-span-2">
             <dt className="text-xs text-[var(--ink-500)]">{t("nodes.version")}</dt>
-            <dd className="num">{n.version}</dd>
+            <dd className="flex flex-wrap items-center gap-2">
+              <span className="num">{n.version}</span>
+              {n.behind ? <Pill tone="warn">{t("nodes.behind")}</Pill> : null}
+            </dd>
           </div>
         ) : null}
         {n.certificate ? (
@@ -243,12 +359,21 @@ function NodeCard({
           </div>
         ) : null}
       </dl>
+      <NodeUpdate n={n} />
       <div className="mt-4 flex flex-wrap gap-2 border-t border-[var(--hairline)] pt-4">
+        {updatable(n) ? (
+          <Button size="sm" variant="primary" loading={asking || updating(n)} disabled={busy || updating(n)} onClick={onUpdate}>
+            <ArrowUpCircle size={16} aria-hidden /> {updating(n) ? t("nodes.updatingShort") : t("nodes.update")}
+          </Button>
+        ) : null}
         <Button size="sm" onClick={onEdit}>
           <Pencil size={16} aria-hidden /> {t("nodes.configure")}
         </Button>
         <Button size="sm" onClick={onWarp}>
           <Cloud size={16} aria-hidden /> WARP
+        </Button>
+        <Button size="sm" onClick={onSpeed}>
+          <Gauge size={16} aria-hidden /> {t("speed.button")}
         </Button>
         <Button size="sm" onClick={onCascade}>
           <Waypoints size={16} aria-hidden /> {t("cascade.title")}
@@ -268,6 +393,42 @@ function NodeCard({
         ) : null}
       </div>
     </section>
+  );
+}
+
+/**
+ * How the node's update goes, or why it did not: the updater on its server says. A node too
+ * old to be updated from the panel gets the one command to run on its server instead.
+ */
+function NodeUpdate({ n }: { n: Node }) {
+  const copyText = useCopy();
+  const u = n.update;
+  if (n.local || !n.behind) return null;
+  if (u?.state === "running") {
+    return (
+      <p className="mt-3 text-[13px] text-[var(--ink-500)]" role="status">
+        {t("nodes.updating", { v: u.version })}
+      </p>
+    );
+  }
+  if (u?.state === "failed") {
+    return (
+      <p className="mt-3 text-[13px] text-[var(--berry-600)]" role="alert">
+        {t("nodes.updateFailed", { v: u.version, from: u.from || n.version || "", e: (u.error ?? "").split("\n")[0] ?? "" })}
+      </p>
+    );
+  }
+  if (n.can_update || n.status !== "ok") return null;
+  return (
+    <div className="mt-3">
+      <p className="mb-2 text-[13px] text-[var(--ink-500)]">{t("nodes.oldNode")}</p>
+      <div className="link-field">
+        <span className="mono break-all text-xs">{OLD_NODE_COMMAND}</span>
+        <button type="button" className="icon-btn" onClick={() => void copyText(OLD_NODE_COMMAND, t("nodes.commandCopied"))} aria-label={t("nodes.copyCommand")}>
+          <Copy size={18} />
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -390,11 +551,11 @@ function KeyDrawer({ joined, onClose }: { joined: Joined | null; onClose: () => 
 function EditNodeDrawer({ node, onClose }: { node: Node | null; onClose: () => void }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const [form, setForm] = useState({ name: "", host: "", domain: "", enabled: true });
+  const [form, setForm] = useState({ name: "", public_name: "", host: "", domain: "", enabled: true });
   const [errors, setErrors] = useState<Record<string, string>>({});
   useEffect(() => {
     if (node) {
-      setForm({ name: node.name, host: node.host, domain: node.domain, enabled: node.enabled });
+      setForm({ name: node.name, public_name: node.public_name, host: node.host, domain: node.domain, enabled: node.enabled });
       setErrors({});
     }
   }, [node]);
@@ -416,14 +577,14 @@ function EditNodeDrawer({ node, onClose }: { node: Node | null; onClose: () => v
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (!node) return;
-    const body: Schemas["PatchNodeInputBody"] = { name: form.name.trim(), enabled: form.enabled };
+    const body: Schemas["PatchNodeInputBody"] = { name: form.name.trim(), public_name: form.public_name.trim(), enabled: form.enabled };
     if (!node.local) {
       body.host = form.host.trim();
       body.domain = form.domain.trim();
     }
     save.mutate({ id: node.id, body });
   };
-  const set = (k: "name" | "host" | "domain") => (e: React.ChangeEvent<HTMLInputElement>) => {
+  const set = (k: "name" | "public_name" | "host" | "domain") => (e: React.ChangeEvent<HTMLInputElement>) => {
     setForm((f) => ({ ...f, [k]: e.target.value }));
     setErrors(({ [k]: _, ...rest }) => rest);
   };
@@ -447,6 +608,9 @@ function EditNodeDrawer({ node, onClose }: { node: Node | null; onClose: () => v
       <form id="edit-node" onSubmit={submit} className="pt-5" noValidate>
         <Field label={t("nodes.name")} htmlFor="e-name" hint={t("nodes.nameHint")} error={errors.name}>
           <input id="e-name" className="input" value={form.name} onChange={set("name")} placeholder={t("nodes.namePlaceholderEdit")} maxLength={48} autoComplete="off" aria-invalid={!!errors.name} />
+        </Field>
+        <Field label={t("nodes.publicName")} htmlFor="e-public-name" hint={t("nodes.publicNameHint")} error={errors.public_name}>
+          <input id="e-public-name" className="input" value={form.public_name} onChange={set("public_name")} placeholder={t("nodes.publicNamePlaceholder")} maxLength={80} autoComplete="off" aria-invalid={!!errors.public_name} />
         </Field>
         {node && !node.local ? (
           <>

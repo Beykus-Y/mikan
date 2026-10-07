@@ -48,7 +48,7 @@ func TestMoveBuiltin(t *testing.T) {
 		}
 	}
 	var raw string
-	must(t, e.st.DB.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = ?", KeyConfig).Scan(&raw))
+	must(t, e.st.DB.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = $1", KeyConfig).Scan(&raw))
 	if strings.Contains(raw, "yookassa") || !strings.Contains(raw, `"enabled":true`) {
 		t.Fatalf("payment settings: %s", raw)
 	}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -70,10 +71,27 @@ func Handler(e *Engine, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, e.Health())
 	})
+	mux.HandleFunc("POST /v1/update", func(w http.ResponseWriter, r *http.Request) {
+		var req nodeapi.UpdateRequest
+		// A request is one short version: nothing here is as large as the other calls' bodies.
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, nodeapi.Error{Code: "bad_request", Message: err.Error()})
+			return
+		}
+		switch err := e.RequestUpdate(req.Version); {
+		case errors.Is(err, ErrBadVersion):
+			writeJSON(w, http.StatusUnprocessableEntity, nodeapi.Error{Code: "bad_version", Message: "version must be a release version like 0.5.0.2"})
+		case err != nil:
+			log.Error("update request", "err", err)
+			writeJSON(w, http.StatusInternalServerError, nodeapi.Error{Code: "update_failed", Message: "the request could not be written"})
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	})
 	mux.HandleFunc("GET /v1/warp", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
 		defer cancel()
-		writeJSON(w, http.StatusOK, e.WarpStatus(ctx))
+		writeJSON(w, http.StatusOK, e.WarpStatus(ctx, r.URL.Query().Get("force") == "1"))
 	})
 	mux.HandleFunc("GET /v1/probe", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
@@ -85,8 +103,23 @@ func Handler(e *Engine, log *slog.Logger) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, res)
 	})
+	mux.HandleFunc("POST /v1/speedtest", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		res, err := e.SpeedTest(ctx)
+		if errors.Is(err, ErrSpeedTestBusy) {
+			writeJSON(w, http.StatusConflict, nodeapi.Error{Code: "speed_test_busy", Message: "a speed test is running"})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
 	mux.HandleFunc("GET /v1/activity", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, e.Reg.Activity())
+	})
+	mux.HandleFunc("GET /v1/torrents", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+		writeJSON(w, http.StatusOK, e.Reg.TorrentHits(q.Get("epoch"), after))
 	})
 	mux.HandleFunc("POST /v1/targets/check", func(w http.ResponseWriter, r *http.Request) {
 		var req nodeapi.TargetCheckRequest

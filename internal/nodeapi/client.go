@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -56,6 +57,17 @@ func NewTLSClient(address string, cfg *tls.Config) *Client {
 
 var ErrUnavailable = errors.New("node unavailable")
 
+// StatusError is a node's failure answer without an Error body, such as the 404 of a node
+// that predates an endpoint.
+type StatusError struct {
+	Method, Path string
+	Status       int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("node %s %s: status %d", e.Method, e.Path, e.Status)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, in, out any, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -84,7 +96,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, timeo
 		if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&e) == nil && e.Code != "" {
 			return &e
 		}
-		return fmt.Errorf("node %s %s: status %d", method, path, resp.StatusCode)
+		return &StatusError{Method: method, Path: path, Status: resp.StatusCode}
 	}
 	if out != nil {
 		return json.NewDecoder(&cappedReader{r: resp.Body, left: MaxResponse}).Decode(out)
@@ -148,6 +160,29 @@ func (c *Client) Health(ctx context.Context) (Health, error) {
 	return r, err
 }
 
+// RequestUpdate asks the node to update to a release; the updater on its server takes
+// the request. Nodes before 0.5.0.2 answer 404.
+func (c *Client) RequestUpdate(ctx context.Context, version string) error {
+	return c.do(ctx, http.MethodPost, "/v1/update", UpdateRequest{Version: version}, nil, 10*time.Second)
+}
+
+// Torrents returns the torrent blocker's hits after seq of epoch. Nodes that predate the
+// blocker answer 404.
+func (c *Client) Torrents(ctx context.Context, epoch string, after int64) (TorrentHits, error) {
+	var r TorrentHits
+	q := url.Values{"epoch": {epoch}, "after": {strconv.FormatInt(after, 10)}}
+	err := c.do(ctx, http.MethodGet, "/v1/torrents?"+q.Encode(), nil, &r, 10*time.Second)
+	return r, err
+}
+
+// SpeedTest runs the node's speed test, about twenty seconds. Nodes that predate it
+// answer 404 (a *StatusError); one running a test answers 409 speed_test_busy.
+func (c *Client) SpeedTest(ctx context.Context) (SpeedTest, error) {
+	var r SpeedTest
+	err := c.do(ctx, http.MethodPost, "/v1/speedtest", nil, &r, 90*time.Second)
+	return r, err
+}
+
 func (c *Client) Activity(ctx context.Context) (Activity, error) {
 	var r Activity
 	err := c.do(ctx, http.MethodGet, "/v1/activity", nil, &r, 10*time.Second)
@@ -167,10 +202,16 @@ func (c *Client) ScanTargets(ctx context.Context, req TargetScanRequest) (Target
 	return r, err
 }
 
-// Warp checks the node's way out through WARP (a request to Cloudflare through it).
-func (c *Client) Warp(ctx context.Context) (WarpStatus, error) {
+// Warp checks the node's way out through WARP (a request to Cloudflare through it). The
+// node answers from a minute-old check unless force asks for a new one; it may still
+// answer from the cache when forced too often, and old nodes ignore force.
+func (c *Client) Warp(ctx context.Context, force bool) (WarpStatus, error) {
 	var r WarpStatus
-	err := c.do(ctx, http.MethodGet, "/v1/warp", nil, &r, 20*time.Second)
+	path := "/v1/warp"
+	if force {
+		path += "?force=1"
+	}
+	err := c.do(ctx, http.MethodGet, path, nil, &r, 20*time.Second)
 	return r, err
 }
 

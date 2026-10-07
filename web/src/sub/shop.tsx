@@ -5,9 +5,11 @@ import { Check, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui";
 import { t, type Key } from "../i18n";
-import { rubles } from "../lib/format";
+import { money, rubles } from "../lib/format";
 
-export type Offer = { id: number; name: string; description: string; stars?: number; rub?: number };
+/** A term of a plan sold for several: its own price; label is "30 days", "3 months". */
+export type Term = { days: number; label: string; description: string; stars?: number; rub?: number };
+export type Offer = { id: number; name: string; description: string; stars?: number; rub?: number; terms?: Term[] };
 export type ShopData = {
   allow_new: boolean;
   providers: { stars: boolean };
@@ -26,6 +28,8 @@ const FAIL: Record<string, Key> = {
   not_for_sale: "sub.shopNotForSale",
   too_many_invoices: "sub.shopTooMany",
   too_many_subs: "sub.shopTooManySubs",
+  promo_unavailable: "sub.promoUnavailable",
+  promo_try_later: "sub.promoTryLater",
 };
 
 /** What the account can buy; with token, the traffic packages of that subscription too. */
@@ -52,6 +56,7 @@ export function Shop({
   openInvoice,
   openLink,
   onRefresh,
+  promoCode = "",
 }: {
   data: ShopData;
   offers: Offer[];
@@ -64,13 +69,26 @@ export function Shop({
   openInvoice: (slug: string) => void;
   openLink: (url: string) => void;
   onRefresh: () => void;
+  promoCode?: string;
 }) {
   const [picked, setPicked] = useState<number | null>(offers.length === 1 ? offers[0]!.id : null);
+  // The chosen term of a plan sold for several; the first until another is chosen.
+  const [termDays, setTermDays] = useState<number | null>(null);
   const [busy, setBusy] = useState<Provider | null>(null);
   const [error, setError] = useState("");
+  const [promoPreview, setPromoPreview] = useState<{ discount: number; final_amount: number; currency: string } | null>(null);
   const [opened, setOpened] = useState(false);
-  useEffect(() => setError(""), [picked]);
+  useEffect(() => { setError(""); setPromoPreview(null); }, [picked, termDays, promoCode]);
+  useEffect(() => setTermDays(null), [picked]);
   const offer = offers.find((o) => o.id === picked);
+  const terms = offer?.terms && offer.terms.length > 1 ? offer.terms : null;
+  const term = terms ? (terms.find((x) => x.days === termDays) ?? terms[0]!) : null;
+  // What is paid for: the chosen term's prices, or the offer's own.
+  const price = term ?? offer;
+  // A single term the providers take now is named too: it may not be the plan's first,
+  // which a request without days is for.
+  const sold = term ?? offer?.terms?.[0];
+  const order = { [field]: offer?.id, ...(sold ? { term_days: sold.days } : {}) };
   const failText = (code: string) => (field === "package_id" && code === "not_for_sale" ? t("sub.packageNotForSale") : t(FAIL[code] ?? "sub.shopFail"));
 
   const pay = async (provider: Provider) => {
@@ -78,10 +96,26 @@ export function Shop({
     setBusy(provider);
     setError("");
     try {
+      if (promoCode) {
+        const preview = await fetch(subRoot + "/tg/promo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ init_data: initData, token, code: promoCode, ...order, provider, validate_only: true }),
+          cache: "no-store",
+        });
+        const result = (await preview.json().catch(() => ({}))) as { code?: string; discount?: number; final_amount?: number; currency?: string };
+        if (!preview.ok) {
+          setError(failText(result.code ?? "promo_unavailable"));
+          return;
+        }
+        if (result.discount != null && result.final_amount != null && result.currency) {
+          setPromoPreview({ discount: result.discount, final_amount: result.final_amount, currency: result.currency });
+        }
+      }
       const r = await fetch(subRoot + "/tg/pay", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ init_data: initData, [field]: offer.id, provider, token }),
+        body: JSON.stringify({ init_data: initData, ...order, provider, token, promo_code: promoCode }),
         cache: "no-store",
       });
       const body = (await r.json().catch(() => ({}))) as { url?: string; code?: string };
@@ -102,27 +136,38 @@ export function Shop({
   };
 
   const methods: { id: Provider; label: string; price?: string }[] = [];
-  if (offer?.stars && data.providers.stars) methods.push({ id: "stars", label: t("sub.shopStars"), price: `⭐ ${offer.stars}` });
-  if (offer?.rub) {
+  if (price?.stars && data.providers.stars) methods.push({ id: "stars", label: t("sub.shopStars"), price: `⭐ ${price.stars}` });
+  if (price?.rub) {
     const adapters = [...(data.addons ?? [])].sort((a, b) => rank(a.provider) - rank(b.provider) || a.provider.localeCompare(b.provider));
-    for (const a of adapters) methods.push({ id: a.provider, label: KNOWN[a.provider] ? t(KNOWN[a.provider]!) : a.name, price: rubles(offer.rub) });
+    for (const a of adapters) methods.push({ id: a.provider, label: KNOWN[a.provider] ? t(KNOWN[a.provider]!) : a.name, price: rubles(price.rub) });
   }
 
   return (
     <section className="glass rounded-3xl p-4" aria-label={title}>
       <h2 className="mb-1 text-[15px] font-semibold">{title}</h2>
-      <p className="mb-3 text-xs text-[var(--ink-500)]">{pick}</p>
+      <p className="mb-3 text-xs text-[var(--ink-500)]">{pick}{promoCode ? ` · ${t("sub.promoSelected", { code: promoCode })}` : ""}</p>
+      {promoPreview ? <p className="mb-3 text-xs text-[var(--leaf-600)]">{t("sub.promoCheckoutDiscount", { discount: money(promoPreview.discount, promoPreview.currency), total: money(promoPreview.final_amount, promoPreview.currency) })}</p> : null}
       <div className="flex flex-col gap-2" role="radiogroup" aria-label={pick}>
         {offers.map((o) => (
           <button key={o.id} type="button" role="radio" aria-checked={picked === o.id} className="opt" onClick={() => setPicked(o.id)}>
             <span className="flex items-center justify-between gap-2">
               <span className="font-semibold">{o.name}</span>
-              <span className="num text-[13px] text-[var(--ink-700)]">{o.rub ? rubles(o.rub) : `⭐ ${o.stars}`}</span>
+              <span className="num text-[13px] text-[var(--ink-700)]">{listPrice(o)}</span>
             </span>
             <span className="text-xs text-[var(--ink-500)]">{o.description}</span>
           </button>
         ))}
       </div>
+      {terms ? (
+        <div className="mt-3 flex flex-wrap gap-2" role="radiogroup" aria-label={t("sub.shopPickTerm")}>
+          {terms.map((x) => (
+            <button key={x.days} type="button" role="radio" aria-checked={term?.days === x.days} className="opt flex-1" style={{ minWidth: 96 }} onClick={() => setTermDays(x.days)}>
+              <span className="font-semibold">{x.label}</span>
+              <span className="num text-xs text-[var(--ink-600)]">{x.rub ? rubles(x.rub) : `⭐ ${x.stars}`}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
       {offer ? (
         <div className="mt-3 grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.min(3, Math.max(1, methods.length))}, minmax(0, 1fr))` }}>
           {methods.map((m, i) => (
@@ -152,3 +197,11 @@ export function Shop({
   );
 }
 
+/** The price a list shows: rubles when sold for them, else Stars; "from" the cheapest term
+ * of a plan sold for several. */
+function listPrice(o: Offer): string {
+  const terms = o.terms && o.terms.length > 1 ? o.terms : [o];
+  const rub = Math.min(...terms.map((x) => x.rub || Infinity));
+  const price = Number.isFinite(rub) ? rubles(rub) : `⭐ ${Math.min(...terms.map((x) => x.stars || Infinity))}`;
+  return terms.length > 1 ? t("sub.shopFrom", { price }) : price;
+}

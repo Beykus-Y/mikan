@@ -1,6 +1,7 @@
 package nodesync
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -57,6 +58,14 @@ type Manager struct {
 	lastPrune time.Time
 
 	generation atomic.Uint64 // moves whenever a node is added, changed or removed
+
+	// The snapshot the syncers share (snapshot.go): changes moves with every change it
+	// may not hold any more, batches counts the traffic batches stored per node.
+	changes atomic.Uint64
+	snapMu  sync.Mutex
+	snap    *snapshot
+	batchMu sync.Mutex
+	batches map[int64]uint64
 }
 
 type running struct {
@@ -68,7 +77,7 @@ type running struct {
 
 func NewManager(st *store.Store, set *settings.Settings, pool *domain.Pool, connect Connect, log *slog.Logger, now func() time.Time) *Manager {
 	return &Manager{st: st, set: set, pool: pool, connect: connect, log: log, now: now,
-		nodesDirty: make(chan struct{}, 1), running: map[int64]*running{}}
+		nodesDirty: make(chan struct{}, 1), running: map[int64]*running{}, batches: map[int64]uint64{}}
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -90,12 +99,14 @@ func (m *Manager) Run(ctx context.Context) {
 
 // PoliciesChanged and SlotsChanged implement domain.Changes for all nodes at once.
 func (m *Manager) PoliciesChanged() {
+	m.changes.Add(1)
 	for _, s := range m.Syncers() {
 		s.PoliciesChanged()
 	}
 }
 
 func (m *Manager) SlotsChanged() {
+	m.changes.Add(1)
 	for _, s := range m.Syncers() {
 		s.SlotsChanged()
 	}
@@ -104,6 +115,7 @@ func (m *Manager) SlotsChanged() {
 // NodesChanged restarts syncers after a node was added, removed or re-keyed.
 func (m *Manager) NodesChanged() {
 	m.generation.Add(1)
+	m.changes.Add(1)
 	signal(m.nodesDirty)
 }
 
@@ -269,6 +281,15 @@ func (m *Manager) Health(id int64) (HealthView, bool) {
 	return s.Health(), true
 }
 
+// HostPorts is what the node last said listens on its server; nil when it has not (domain.HostLookup).
+func (m *Manager) HostPorts(id int64) *nodeapi.HostPorts {
+	hv, ok := m.Health(id)
+	if !ok {
+		return nil
+	}
+	return hv.HostPorts()
+}
+
 // Validate runs mihomo's parser on an inbound on the node that will run it.
 func (m *Manager) Validate(ctx context.Context, id int64, req nodeapi.ValidateRequest) error {
 	v, err := clientOf[interface {
@@ -278,6 +299,17 @@ func (m *Manager) Validate(ctx context.Context, id int64, req nodeapi.ValidateRe
 		return err
 	}
 	return v.Validate(ctx, req)
+}
+
+// RequestUpdate asks a node to update to a release (nodeupdate has the rules).
+func (m *Manager) RequestUpdate(ctx context.Context, id int64, version string) error {
+	c, err := clientOf[interface {
+		RequestUpdate(context.Context, string) error
+	}](m, id)
+	if err != nil {
+		return err
+	}
+	return c.RequestUpdate(ctx, version)
 }
 
 // Activity reports which inbounds of a node each device reached lately.
@@ -311,6 +343,17 @@ func (m *Manager) ScanTargets(ctx context.Context, id int64, req nodeapi.TargetS
 		return nodeapi.TargetScan{}, err
 	}
 	return c.ScanTargets(ctx, req)
+}
+
+// SpeedTest runs a node's speed test of its own way to the internet.
+func (m *Manager) SpeedTest(ctx context.Context, id int64) (nodeapi.SpeedTest, error) {
+	c, err := clientOf[interface {
+		SpeedTest(context.Context) (nodeapi.SpeedTest, error)
+	}](m, id)
+	if err != nil {
+		return nodeapi.SpeedTest{}, err
+	}
+	return c.SpeedTest(ctx)
 }
 
 // clientOf returns a node's client as T: methods beyond Node are optional, and tests
@@ -356,6 +399,8 @@ func (m *Manager) maintain(ctx context.Context) {
 		m.log.Error("record devices", "err", err)
 	}
 	m.reconcile(ctx)
+	// One fresh snapshot for the round: it picks up what changed outside the API.
+	m.changes.Add(1)
 	for _, s := range m.Syncers() {
 		// Reconcile: picks up changes made outside the API (server CLI, restore) and pushes
 		// policies, whose key changes by time alone when a user crosses expires_at, and which
@@ -366,8 +411,7 @@ func (m *Manager) maintain(ctx context.Context) {
 }
 
 // How long traffic by the hour and the devices that went quiet are kept, and how often
-// the old rows are deleted: the tables are big, the delete scans them, and it holds the
-// database's one writer.
+// the old rows are deleted: the tables are big and the delete scans them.
 const (
 	hourlyKeep = 62 * 24 * time.Hour
 	deviceKeep = 30 * 24 * time.Hour
@@ -384,6 +428,10 @@ func (m *Manager) prune(ctx context.Context, now time.Time) {
 	}
 	if err := m.st.Q.PruneDevices(ctx, now.Add(-deviceKeep).Unix()); err != nil {
 		m.log.Error("prune devices", "err", err)
+		return
+	}
+	if err := m.st.Q.PruneTorrentHits(ctx, now.Add(-torrentKeep).Unix()); err != nil {
+		m.log.Error("prune torrent hits", "err", err)
 		return
 	}
 	m.lastPrune = now
@@ -414,11 +462,17 @@ func (m *Manager) resetPeriods(ctx context.Context, now time.Time) error {
 		default:
 			continue
 		}
-		err := m.st.Tx(ctx, func(q *db.Queries) error { return domain.StartPeriod(ctx, q, u.ID, start, now) })
+		// The row was read above, outside the transaction: the reset happens only while the
+		// period is still older than start, so one a payment began meanwhile stays.
+		var reset bool
+		err := m.st.TxRC(ctx, func(q *db.Queries) (err error) {
+			reset, err = domain.StartPeriodIfOlder(ctx, q, u.ID, start, now)
+			return err
+		})
 		if err != nil {
 			return err
 		}
-		changed = true
+		changed = changed || reset
 	}
 	if changed {
 		m.PoliciesChanged()
@@ -471,30 +525,55 @@ func (m *Manager) recordDevices(ctx context.Context, now time.Time) error {
 	if len(online) == 0 {
 		return nil
 	}
-	rows, err := m.st.Q.ListSlotUsers(ctx)
+	names := make([]string, 0, len(online))
+	for slot := range online {
+		names = append(names, slot)
+	}
+	rows, err := m.st.Q.SlotOwners(ctx, names)
 	if err != nil {
 		return err
 	}
-	owner := make(map[string]int64, len(rows))
-	for _, r := range rows {
-		owner[r.SlotName] = r.UserID
+	// A user's slots (the own one, bound devices) may report the same address.
+	type device struct {
+		user int64
+		ip   string
 	}
-	return m.st.Tx(ctx, func(q *db.Queries) error {
-		for slot, on := range online {
-			uid, ok := owner[slot]
-			if !ok {
-				continue
-			}
-			if err := q.SetUserOnline(ctx, db.SetUserOnlineParams{OnlineAt: sql.NullInt64{Int64: now.Unix(), Valid: true}, ID: uid}); err != nil {
-				return err
-			}
-			for _, ip := range on.IPs {
-				if err := q.UpsertDevice(ctx, db.UpsertDeviceParams{UserID: uid, Ip: ip, FirstSeen: now.Unix(), LastSeen: now.Unix()}); err != nil {
-					return err
-				}
-			}
+	seen := map[int64]bool{}
+	var users []int64
+	var devices []device
+	for _, r := range rows {
+		if !seen[r.UserID] {
+			seen[r.UserID] = true
+			users = append(users, r.UserID)
 		}
+		for _, ip := range online[r.SlotName].IPs {
+			devices = append(devices, device{r.UserID, ip})
+		}
+	}
+	if len(users) == 0 {
 		return nil
+	}
+	slices.Sort(users)
+	slices.SortFunc(devices, func(a, b device) int { return cmp.Or(cmp.Compare(a.user, b.user), strings.Compare(a.ip, b.ip)) })
+	devices = slices.Compact(devices)
+	dp := db.UpsertDevicesParams{Now: now.Unix()}
+	for _, d := range devices {
+		dp.UserIds, dp.Ips = append(dp.UserIds, d.user), append(dp.Ips, d.ip)
+	}
+	// Blind writes: READ COMMITTED. The users are locked in id order like the traffic
+	// batches lock them; a user deleted meanwhile is skipped, not an error for the rest.
+	return m.st.TxRC(ctx, func(q *db.Queries) error {
+		locked, err := q.LockUsers(ctx, users)
+		if err != nil || len(locked) == 0 {
+			return err
+		}
+		if err := q.SetUsersOnline(ctx, db.SetUsersOnlineParams{OnlineAt: sql.NullInt64{Int64: now.Unix(), Valid: true}, Ids: locked}); err != nil {
+			return err
+		}
+		if len(dp.UserIds) == 0 {
+			return nil
+		}
+		return q.UpsertDevices(ctx, dp)
 	})
 }
 

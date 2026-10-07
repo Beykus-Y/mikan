@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"mikan/internal/nodeapi"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store/db"
 )
@@ -24,6 +25,18 @@ const (
 	PortSub     = "sub"      // the subscription port, on the panel's node
 	PortNodeAPI = "node_api" // the node API the panel connects to, on a remote node
 )
+
+// HostLookup says what listens on a node's server now, as the node reported it; nil for a
+// node that has not (a node before 0.5.0.2, one that does not answer).
+type HostLookup func(node int64) *nodeapi.HostPorts
+
+// of is l's answer for node; a nil l knows nothing.
+func (l HostLookup) of(node int64) *nodeapi.HostPorts {
+	if l == nil {
+		return nil
+	}
+	return l(node)
+}
 
 // sshPort is never picked automatically: a relay or a moved inbound there would take
 // the admin's way in. An admin may still choose it.
@@ -67,7 +80,10 @@ type portUse struct {
 
 // PortMap is every port taken on one node's server, over TCP and UDP. A Hysteria2
 // hopping range takes every port in it.
-type PortMap struct{ uses []portUse }
+type PortMap struct {
+	uses []portUse
+	host *nodeapi.HostPorts // what listens on the server, see WithHost
+}
 
 // NodePorts maps the ports of node: its inbounds, its cascade relay, and the panel's
 // port and the subscription port on the panel's own node or the node API's port on a
@@ -105,6 +121,15 @@ func NodePorts(ctx context.Context, q *db.Queries, node db.Node) (PortMap, error
 	return m, nil
 }
 
+// WithHost adds what the node's server reports as listening, mikan's own listeners among
+// it. Only Free looks at it: a port another program holds is not one to pick, but
+// Busy, which refuses the admin's choice, names holders by what mikan knows of them, so
+// an inbound keeps its own port while it is listening on it.
+func (m PortMap) WithHost(h *nodeapi.HostPorts) PortMap {
+	m.host = h
+	return m
+}
+
 func (m *PortMap) add(h PortHolder, spec, network string, off bool) {
 	if lo, hi, ok := parsePort(spec); ok {
 		m.uses = append(m.uses, portUse{holder: h, lo: lo, hi: hi, network: network, off: off})
@@ -127,9 +152,10 @@ func (m PortMap) Busy(spec, network string, self PortHolder) (PortHolder, bool) 
 }
 
 // Free says whether an automatic pick may take port over network: nothing holds it, not
-// even a disabled inbound that may come back on, and it is not SSH's.
+// even a disabled inbound that may come back on, no other program listens on it (as far
+// as the node said), and it is not SSH's.
 func (m PortMap) Free(port int, network string) bool {
-	if port == sshPort {
+	if port == sshPort || m.host.Listens(network, port) {
 		return false
 	}
 	for _, u := range m.uses {

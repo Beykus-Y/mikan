@@ -11,7 +11,7 @@ import (
 )
 
 const archiveTrafficPackage = `-- name: ArchiveTrafficPackage :execrows
-UPDATE traffic_packages SET archived = 1, on_sale = 0 WHERE id = ? AND archived = 0
+UPDATE traffic_packages SET archived = 1, on_sale = 0 WHERE id = $1 AND archived = 0
 `
 
 func (q *Queries) ArchiveTrafficPackage(ctx context.Context, id int64) (int64, error) {
@@ -24,8 +24,8 @@ func (q *Queries) ArchiveTrafficPackage(ctx context.Context, id int64) (int64, e
 
 const createPackagePayment = `-- name: CreatePackagePayment :one
 INSERT INTO payments (provider, payload, tg_id, kind, user_id, package_id, tariff_name, amount, currency, status, created_at)
-VALUES (?, ?, ?, 'package', ?, ?, ?, ?, ?, 'pending', ?)
-RETURNING id, provider, payload, external_id, tg_id, kind, user_id, tariff_id, package_id, tariff_name, amount, currency, status, error, pay_url, created_at, paid_at, applied_at, refunded_at
+VALUES ($1, $2, $3, 'package', $4, $5, $6, $7, $8, 'pending', $9)
+RETURNING id, provider, payload, external_id, tg_id, kind, user_id, tariff_id, package_id, tariff_name, amount, currency, status, error, pay_url, created_at, paid_at, applied_at, refunded_at, term_days, revert
 `
 
 type CreatePackagePaymentParams struct {
@@ -73,13 +73,15 @@ func (q *Queries) CreatePackagePayment(ctx context.Context, arg CreatePackagePay
 		&i.PaidAt,
 		&i.AppliedAt,
 		&i.RefundedAt,
+		&i.TermDays,
+		&i.Revert,
 	)
 	return i, err
 }
 
 const createTrafficGrant = `-- name: CreateTrafficGrant :one
 INSERT INTO traffic_grants (user_id, pool_id, bytes, remaining, lifetime, expires_at, source, payment_id, package_id, note, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 RETURNING id, user_id, pool_id, bytes, remaining, lifetime, expires_at, source, payment_id, package_id, note, created_at
 `
 
@@ -131,7 +133,7 @@ func (q *Queries) CreateTrafficGrant(ctx context.Context, arg CreateTrafficGrant
 
 const createTrafficPackage = `-- name: CreateTrafficPackage :one
 INSERT INTO traffic_packages (name, bytes, pool_id, lifetime, days, price_stars, price_rub, on_sale, sort, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id, name, bytes, pool_id, lifetime, days, price_stars, price_rub, on_sale, sort, archived, created_at
 `
 
@@ -179,10 +181,22 @@ func (q *Queries) CreateTrafficPackage(ctx context.Context, arg CreateTrafficPac
 	return i, err
 }
 
+const deleteGrantByPayment = `-- name: DeleteGrantByPayment :execrows
+DELETE FROM traffic_grants WHERE payment_id = $1
+`
+
+func (q *Queries) DeleteGrantByPayment(ctx context.Context, paymentID sql.NullInt64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteGrantByPayment, paymentID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const endPeriodGrants = `-- name: EndPeriodGrants :exec
-UPDATE traffic_grants SET expires_at = CAST(?1 AS INTEGER)
-WHERE user_id = ?2 AND lifetime = 'period' AND remaining > 0
-  AND (expires_at IS NULL OR expires_at > CAST(?1 AS INTEGER))
+UPDATE traffic_grants SET expires_at = CAST($1 AS BIGINT)
+WHERE user_id = $2 AND lifetime = 'period' AND remaining > 0
+  AND (expires_at IS NULL OR expires_at > CAST($1 AS BIGINT))
 `
 
 type EndPeriodGrantsParams struct {
@@ -197,9 +211,9 @@ func (q *Queries) EndPeriodGrants(ctx context.Context, arg EndPeriodGrantsParams
 }
 
 const findOpenPackagePayment = `-- name: FindOpenPackagePayment :one
-SELECT id, provider, payload, external_id, tg_id, kind, user_id, tariff_id, package_id, tariff_name, amount, currency, status, error, pay_url, created_at, paid_at, applied_at, refunded_at FROM payments
-WHERE tg_id = ? AND package_id = ? AND provider = ? AND kind = 'package' AND user_id = ?
-  AND status = 'pending' AND pay_url <> '' AND created_at > ?5
+SELECT id, provider, payload, external_id, tg_id, kind, user_id, tariff_id, package_id, tariff_name, amount, currency, status, error, pay_url, created_at, paid_at, applied_at, refunded_at, term_days, revert FROM payments
+WHERE tg_id = $1 AND package_id = $2 AND provider = $3 AND kind = 'package' AND user_id = $4
+  AND status = 'pending' AND pay_url <> '' AND created_at > $5
 ORDER BY id DESC LIMIT 1
 `
 
@@ -240,12 +254,80 @@ func (q *Queries) FindOpenPackagePayment(ctx context.Context, arg FindOpenPackag
 		&i.PaidAt,
 		&i.AppliedAt,
 		&i.RefundedAt,
+		&i.TermDays,
+		&i.Revert,
 	)
 	return i, err
 }
 
+const findOpenPackagePayments = `-- name: FindOpenPackagePayments :many
+SELECT id, provider, payload, external_id, tg_id, kind, user_id, tariff_id, package_id, tariff_name, amount, currency, status, error, pay_url, created_at, paid_at, applied_at, refunded_at, term_days, revert FROM payments
+WHERE tg_id = $1 AND package_id = $2 AND provider = $3 AND kind = 'package' AND user_id = $4
+  AND status = 'pending' AND pay_url <> '' AND created_at > $5
+ORDER BY id DESC
+`
+
+type FindOpenPackagePaymentsParams struct {
+	TgID      int64
+	PackageID sql.NullInt64
+	Provider  string
+	UserID    sql.NullInt64
+	Since     int64
+}
+
+func (q *Queries) FindOpenPackagePayments(ctx context.Context, arg FindOpenPackagePaymentsParams) ([]Payment, error) {
+	rows, err := q.db.QueryContext(ctx, findOpenPackagePayments,
+		arg.TgID,
+		arg.PackageID,
+		arg.Provider,
+		arg.UserID,
+		arg.Since,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Payment{}
+	for rows.Next() {
+		var i Payment
+		if err := rows.Scan(
+			&i.ID,
+			&i.Provider,
+			&i.Payload,
+			&i.ExternalID,
+			&i.TgID,
+			&i.Kind,
+			&i.UserID,
+			&i.TariffID,
+			&i.PackageID,
+			&i.TariffName,
+			&i.Amount,
+			&i.Currency,
+			&i.Status,
+			&i.Error,
+			&i.PayUrl,
+			&i.CreatedAt,
+			&i.PaidAt,
+			&i.AppliedAt,
+			&i.RefundedAt,
+			&i.TermDays,
+			&i.Revert,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getTrafficPackage = `-- name: GetTrafficPackage :one
-SELECT id, name, bytes, pool_id, lifetime, days, price_stars, price_rub, on_sale, sort, archived, created_at FROM traffic_packages WHERE id = ?
+SELECT id, name, bytes, pool_id, lifetime, days, price_stars, price_rub, on_sale, sort, archived, created_at FROM traffic_packages WHERE id = $1
 `
 
 func (q *Queries) GetTrafficPackage(ctx context.Context, id int64) (TrafficPackage, error) {
@@ -269,7 +351,7 @@ func (q *Queries) GetTrafficPackage(ctx context.Context, id int64) (TrafficPacka
 }
 
 const getUserPool = `-- name: GetUserPool :one
-SELECT user_id, pool_id, traffic_limit, used_up, used_down FROM user_pools WHERE user_id = ? AND pool_id = ?
+SELECT user_id, pool_id, traffic_limit, used_up, used_down, excluded FROM user_pools WHERE user_id = $1 AND pool_id = $2
 `
 
 type GetUserPoolParams struct {
@@ -286,6 +368,7 @@ func (q *Queries) GetUserPool(ctx context.Context, arg GetUserPoolParams) (UserP
 		&i.TrafficLimit,
 		&i.UsedUp,
 		&i.UsedDown,
+		&i.Excluded,
 	)
 	return i, err
 }
@@ -316,57 +399,6 @@ func (q *Queries) ListAllTrafficPackages(ctx context.Context) ([]TrafficPackage,
 			&i.OnSale,
 			&i.Sort,
 			&i.Archived,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSpendableGrants = `-- name: ListSpendableGrants :many
-SELECT id, user_id, pool_id, bytes, remaining, lifetime, expires_at, source, payment_id, package_id, note, created_at FROM traffic_grants
-WHERE user_id = ?1 AND pool_id IS ?2 AND remaining > 0
-  AND (expires_at IS NULL OR expires_at > CAST(?3 AS INTEGER))
-ORDER BY expires_at IS NULL, expires_at, created_at, id
-`
-
-type ListSpendableGrantsParams struct {
-	UserID int64
-	PoolID sql.NullInt64
-	Now    int64
-}
-
-// The order traffic past the base quota is taken in: the soonest to expire first, then
-// the oldest. Expired and used-up grants are left out.
-func (q *Queries) ListSpendableGrants(ctx context.Context, arg ListSpendableGrantsParams) ([]TrafficGrant, error) {
-	rows, err := q.db.QueryContext(ctx, listSpendableGrants, arg.UserID, arg.PoolID, arg.Now)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []TrafficGrant{}
-	for rows.Next() {
-		var i TrafficGrant
-		if err := rows.Scan(
-			&i.ID,
-			&i.UserID,
-			&i.PoolID,
-			&i.Bytes,
-			&i.Remaining,
-			&i.Lifetime,
-			&i.ExpiresAt,
-			&i.Source,
-			&i.PaymentID,
-			&i.PackageID,
-			&i.Note,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -463,7 +495,7 @@ func (q *Queries) ListTrafficPackagesOnSale(ctx context.Context) ([]TrafficPacka
 }
 
 const listUserGrants = `-- name: ListUserGrants :many
-SELECT id, user_id, pool_id, bytes, remaining, lifetime, expires_at, source, payment_id, package_id, note, created_at FROM traffic_grants WHERE user_id = ? ORDER BY created_at DESC, id DESC
+SELECT id, user_id, pool_id, bytes, remaining, lifetime, expires_at, source, payment_id, package_id, note, created_at FROM traffic_grants WHERE user_id = $1 ORDER BY created_at DESC, id DESC
 `
 
 func (q *Queries) ListUserGrants(ctx context.Context, userID int64) ([]TrafficGrant, error) {
@@ -502,25 +534,11 @@ func (q *Queries) ListUserGrants(ctx context.Context, userID int64) ([]TrafficGr
 	return items, nil
 }
 
-const spendGrant = `-- name: SpendGrant :exec
-UPDATE traffic_grants SET remaining = remaining - ?1 WHERE id = ?2
-`
-
-type SpendGrantParams struct {
-	Spent int64
-	ID    int64
-}
-
-func (q *Queries) SpendGrant(ctx context.Context, arg SpendGrantParams) error {
-	_, err := q.db.ExecContext(ctx, spendGrant, arg.Spent, arg.ID)
-	return err
-}
-
 const sumGrantsLeft = `-- name: SumGrantsLeft :many
-SELECT user_id, CAST(IFNULL(pool_id, 0) AS INTEGER) AS pool_id, CAST(SUM(remaining) AS INTEGER) AS left_bytes
+SELECT user_id, CAST(COALESCE(pool_id, 0) AS BIGINT) AS pool_id, CAST(SUM(remaining) AS BIGINT) AS left_bytes
 FROM traffic_grants
-WHERE remaining > 0 AND (expires_at IS NULL OR expires_at > CAST(?1 AS INTEGER))
-GROUP BY user_id, IFNULL(pool_id, 0)
+WHERE remaining > 0 AND (expires_at IS NULL OR expires_at > CAST($1 AS BIGINT))
+GROUP BY user_id, COALESCE(pool_id, 0)
 `
 
 type SumGrantsLeftRow struct {
@@ -554,10 +572,10 @@ func (q *Queries) SumGrantsLeft(ctx context.Context, now int64) ([]SumGrantsLeft
 }
 
 const sumUserGrantsLeft = `-- name: SumUserGrantsLeft :many
-SELECT user_id, CAST(IFNULL(pool_id, 0) AS INTEGER) AS pool_id, CAST(SUM(remaining) AS INTEGER) AS left_bytes
+SELECT user_id, CAST(COALESCE(pool_id, 0) AS BIGINT) AS pool_id, CAST(SUM(remaining) AS BIGINT) AS left_bytes
 FROM traffic_grants
-WHERE user_id = ?1 AND remaining > 0 AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
-GROUP BY user_id, IFNULL(pool_id, 0)
+WHERE user_id = $1 AND remaining > 0 AND (expires_at IS NULL OR expires_at > CAST($2 AS BIGINT))
+GROUP BY user_id, COALESCE(pool_id, 0)
 `
 
 type SumUserGrantsLeftParams struct {
@@ -596,8 +614,8 @@ func (q *Queries) SumUserGrantsLeft(ctx context.Context, arg SumUserGrantsLeftPa
 
 const updateTrafficPackage = `-- name: UpdateTrafficPackage :one
 UPDATE traffic_packages
-SET name = ?, bytes = ?, pool_id = ?, lifetime = ?, days = ?, price_stars = ?, price_rub = ?, on_sale = ?, sort = ?
-WHERE id = ? AND archived = 0
+SET name = $1, bytes = $2, pool_id = $3, lifetime = $4, days = $5, price_stars = $6, price_rub = $7, on_sale = $8, sort = $9
+WHERE id = $10 AND archived = 0
 RETURNING id, name, bytes, pool_id, lifetime, days, price_stars, price_rub, on_sale, sort, archived, created_at
 `
 

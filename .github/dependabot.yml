@@ -1,10 +1,13 @@
-# The workflows pin every action to a commit; a pin does not move on its own, so
-# dependabot proposes the new commit (and the version comment beside it) weekly. The
-# installer's crates are the other dependency a security fix reaches only by a release.
+# The workflows pin every action to a commit and the Dockerfile every base image to a
+# digest; a pin does not move on its own, so dependabot proposes the new commit or digest
+# (and the version beside it) weekly. The installer's crates, the panel's Go modules and
+# the admin's npm packages are the other dependencies a security fix reaches only by a
+# release. Minor and patch updates come grouped, a major one in its own pull request.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -13,6 +16,33 @@ updates:
         patterns: ["*"]
   - package-ecosystem: cargo
     directory: /installer
+    target-branch: dev
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  - package-ecosystem: gomod
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: docker
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /web
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      web:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

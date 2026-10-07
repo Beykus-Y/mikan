@@ -3,6 +3,7 @@ package tgbot
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"html"
 	"log/slog"
 	"net"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,6 +22,7 @@ import (
 
 	"mikan/internal/panel/billing"
 	"mikan/internal/panel/domain"
+	"mikan/internal/panel/panelimport"
 	"mikan/internal/panel/settings"
 	"mikan/internal/panel/store"
 	"mikan/internal/panel/store/db"
@@ -27,12 +30,14 @@ import (
 
 // Settings keys of the bot.
 const (
-	KeyEnabled = "tg_enabled"
-	KeyToken   = "tg_token" // never leaves the panel's API
-	KeyBot     = "tg_bot"   // the token's bot, from getMe
-	KeyConfig  = "tg_config"
-	KeySecret  = "tg_secret" // signs the link codes
-	KeyOffset  = "tg_offset" // the last update taken, so a restart does not hand them out again
+	KeyEnabled        = "tg_enabled"
+	KeyToken          = "tg_token" // never leaves the panel's API
+	KeyBot            = "tg_bot"   // the token's bot, from getMe
+	KeyConfig         = "tg_config"
+	KeySecret         = "tg_secret" // signs the link codes
+	KeyOffset         = "tg_offset" // the last update taken, so a restart does not hand them out again
+	KeyInfraAdminChat = "infrastructure_admin_chat"
+	keyInfraAdminLink = "infrastructure_admin_link"
 )
 
 // Enabled switches the bot on; off until the admin connects it.
@@ -222,6 +227,98 @@ func (b *Bot) LinkURL(ctx context.Context, userID int64) string {
 	return "https://t.me/" + st.Bot.Username + "?start=" + LinkCode(secret, userID, b.d.Now())
 }
 
+// BeginInfrastructureAdminConnect makes a short lived deep link that binds one private
+// Telegram chat to infrastructure alerts. The bot must be running so it can consume the
+// one-time /start code.
+func (b *Bot) BeginInfrastructureAdminConnect(ctx context.Context) (string, error) {
+	st := b.Status()
+	if !st.Running || st.Bot.Username == "" {
+		return "", ErrOff
+	}
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	code := base64.RawURLEncoding.EncodeToString(raw)
+	pending, _ := json.Marshal(struct {
+		Code  string `json:"code"`
+		Until int64  `json:"until"`
+	}{code, b.d.Now().Add(10 * time.Minute).Unix()})
+	if err := settings.Set(ctx, b.d.Settings, keyInfraAdminLink, string(pending)); err != nil {
+		return "", err
+	}
+	return "https://t.me/" + st.Bot.Username + "?start=infra_" + code, nil
+}
+
+// InfrastructureAdminChat returns the one chat connected to receive private alerts.
+func (b *Bot) InfrastructureAdminChat(ctx context.Context) (int64, bool, error) {
+	id, ok, err := settings.Get[int64](ctx, b.d.Settings, KeyInfraAdminChat)
+	return id, ok && id > 0, err
+}
+
+func (b *Bot) DisconnectInfrastructureAdmin(ctx context.Context) error {
+	return b.d.Store.TxRC(ctx, func(q *db.Queries) error {
+		set := settings.New(q)
+		if err := settings.Set(ctx, set, KeyInfraAdminChat, int64(0)); err != nil {
+			return err
+		}
+		return settings.Set(ctx, set, keyInfraAdminLink, "")
+	})
+}
+
+// InfrastructureClient builds a sending client with the same bot token and route used by
+// the subscriber bot. Sending alerts does not require the subscriber bot's polling loop.
+func (b *Bot) InfrastructureClient(ctx context.Context) (*Client, error) {
+	token, err := b.d.Settings.String(ctx, KeyToken)
+	if err != nil || token == "" {
+		return nil, ErrOff
+	}
+	rt, err := b.transport(b.Route(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return NewClient(b.d.API, token, rt), nil
+}
+
+// InfrastructureEnabled reports whether Telegram delivery is enabled and has a token.
+func (b *Bot) InfrastructureEnabled(ctx context.Context) bool {
+	enabled, err := b.d.Settings.On(ctx, settings.Switch{Key: KeyEnabled})
+	if err != nil || !enabled {
+		return false
+	}
+	token, err := b.d.Settings.String(ctx, KeyToken)
+	return err == nil && token != ""
+}
+
+func (b *Bot) claimInfrastructureAdmin(ctx context.Context, chat int64, code string) bool {
+	claimed := false
+	err := b.d.Store.Tx(ctx, func(q *db.Queries) error {
+		// A conflict runs this again: an attempt that rolled back claimed nothing.
+		claimed = false
+		set := settings.New(q)
+		var pending struct {
+			Code  string `json:"code"`
+			Until int64  `json:"until"`
+		}
+		raw, ok, err := settings.Get[string](ctx, set, keyInfraAdminLink)
+		if err != nil {
+			return err
+		}
+		if !ok || json.Unmarshal([]byte(raw), &pending) != nil || pending.Until < b.d.Now().Unix() || len(code) != len(pending.Code) || subtle.ConstantTimeCompare([]byte(code), []byte(pending.Code)) != 1 {
+			return nil
+		}
+		if err := settings.Set(ctx, set, KeyInfraAdminChat, chat); err != nil {
+			return err
+		}
+		if err := settings.Set(ctx, set, keyInfraAdminLink, ""); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	return err == nil && claimed
+}
+
 func (b *Bot) poll(ctx context.Context, c *Client) {
 	me, err := c.Me(ctx)
 	if err != nil {
@@ -398,6 +495,8 @@ func (b *Bot) handle(ctx context.Context, c *Client, up Update) error {
 		b.running.Go(func() { b.preCheckout(ctx, c, up.PreCheckoutQuery) })
 	case up.Message != nil && up.Message.SuccessfulPayment != nil && up.Message.Chat.Type == "private":
 		return b.starsPaid(ctx, up.Message)
+	case up.Message != nil && up.Message.RefundedPayment != nil && up.Message.Chat.Type == "private":
+		return b.starsRefunded(ctx, up.Message)
 	case up.CallbackQuery != nil && up.CallbackQuery.Message != nil && up.CallbackQuery.Message.Chat.Type == "private":
 		if cmd, _, _ := strings.Cut(up.CallbackQuery.Data, ":"); cmd == "ta" || cmd == "tx" {
 			b.onTransfer(ctx, c, out, up.CallbackQuery)
@@ -410,13 +509,37 @@ func (b *Bot) handle(ctx context.Context, c *Client, up Update) error {
 	return nil
 }
 
-var subLink = regexp.MustCompile(`https?://\S+/([A-Za-z0-9]{24})(?:[/?#]\S*)?`)
+var (
+	linkInText  = regexp.MustCompile(`https?://\S+`)
+	nativeToken = regexp.MustCompile(`^[A-Za-z0-9]{24}$`)
+)
+
+// maxLinksRead: how many addresses of one message are looked at, so that a long list is
+// not a hundred database lookups.
+const maxLinksRead = 3
 
 // onMessage: /start (with a code from a subscription page), a subscription link, or
 // anything else — every message brings the main menu back to the bottom of the chat.
 func (b *Bot) onMessage(ctx context.Context, out *Outbox, m *Message) {
 	chat, now := m.Chat.ID, b.d.Now().Unix()
 	if b.flooding(chat) {
+		return
+	}
+	messageText := strings.TrimSpace(m.Text)
+	if strings.HasPrefix(messageText, "/start infra_") {
+		code := strings.TrimSpace(strings.TrimPrefix(messageText, "/start infra_"))
+		text := "Не удалось подключить чат администратора. Создайте новую ссылку в панели."
+		claimed := b.claimInfrastructureAdmin(ctx, chat, code)
+		if claimed {
+			text = "✅ Чат подключён. Сюда будут приходить личные уведомления о состоянии инфраструктуры."
+		}
+		if b.Config(ctx).Lang == "en" {
+			text = "Could not connect the admin chat. Create a new link in the panel."
+			if claimed {
+				text = "✅ Admin chat connected. Infrastructure alerts will be sent here."
+			}
+		}
+		out.Reply(chat, "infrastructure-admin", 1, func(ctx context.Context, c *Client) error { _, err := c.Send(ctx, chat, text, nil, false); return err })
 		return
 	}
 	_ = b.d.Store.Q.UpsertTgChat(ctx, db.UpsertTgChatParams{TgID: chat, Username: m.From.Username, FirstName: m.From.FirstName, CreatedAt: now, UpdatedAt: now})
@@ -431,10 +554,15 @@ func (b *Bot) onMessage(ctx context.Context, out *Outbox, m *Message) {
 	switch {
 	case strings.HasPrefix(text, "/start "):
 		notice = b.linkByCode(ctx, out, w, chat, who(m.From), strings.TrimSpace(strings.TrimPrefix(text, "/start ")))
-	case subLink.MatchString(text):
-		notice = b.linkByToken(ctx, out, w, chat, who(m.From), subLink.FindStringSubmatch(text)[1])
+	default:
+		notice = b.linkByAddress(ctx, out, w, chat, who(m.From), text)
 	}
 	b.freshMenu(out, chat, notice)
+}
+
+func (b *Bot) InfrastructureAdminChatIs(ctx context.Context, chat int64) bool {
+	id, ok, err := b.InfrastructureAdminChat(ctx)
+	return err == nil && ok && id == chat
 }
 
 // freshMenu sends the main menu as a new message and removes the previous one, so the
@@ -505,12 +633,57 @@ func (b *Bot) linkByCode(ctx context.Context, out *Outbox, w *words, chat int64,
 	return b.link(ctx, out, w, chat, name, id)
 }
 
-func (b *Bot) linkByToken(ctx context.Context, out *Outbox, w *words, chat int64, name, token string) string {
-	u, err := b.d.Store.Q.GetUserBySubToken(ctx, token)
-	if err != nil {
+// linkByAddress takes the subscription address in a message: the panel's own, or one of
+// the panel the users came from. "" when the message has no address with a path at all;
+// an address that leads to no subscription is told so.
+func (b *Bot) linkByAddress(ctx context.Context, out *Outbox, w *words, chat int64, name, text string) string {
+	var seen bool
+	for _, raw := range linkInText.FindAllString(text, maxLinksRead) {
+		u, err := url.Parse(strings.TrimRight(raw, ".,;:!?)]}>\"'»"))
+		if err != nil || u.Host == "" {
+			continue
+		}
+		if u.Path != "" && u.Path != "/" {
+			seen = true
+		}
+		if id, ok := b.userOfAddress(ctx, u.Path); ok {
+			return b.link(ctx, out, w, chat, name, id)
+		}
+	}
+	if seen {
 		return w.linkInvalid
 	}
-	return b.link(ctx, out, w, chat, name, u.ID)
+	return ""
+}
+
+// userOfAddress finds whose subscription an address path leads to. The own token is a
+// path segment of 24 letters and digits. An old panel's address is taken as the panel
+// serves it (panelimport.LinkToken), and only while old links are set up; the signature
+// of a token Marzban or PasarGuard signed is checked as there (Verifier.User).
+func (b *Bot) userOfAddress(ctx context.Context, urlPath string) (int64, bool) {
+	for seg := range strings.SplitSeq(urlPath, "/") {
+		if !nativeToken.MatchString(seg) {
+			continue
+		}
+		if u, err := b.d.Store.Q.GetUserBySubToken(ctx, seg); err == nil {
+			return u.ID, true
+		}
+	}
+	if b.d.Settings == nil {
+		return 0, false
+	}
+	legacyPath, verifier, err := panelimport.LoadLegacy(ctx, b.d.Settings)
+	if err != nil {
+		return 0, false
+	}
+	token, _, ok := panelimport.LinkToken(urlPath, legacyPath)
+	if !ok {
+		return 0, false
+	}
+	if u, ok := verifier.User(ctx, b.d.Store.Q, token); ok {
+		return u.ID, true
+	}
+	return 0, false
 }
 
 // link ties a subscription to the chat's account. A subscription has one owner. The link

@@ -10,7 +10,7 @@ import (
 )
 
 const deleteNodeWarp = `-- name: DeleteNodeWarp :execrows
-DELETE FROM node_warp WHERE node_id = ?
+DELETE FROM node_warp WHERE node_id = $1
 `
 
 func (q *Queries) DeleteNodeWarp(ctx context.Context, nodeID int64) (int64, error) {
@@ -22,7 +22,7 @@ func (q *Queries) DeleteNodeWarp(ctx context.Context, nodeID int64) (int64, erro
 }
 
 const getNodeWarp = `-- name: GetNodeWarp :one
-SELECT node_id, enabled, source, private_key, peer_public_key, endpoint, ipv4, ipv6, reserved, mtu, account_id, account_token, plus, routes, created_at, updated_at FROM node_warp WHERE node_id = ?
+SELECT node_id, enabled, source, private_key, peer_public_key, endpoint, ipv4, ipv6, reserved, mtu, account_id, account_token, plus, routes, created_at, updated_at FROM node_warp WHERE node_id = $1
 `
 
 func (q *Queries) GetNodeWarp(ctx context.Context, nodeID int64) (NodeWarp, error) {
@@ -52,7 +52,7 @@ func (q *Queries) GetNodeWarp(ctx context.Context, nodeID int64) (NodeWarp, erro
 const saveNodeWarp = `-- name: SaveNodeWarp :exec
 INSERT INTO node_warp (node_id, enabled, source, private_key, peer_public_key, endpoint, ipv4, ipv6, reserved, mtu,
   account_id, account_token, plus, routes, created_at, updated_at)
-VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (node_id) DO UPDATE SET enabled = 1, source = excluded.source, private_key = excluded.private_key,
   peer_public_key = excluded.peer_public_key, endpoint = excluded.endpoint, ipv4 = excluded.ipv4, ipv6 = excluded.ipv6,
   reserved = excluded.reserved, mtu = excluded.mtu, account_id = excluded.account_id, account_token = excluded.account_token,
@@ -99,7 +99,7 @@ func (q *Queries) SaveNodeWarp(ctx context.Context, arg SaveNodeWarpParams) erro
 }
 
 const setInboundOutbound = `-- name: SetInboundOutbound :exec
-UPDATE inbounds SET outbound = ? WHERE id = ?
+UPDATE inbounds SET outbound = $1 WHERE id = $2
 `
 
 type SetInboundOutboundParams struct {
@@ -113,7 +113,7 @@ func (q *Queries) SetInboundOutbound(ctx context.Context, arg SetInboundOutbound
 }
 
 const setNodeWarpOptions = `-- name: SetNodeWarpOptions :exec
-UPDATE node_warp SET enabled = ?, routes = ?, updated_at = ? WHERE node_id = ?
+UPDATE node_warp SET enabled = $1, routes = $2, updated_at = $3 WHERE node_id = $4
 `
 
 type SetNodeWarpOptionsParams struct {
@@ -134,7 +134,7 @@ func (q *Queries) SetNodeWarpOptions(ctx context.Context, arg SetNodeWarpOptions
 }
 
 const setNodeWarpPlus = `-- name: SetNodeWarpPlus :exec
-UPDATE node_warp SET plus = ?, updated_at = ? WHERE node_id = ?
+UPDATE node_warp SET plus = $1, updated_at = $2 WHERE node_id = $3
 `
 
 type SetNodeWarpPlusParams struct {

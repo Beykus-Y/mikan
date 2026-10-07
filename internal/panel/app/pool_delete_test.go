@@ -89,7 +89,7 @@ func TestDeletePoolKeepsPaidTraffic(t *testing.T) {
 	// A paid invoice that is not applied yet is still money the customer is owed.
 	setStatus := func(status string) {
 		t.Helper()
-		if _, err := h.st.DB.ExecContext(ctx, "UPDATE payments SET status = ? WHERE id = ?", status, pay.ID); err != nil {
+		if _, err := h.st.DB.ExecContext(ctx, "UPDATE payments SET status = $1 WHERE id = $2", status, pay.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -98,7 +98,7 @@ func TestDeletePoolKeepsPaidTraffic(t *testing.T) {
 	setStatus("applied")
 	refused("invoice applied", "pool_has_grants")
 	// An expired grant is worth nothing and does not hold the pool; a used-up one neither.
-	if _, err := h.st.DB.ExecContext(ctx, "UPDATE traffic_grants SET remaining = 0 WHERE user_id = ?", u.ID); err != nil {
+	if _, err := h.st.DB.ExecContext(ctx, "UPDATE traffic_grants SET remaining = 0 WHERE user_id = $1", u.ID); err != nil {
 		t.Fatal(err)
 	}
 	if resp, body := remove(); resp.StatusCode != http.StatusNoContent {

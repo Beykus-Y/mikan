@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"mikan/internal/panel/store/db"
 )
 
 // A bulk action is one transaction: when it fails on a user, the users before it are as
@@ -30,7 +32,7 @@ func TestBulkIsAllOrNothing(t *testing.T) {
 	pushes := ch.policies
 
 	// The third user cannot be written: the first two must not stay extended.
-	if _, err := st.DB.ExecContext(ctx, "CREATE TRIGGER no_third BEFORE UPDATE ON users WHEN NEW.id = "+strconv.FormatInt(ids[2], 10)+" BEGIN SELECT RAISE(ABORT, 'refused'); END"); err != nil {
+	if _, err := st.DB.ExecContext(ctx, "ALTER TABLE users ADD CONSTRAINT no_third CHECK(id <> "+strconv.FormatInt(ids[2], 10)+" OR expires_at = "+strconv.FormatInt(before[2], 10)+")"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := users.Bulk(ctx, ids, BulkExtend, 10); err == nil {
@@ -44,7 +46,7 @@ func TestBulkIsAllOrNothing(t *testing.T) {
 	if ch.policies != pushes {
 		t.Fatal("nodes were told about a change that did not happen")
 	}
-	if _, err := st.DB.ExecContext(ctx, "DROP TRIGGER no_third"); err != nil {
+	if _, err := st.DB.ExecContext(ctx, "ALTER TABLE users DROP CONSTRAINT no_third"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,5 +69,91 @@ func TestBulkIsAllOrNothing(t *testing.T) {
 	}
 	if _, err := users.Bulk(ctx, ids, "explode", 0); err == nil {
 		t.Fatal("an unknown action was accepted")
+	}
+}
+
+// Each bulk action does to every listed user what the single change does.
+func TestBulkActions(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	st, users, ch := setup(t, &now)
+	ctx := context.Background()
+	clock := func() time.Time { return now }
+	devs := NewDevices(st, NewPool(st, clock), ch, clock)
+	tariffs, _ := st.Q.ListTariffs(ctx)
+	var ids []int64
+	for _, name := range []string{"a", "b"} {
+		u, err := users.Create(ctx, CreateInput{Name: name, TariffID: tariffs[1].ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, u.ID)
+	}
+	get := func(id int64) db.User {
+		u, err := st.Q.GetUser(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	if n, err := users.Bulk(ctx, ids, BulkDisable, 0); err != nil || n != 2 || get(ids[0]).Status != "disabled" || get(ids[1]).Status != "disabled" {
+		t.Fatalf("disable: %d %v", n, err)
+	}
+	if n, err := users.Bulk(ctx, ids, BulkEnable, 0); err != nil || n != 2 || get(ids[0]).Status != "active" {
+		t.Fatalf("enable: %d %v", n, err)
+	}
+
+	// Extend without days: one paid period from each user's own expiry; it turns them on.
+	off := true
+	if _, err := users.Update(ctx, ids[1], Patch{ClearExpiry: true, Disabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	exp0 := get(ids[0]).ExpiresAt.Int64
+	if n, err := users.Bulk(ctx, ids, BulkExtend, 0); err != nil || n != 2 {
+		t.Fatalf("extend: %d %v", n, err)
+	}
+	if got := get(ids[0]).ExpiresAt.Int64; got != exp0+30*86400 {
+		t.Fatalf("extended from the expiry: %d, want %d", got, exp0+30*86400)
+	}
+	if u := get(ids[1]); u.ExpiresAt.Int64 != now.Unix()+30*86400 || u.Status != "active" {
+		t.Fatalf("extended from now and turned on: %d %s", u.ExpiresAt.Int64, u.Status)
+	}
+
+	// Reset: a new period now, the period's grants end, the others stay.
+	if _, err := st.DB.ExecContext(ctx, "UPDATE users SET used_up = 5, used_down = 7"); err != nil {
+		t.Fatal(err)
+	}
+	u0 := get(ids[0])
+	once, _ := GrantTx(ctx, st.Q, u0, GrantSpec{Bytes: 50, Lifetime: LifetimePeriod, Source: SourceAdmin}, now)
+	keep, _ := GrantTx(ctx, st.Q, u0, GrantSpec{Bytes: 50, Lifetime: LifetimeUsed, Source: SourceAdmin}, now)
+	now = now.Add(time.Hour)
+	if n, err := users.Bulk(ctx, ids, BulkReset, 0); err != nil || n != 2 {
+		t.Fatalf("reset: %d %v", n, err)
+	}
+	for _, id := range ids {
+		if u := get(id); u.UsedUp+u.UsedDown != 0 || u.PeriodStart != now.Unix() {
+			t.Fatalf("user %d after the reset: used %d/%d, period %d", id, u.UsedUp, u.UsedDown, u.PeriodStart)
+		}
+	}
+	left, _ := UserGrantsLeft(ctx, st.Q, ids[0], now)
+	if left.Main(ids[0]) != 50 {
+		t.Fatalf("grants after the reset: %d left, want the endless %d's 50 (period grant %d ends)", left.Main(ids[0]), keep.ID, once.ID)
+	}
+
+	// Delete: the users' slots and their devices' slots are burned.
+	dev, err := devs.Bind(ctx, get(ids[0]), DeviceInfo{HWID: "phone-0123456789", App: "Happ"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := get(ids[1]).SlotID.Int64
+	if n, err := users.Bulk(ctx, ids, BulkDelete, 0); err != nil || n != 2 {
+		t.Fatalf("delete: %d %v", n, err)
+	}
+	for _, id := range []int64{dev.ID, own} {
+		if s, _ := st.Q.GetSlot(ctx, id); s.State != "burned" || !s.BurnedAt.Valid {
+			t.Fatalf("slot %d after the delete: %s", id, s.State)
+		}
+	}
+	if devices, _ := st.Q.ListBoundDevices(ctx, ids[0]); len(devices) != 0 {
+		t.Fatalf("bound devices left: %+v", devices)
 	}
 }

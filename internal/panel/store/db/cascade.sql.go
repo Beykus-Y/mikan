@@ -11,7 +11,7 @@ import (
 )
 
 const addRelayUser = `-- name: AddRelayUser :exec
-INSERT INTO relay_users (exit_node_id, src_node_id, uuid) VALUES (?, ?, ?)
+INSERT INTO relay_users (exit_node_id, src_node_id, uuid) VALUES ($1, $2, $3)
 ON CONFLICT (exit_node_id, src_node_id) DO NOTHING
 `
 
@@ -27,7 +27,7 @@ func (q *Queries) AddRelayUser(ctx context.Context, arg AddRelayUserParams) erro
 }
 
 const createNodeRelay = `-- name: CreateNodeRelay :one
-INSERT INTO node_relays (node_id, port, config, created_at) VALUES (?, ?, ?, ?)
+INSERT INTO node_relays (node_id, port, config, created_at) VALUES ($1, $2, $3, $4)
 ON CONFLICT (node_id) DO UPDATE SET node_id = excluded.node_id
 RETURNING node_id, port, config, outbound, exit_node_id, created_at
 `
@@ -59,7 +59,7 @@ func (q *Queries) CreateNodeRelay(ctx context.Context, arg CreateNodeRelayParams
 }
 
 const getNodeRelay = `-- name: GetNodeRelay :one
-SELECT node_id, port, config, outbound, exit_node_id, created_at FROM node_relays WHERE node_id = ?
+SELECT node_id, port, config, outbound, exit_node_id, created_at FROM node_relays WHERE node_id = $1
 `
 
 func (q *Queries) GetNodeRelay(ctx context.Context, nodeID int64) (NodeRelay, error) {
@@ -77,7 +77,7 @@ func (q *Queries) GetNodeRelay(ctx context.Context, nodeID int64) (NodeRelay, er
 }
 
 const getRelayUser = `-- name: GetRelayUser :one
-SELECT uuid FROM relay_users WHERE exit_node_id = ? AND src_node_id = ?
+SELECT uuid FROM relay_users WHERE exit_node_id = $1 AND src_node_id = $2
 `
 
 type GetRelayUserParams struct {
@@ -127,7 +127,7 @@ func (q *Queries) ListNodeRelays(ctx context.Context) ([]NodeRelay, error) {
 }
 
 const listRelayUsers = `-- name: ListRelayUsers :many
-SELECT exit_node_id, src_node_id, uuid FROM relay_users WHERE exit_node_id = ? ORDER BY src_node_id
+SELECT exit_node_id, src_node_id, uuid FROM relay_users WHERE exit_node_id = $1 ORDER BY src_node_id
 `
 
 func (q *Queries) ListRelayUsers(ctx context.Context, exitNodeID int64) ([]RelayUser, error) {
@@ -154,7 +154,7 @@ func (q *Queries) ListRelayUsers(ctx context.Context, exitNodeID int64) ([]Relay
 }
 
 const setInboundExit = `-- name: SetInboundExit :exec
-UPDATE inbounds SET exit_node_id = ?, outbound = ? WHERE id = ?
+UPDATE inbounds SET exit_node_id = $1, outbound = $2 WHERE id = $3
 `
 
 type SetInboundExitParams struct {
@@ -168,8 +168,22 @@ func (q *Queries) SetInboundExit(ctx context.Context, arg SetInboundExitParams) 
 	return err
 }
 
+const setNodeRelayPort = `-- name: SetNodeRelayPort :exec
+UPDATE node_relays SET port = $1 WHERE node_id = $2
+`
+
+type SetNodeRelayPortParams struct {
+	Port   string
+	NodeID int64
+}
+
+func (q *Queries) SetNodeRelayPort(ctx context.Context, arg SetNodeRelayPortParams) error {
+	_, err := q.db.ExecContext(ctx, setNodeRelayPort, arg.Port, arg.NodeID)
+	return err
+}
+
 const setNodeRelayRoute = `-- name: SetNodeRelayRoute :exec
-UPDATE node_relays SET outbound = ?, exit_node_id = ? WHERE node_id = ?
+UPDATE node_relays SET outbound = $1, exit_node_id = $2 WHERE node_id = $3
 `
 
 type SetNodeRelayRouteParams struct {

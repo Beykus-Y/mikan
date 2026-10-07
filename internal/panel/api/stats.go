@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -60,39 +59,30 @@ func (h *handlers) registerStats() {
 
 func (h *handlers) overview(ctx context.Context, _ *struct{}) (*overviewOutput, error) {
 	now := h.d.Now()
-	users, err := h.d.Store.Q.ListUsers(ctx)
-	if err != nil {
-		return nil, err
-	}
 	out := &overviewOutput{}
 	b := &out.Body
 	b.GeneratedAt = now.UTC()
-	b.UsersTotal = len(users)
-	grants, err := domain.LoadGrantsLeft(ctx, h.d.Store.Q, now)
+	// Counted by the database: the dashboard does not load every user.
+	counts, err := domain.CountStates(ctx, h.d.Store.Q, now)
 	if err != nil {
 		return nil, err
 	}
-	for _, u := range users {
-		switch domain.State(u, grants.Main(u.ID), now) {
-		case domain.StateActive:
-			b.UsersActive++
-		case domain.StateExpiring:
-			b.UsersActive++
-			b.Expiring7d++
-		}
-	}
-	if h.d.Online != nil {
+	b.UsersTotal, b.UsersActive, b.Expiring7d = int(counts.Total), int(counts.Active+counts.Expiring), int(counts.Expiring)
+	if online := h.online(); len(online) > 0 {
 		// Online counts users: one with several bound devices has several slots online.
-		slots, err := h.allUserSlots(ctx)
+		names := make([]string, 0, len(online))
+		for n := range online {
+			names = append(names, n)
+		}
+		owners, err := h.d.Store.Q.SlotOwners(ctx, names)
 		if err != nil {
 			return nil, err
 		}
-		online := h.d.Online()
-		for _, names := range slots {
-			if slices.ContainsFunc(names, func(n string) bool { _, ok := online[n]; return ok }) {
-				b.Online++
-			}
+		seen := map[int64]bool{}
+		for _, o := range owners {
+			seen[o.UserID] = true
 		}
+		b.Online = len(seen)
 	}
 	today := now.Unix() / 86400
 	days, err := h.d.Store.Q.TotalTrafficDaily(ctx, today-1)
@@ -108,7 +98,7 @@ func (h *handlers) overview(ctx context.Context, _ *struct{}) (*overviewOutput, 
 		}
 	}
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Unix() / 86400
-	top, err := h.d.Store.Q.TopUsersByTraffic(ctx, db.TopUsersByTrafficParams{Day: monthStart, Limit: 5})
+	top, err := h.d.Store.Q.TopUsersByTraffic(ctx, db.TopUsersByTrafficParams{Day: monthStart, Lim: 5})
 	if err != nil {
 		return nil, err
 	}

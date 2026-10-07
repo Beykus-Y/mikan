@@ -259,9 +259,25 @@ pub fn checkbox(label: &str, on: bool, focused: bool) -> Line<'static> {
     Line::from(vec![marker, mark, Span::styled(label.to_owned(), style)])
 }
 
-/// Label and value in two columns.
-pub fn field(label: &str, value: impl Into<String>) -> Line<'static> {
-    Line::from(vec![dim(format!("{label:<14}")), Span::raw(value.into())])
+/// The width of a field's label column.
+const LABEL: usize = 14;
+
+/// Label and value in two columns, on lines of width. A value too long for its column goes
+/// on under itself, a link cut where it meets the edge: cut off at the border, it would be
+/// copied broken.
+pub fn field(label: &str, value: impl Into<String>, width: usize) -> Vec<Line<'static>> {
+    field_styled(label, value, Style::new(), width)
+}
+
+pub fn field_styled(label: &str, value: impl Into<String>, style: Style, width: usize) -> Vec<Line<'static>> {
+    wrap(&value.into(), width.saturating_sub(LABEL))
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let head = if i == 0 { dim(format!("{label:<LABEL$}")) } else { Span::raw(" ".repeat(LABEL)) };
+            Line::from(vec![head, Span::styled(part, style)])
+        })
+        .collect()
 }
 
 /// The QR code of text in half blocks, two modules per character; black on white with a
@@ -351,6 +367,37 @@ mod tests {
         assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
         assert_eq!(wrap("a\nb", 20), ["a", "b"]);
         assert_eq!(wrap("key mikan1.abcdefghijkl end", 8), ["key", "mikan1.a", "bcdefghi", "jkl end"]);
+    }
+
+    fn text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    // A panel link with a domain is longer than the column on a narrow terminal: it goes on
+    // under the value column, cut anywhere (it has no spaces), and every character stays.
+    #[test]
+    fn a_long_value_wraps_under_its_column() {
+        let url = "https://long.domain.example:21707/Kq7vN2xTg4mRz8pLw3YbC5dE/";
+        let lines = field("Panel", url, 40);
+        assert_eq!(lines.len(), 3, "26 columns for the value");
+        assert_eq!(text(&lines[0]), format!("Panel         {}", &url[..26]));
+        assert_eq!(text(&lines[1]), format!("{}{}", " ".repeat(14), &url[26..52]));
+        assert_eq!(text(&lines[2]), format!("{}{}", " ".repeat(14), &url[52..]));
+        assert!(lines.iter().all(|l| l.width() <= 40));
+        let joined: String = lines.iter().map(|l| text(l)[14..].to_owned()).collect();
+        assert_eq!(joined, url);
+        // words wrap at spaces; a short value stays one line
+        let cert = field("Certificate", "self-signed: the browser warns once, then the panel works", 40);
+        assert_eq!(text(&cert[0]), "Certificate   self-signed: the browser");
+        assert_eq!(text(&cert[1]), format!("{}warns once, then the panel", " ".repeat(14)));
+        assert_eq!(field("Login", "abc123", 40).len(), 1);
+        assert_eq!(field("Login", "", 40).len(), 1);
+        // a card is as tall as its lines (Card::fit takes their number): a 70-column
+        // terminal takes the link in two lines, a wide one in one
+        let narrow = Card::body_width(Rect::new(0, 0, 70, 30));
+        assert_eq!(narrow, 62);
+        assert_eq!(field("Panel", url, narrow).len(), 2);
+        assert_eq!(field("Panel", url, Card::body_width(Rect::new(0, 0, 120, 30))).len(), 1);
     }
 
     #[test]

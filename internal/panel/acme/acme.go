@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,10 @@ import (
 )
 
 const letsEncrypt = "https://acme-v02.api.letsencrypt.org/directory"
+
+// defaultChallenge is where the HTTP-01 challenge is answered unless MIKAN_ACME_LISTEN
+// says otherwise: port 80 on every address, where Let's Encrypt comes.
+const defaultChallenge = ":80"
 
 type Status struct {
 	Kind       string    `json:"kind" enum:"self-signed,letsencrypt,custom"`
@@ -62,7 +67,7 @@ type Manager struct {
 	orderMu   sync.Mutex // one order at a time: it takes minutes when port 80 hangs
 	status    atomic.Pointer[Status]
 	wake      chan struct{}
-	challenge string // listen address for http-01, ":80"
+	challenge string // listen address for http-01: MIKAN_ACME_LISTEN, ":80" by default
 	// customDir holds the admin's own certificate (tlscert.SaveCustom); it wins over
 	// Let's Encrypt while valid. customMod is when its files last changed, as ensure saw.
 	customDir string
@@ -74,10 +79,38 @@ func New(dataDir string, holder *tlscert.Holder, fallback *tls.Certificate, set 
 	if dir == "" {
 		dir = letsEncrypt
 	}
+	challenge, err := ChallengeListen(os.Getenv("MIKAN_ACME_LISTEN"))
+	if err != nil {
+		log.Warn("MIKAN_ACME_LISTEN is not host:port: the HTTP-01 challenge is answered on "+defaultChallenge, "err", err)
+		challenge = defaultChallenge
+	}
 	m := &Manager{dir: filepath.Join(dataDir, "tls", "acme"), directory: dir, holder: holder, fallback: fallback,
-		set: set, log: log, now: now, wake: make(chan struct{}, 1), challenge: ":80", customDir: filepath.Join(dataDir, "tls", "custom")}
+		set: set, log: log, now: now, wake: make(chan struct{}, 1), challenge: challenge, customDir: filepath.Join(dataDir, "tls", "custom")}
 	m.status.Store(&Status{Kind: "self-signed", CheckedAt: now()})
 	return m
+}
+
+// ChallengeListen reads MIKAN_ACME_LISTEN, the address the HTTP-01 challenge is answered
+// on: ":80" when empty. When nginx or caddy holds port 80 the installer sets a loopback
+// port, e.g. 127.0.0.1:18080, and the proxy forwards /.well-known/acme-challenge/ there.
+// The host is an IP address, localhost or empty (every address); the port is 1..65535.
+func ChallengeListen(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return defaultChallenge, nil
+	}
+	host, port, err := net.SplitHostPort(v)
+	if err != nil {
+		return "", err
+	}
+	if host != "" && host != "localhost" && net.ParseIP(host) == nil {
+		return "", fmt.Errorf("host %q is not an IP address", host)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return "", fmt.Errorf("port %q is not 1..65535", port)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p)), nil
 }
 
 func (m *Manager) Status() Status { return *m.status.Load() }
@@ -328,7 +361,8 @@ func (m *Manager) obtain(ctx context.Context, id string) (*tls.Certificate, erro
 	if err != nil {
 		return nil, err
 	}
-	// Port 80 is taken only for the few seconds of the challenge.
+	// The challenge's port (80, or MIKAN_ACME_LISTEN's) is taken only for the few seconds
+	// of the challenge.
 	host, port, _ := net.SplitHostPort(m.challenge)
 	if err := client.Challenge.SetHTTP01Provider(http01.NewProviderServer(host, port)); err != nil {
 		return nil, err

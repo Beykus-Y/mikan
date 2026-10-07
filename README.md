@@ -14,7 +14,7 @@
 [![License](https://img.shields.io/badge/license-GPL--3.0-2f9e6b?style=flat-square)](LICENSE)
 [![mihomo](https://img.shields.io/badge/core-mihomo%201.19.31-9e8eff?style=flat-square)](https://github.com/MetaCubeX/mihomo)
 
-**English** · [Русский](README.ru.md)
+**English** · [Русский](README.ru.md) · [简体中文](README.zh-CN.md) · [فارسی](README.fa.md) · [Türkçe](README.tr.md) · [Español](README.es.md)
 
 </div>
 
@@ -51,7 +51,7 @@ mikan watches whether real clients still reach each protocol. When a port gets b
 <td width="50%" valign="top">
 
 ### 📱 Every app gets what it can use
-Subscriptions detect the app — Happ, v2RayTun, Koala Clash, Clash Verge, FlClash, Hiddify, Shadowrocket and more — and hand it only the protocols it actually supports. No more “it doesn't work for me”.
+Subscriptions detect the app — Happ, v2RayTun, Koala Clash, SlothClash, Clash Verge, FlClash, ClashFest, Hiddify, Shadowrocket and more — and hand it only the protocols it actually supports. No more “it doesn't work for me”.
 
 </td>
 </tr>
@@ -59,7 +59,7 @@ Subscriptions detect the app — Happ, v2RayTun, Koala Clash, Clash Verge, FlCla
 <td valign="top">
 
 ### 📊 Byte-exact accounting
-mihomo is embedded as a library, so traffic is counted per user on every connection — not sampled. Plans by time and gigabytes, billing days, device limits and device binding against key sharing.
+mihomo is embedded as a library, so traffic is counted per user on every connection — not sampled. Plans by time and gigabytes, billing days, device limits and device binding against key sharing. Since every connection is known by its user, the torrent blocker bans the one who torrents on every node, not a shared IP.
 
 </td>
 <td valign="top">
@@ -73,7 +73,7 @@ Subscribers check their plan, devices and connection guides in a bot you set up 
 <td valign="top">
 
 ### 🪶 Light as a mandarin
-Go and SQLite, two small containers. On a working server with clients: **~14 MB RAM** for the panel, **~40 MB** for the VPN core, **<1% CPU**.
+Go and PostgreSQL, three small containers. On a working server with clients: **~14 MB RAM** for the panel, **~50 MB** for the database, **~40 MB** for the VPN core.
 
 </td>
 <td valign="top">
@@ -98,6 +98,15 @@ A REST API documented right in the panel, with read-only or full-access keys for
 </td>
 </tr>
 </table>
+
+## Promo codes
+
+Admins can create discount codes and codes for bonus days or traffic. Subscribers apply
+codes in the Telegram Mini App, which also shows their redemption history. Bonus traffic
+can go to the main balance or a selected pool. Discounted invoices are available only
+through payment methods that support refunds: Telegram Stars and adapters that advertise
+refund support. Mikan can then return a payment if its promo reservation expires before
+the provider confirms it.
 
 ## Screenshots
 
@@ -176,14 +185,16 @@ Run `mikan` for the menu, or use the commands directly:
 
 ## Updates
 
-The panel checks for a new release once a day and shows what changed. Turn on **auto-update** in settings, or press **Update** — the host updater pulls the image from GitHub Packages, backs up, restarts and rolls back if the new version does not come up healthy. Every release manifest is signed.
+The panel checks for a new release once a day and shows what changed. Turn on **auto-update** in settings, or press **Update**: the host updater pulls the image from GitHub Packages, backs up, migrates the database, restarts and rolls back if the new version does not come up healthy. Every release manifest is signed.
+
+On 0.4.4 or older, update to 0.4.5 first; the move to 0.5 and PostgreSQL then comes through the Update button too. If you skipped 0.4.5, the install command above updates an existing server.
 
 ## Building from source
 
 ```bash
 docker buildx build -t mikan:dev .            # panel + node image
 cd web && pnpm install && pnpm dev            # admin UI with hot reload
-go test ./...                                 # Go 1.27
+MIKAN_TEST_DATABASE_URL=postgres://… go test ./...   # Go 1.27, a test PostgreSQL 18 and pg_dump
 cd installer && cargo test                    # the installer (Rust)
 ```
 
